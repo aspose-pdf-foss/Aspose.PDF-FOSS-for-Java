@@ -81,7 +81,13 @@ public class MissingApiTest {
         Document doc = new Document();
         Page page = doc.getPages().add();
 
-        ImageStamp stamp = new ImageStamp("dummy.jpg");
+        // addStamp now materialises and registers the image bytes
+        // (closes Bug B). An in-memory JPEG is enough for the round-trip
+        // check; the old test passed a non-existent "dummy.jpg" because
+        // the buggy impl never actually opened the file.
+        byte[] jpegBytes = buildTinyJpeg();
+        ImageStamp stamp = new ImageStamp("ignored.jpg");
+        stamp.setImageStream(new java.io.ByteArrayInputStream(jpegBytes));
         stamp.setXIndent(100);
         stamp.setYIndent(200);
         stamp.setWidth(200);
@@ -91,6 +97,14 @@ public class MissingApiTest {
 
         assertNotNull(page.getRawContents(), "Content stream should exist after image stamp");
         doc.close();
+    }
+
+    private static byte[] buildTinyJpeg() throws IOException {
+        java.awt.image.BufferedImage img =
+                new java.awt.image.BufferedImage(8, 8, java.awt.image.BufferedImage.TYPE_INT_RGB);
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(img, "JPEG", out);
+        return out.toByteArray();
     }
 
     @Test

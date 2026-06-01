@@ -25,6 +25,7 @@ import org.aspose.pdf.text.TextFragmentAbsorber;
 import org.aspose.pdf.text.TextFragmentCollection;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -51,6 +52,7 @@ public class Page {
     private PageInfo pageInfo;
     private HeaderFooter header;
     private HeaderFooter footer;
+    private boolean headerFooterOverlayApplied;
     private TocInfo tocInfo;
     private java.util.List<Layer> _layers;
     private ArtifactCollection artifactsCache;
@@ -164,6 +166,141 @@ public class Page {
      */
     public Rectangle getRect() {
         return getCropBox();
+    }
+
+    /**
+     * Returns the minimal bounding box of inked content on this page in user
+     * space, scanning the content stream for path operators ({@code re},
+     * {@code m}, {@code l}, {@code c}), text-positioning operators
+     * ({@code Tm}, {@code Td}, {@code T*}) and XObject invocations ({@code Do}).
+     * The bbox is built by transforming each emitted point through the current
+     * CTM (tracked across {@code q}/{@code Q}/{@code cm}) and the current text
+     * matrix (for text-show operators).
+     *
+     * <p>This is a heuristic — it counts the start of each text run and the
+     * placement origin of each XObject (rather than computing exact glyph
+     * extents or recursively expanding XForm contents) — but it is sufficient
+     * for cropping/fitting decisions where a tight-on-the-strokes bbox is not
+     * required. When the content stream contains no drawing operators (or
+     * cannot be parsed) the method falls back to the {@linkplain #getCropBox()
+     * crop box}.</p>
+     *
+     * @return the content bounding box; never null
+     */
+    public Rectangle calculateContentBBox() {
+        Rectangle fallback = getCropBox();
+        try {
+            OperatorCollection ops = getContents();
+            if (ops == null || ops.size() == 0) return fallback;
+            ContentBBoxCalculator calc = new ContentBBoxCalculator();
+            for (int i = 1; i <= ops.size(); i++) {
+                calc.visit(ops.get(i));
+            }
+            Rectangle computed = calc.toRectangle();
+            if (computed != null) return computed;
+        } catch (IOException e) {
+            LOG.fine(() -> "calculateContentBBox: content stream parse failed: " + e.getMessage());
+        }
+        return fallback;
+    }
+
+    /**
+     * Stateful walker that maintains the CTM/text-matrix stacks and accumulates
+     * a bbox in user space. Package-private so unit tests can reach it.
+     */
+    static final class ContentBBoxCalculator {
+        // CTM stack — pushed on q, popped on Q. Top is the active CTM.
+        private final java.util.ArrayDeque<Matrix> ctmStack = new java.util.ArrayDeque<>();
+        // Text matrix; only valid between BT and ET. Reset on BT.
+        private Matrix textMatrix = Matrix.IDENTITY;
+        private boolean inText = false;
+        // Current path origin (from m/Re); subpath start tracked for closepath.
+        private double curX = 0, curY = 0;
+        // Accumulated bbox in user space.
+        private double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+        private double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
+        private boolean hasContent = false;
+
+        ContentBBoxCalculator() {
+            ctmStack.push(Matrix.IDENTITY);
+        }
+
+        void visit(Operator op) {
+            if (op instanceof org.aspose.pdf.operators.GSave) {
+                ctmStack.push(ctmStack.peek());
+            } else if (op instanceof org.aspose.pdf.operators.GRestore) {
+                if (ctmStack.size() > 1) ctmStack.pop();
+            } else if (op instanceof org.aspose.pdf.operators.ConcatenateMatrix) {
+                Matrix m = ((org.aspose.pdf.operators.ConcatenateMatrix) op).getMatrix();
+                ctmStack.push(m.multiply(ctmStack.pop()));
+            } else if (op instanceof org.aspose.pdf.operators.Re) {
+                org.aspose.pdf.operators.Re re = (org.aspose.pdf.operators.Re) op;
+                includeUserPoint(re.getX(), re.getY());
+                includeUserPoint(re.getX() + re.getWidth(), re.getY() + re.getHeight());
+                curX = re.getX();
+                curY = re.getY();
+            } else if (op instanceof org.aspose.pdf.operators.MoveTo) {
+                org.aspose.pdf.operators.MoveTo m = (org.aspose.pdf.operators.MoveTo) op;
+                curX = m.getX();
+                curY = m.getY();
+                includeUserPoint(curX, curY);
+            } else if (op instanceof org.aspose.pdf.operators.LineTo) {
+                org.aspose.pdf.operators.LineTo l = (org.aspose.pdf.operators.LineTo) op;
+                curX = l.getX();
+                curY = l.getY();
+                includeUserPoint(curX, curY);
+            } else if (op instanceof org.aspose.pdf.operators.CurveTo) {
+                org.aspose.pdf.operators.CurveTo c = (org.aspose.pdf.operators.CurveTo) op;
+                // Include all three control points (loose-but-safe envelope)
+                includeUserPoint(c.getX1(), c.getY1());
+                includeUserPoint(c.getX2(), c.getY2());
+                includeUserPoint(c.getX3(), c.getY3());
+                curX = c.getX3();
+                curY = c.getY3();
+            } else if (op instanceof org.aspose.pdf.operators.BT) {
+                inText = true;
+                textMatrix = Matrix.IDENTITY;
+            } else if (op instanceof org.aspose.pdf.operators.ET) {
+                inText = false;
+            } else if (op instanceof org.aspose.pdf.operators.SetTextMatrix) {
+                textMatrix = ((org.aspose.pdf.operators.SetTextMatrix) op).getMatrix();
+                emitTextOriginPoint();
+            } else if (op instanceof org.aspose.pdf.operators.MoveTextPosition) {
+                org.aspose.pdf.operators.MoveTextPosition m =
+                        (org.aspose.pdf.operators.MoveTextPosition) op;
+                textMatrix = new Matrix(1, 0, 0, 1, m.getX(), m.getY()).multiply(textMatrix);
+                emitTextOriginPoint();
+            } else if ("Tj".equals(op.getName())
+                    || "TJ".equals(op.getName())
+                    || "'".equals(op.getName())
+                    || "\"".equals(op.getName())) {
+                emitTextOriginPoint();
+            } else if (op instanceof org.aspose.pdf.operators.Do) {
+                // Place the XObject's origin point (loose: assumes Do at current CTM origin)
+                includeUserPoint(0, 0);
+            }
+        }
+
+        private void emitTextOriginPoint() {
+            if (!inText) return;
+            // Text shows at user-space point (textMatrix.transform(0,0)) then CTM.
+            double[] tp = textMatrix.transformPoint(0, 0);
+            includeUserPoint(tp[0], tp[1]);
+        }
+
+        private void includeUserPoint(double xUser, double yUser) {
+            double[] dev = ctmStack.peek().transformPoint(xUser, yUser);
+            if (dev[0] < minX) minX = dev[0];
+            if (dev[1] < minY) minY = dev[1];
+            if (dev[0] > maxX) maxX = dev[0];
+            if (dev[1] > maxY) maxY = dev[1];
+            hasContent = true;
+        }
+
+        Rectangle toRectangle() {
+            if (!hasContent) return null;
+            return new Rectangle(minX, minY, maxX, maxY);
+        }
     }
 
     /**
@@ -314,6 +451,11 @@ public class Page {
         this.contentsDirty = true;
     }
 
+    /** @return whether this page's cached content operators have unsaved edits. */
+    public boolean isContentsDirty() {
+        return contentsDirty && contentsCache != null;
+    }
+
     /**
      * If the cache is dirty, serialises it into the page's {@code /Contents}
      * stream. Preserves the indirect reference of any existing content stream
@@ -354,11 +496,15 @@ public class Page {
 
     public void flushContentsIfDirty() throws IOException {
         if (!contentsDirty || contentsCache == null) return;
-        StringBuilder sb = new StringBuilder();
+        // Byte-level serialization (Sprint 30): op.toString() routes operands through
+        // US-ASCII and would corrupt any COSString carrying bytes >= 0x80 (CID/Identity-H
+        // glyph codes, non-Latin literals). writeTo preserves the exact bytes.
+        java.io.ByteArrayOutputStream contentBytes = new java.io.ByteArrayOutputStream();
         for (Operator op : contentsCache) {
-            sb.append(op.toString()).append('\n');
+            op.writeTo(contentBytes);
+            contentBytes.write('\n');
         }
-        byte[] data = sb.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] data = contentBytes.toByteArray();
 
         COSBase raw = resolveRef(pageDict.get(COSName.CONTENTS));
         if (raw instanceof COSStream) {
@@ -924,10 +1070,30 @@ public class Page {
             return;
         }
         try {
+            java.util.List<Operator> contentOps = artifact.getContents();
+            boolean hasExplicitOps = contentOps != null && !contentOps.isEmpty();
+            if (!hasExplicitOps) {
+                // No parsed operators — give the subclass a chance to
+                // synthesise a complete /Artifact BMC ... EMC sequence from
+                // its high-level properties (background colour, watermark
+                // text/font/opacity, ...). The synthesised bytes already
+                // include the BMC/EMC wrapper, so we write them via the raw
+                // content-stream path; this avoids re-creating every PDF
+                // operator (cm, re, rg, BT, Tf, Tj, ...) in the typed
+                // Operator hierarchy.
+                byte[] synth = artifact.synthesizeContentBytes(this);
+                if (synth != null && synth.length > 0) {
+                    if (artifact.isBackground()) {
+                        prependToContentStream(synth);
+                    } else {
+                        appendToContentStream(synth);
+                    }
+                    return;
+                }
+            }
             OperatorCollection ops = getContents();
             ops.add(new BMC("Artifact"));
-            java.util.List<Operator> contentOps = artifact.getContents();
-            if (contentOps != null) {
+            if (hasExplicitOps) {
                 for (Operator op : contentOps) {
                     ops.add(op);
                 }
@@ -1052,6 +1218,7 @@ public class Page {
      */
     public void setHeader(HeaderFooter header) {
         this.header = header;
+        this.headerFooterOverlayApplied = false;
     }
 
     /**
@@ -1070,6 +1237,77 @@ public class Page {
      */
     public void setFooter(HeaderFooter footer) {
         this.footer = footer;
+        this.headerFooterOverlayApplied = false;
+    }
+
+    /**
+     * Renders this page's header and/or footer (set via {@link #setHeader}/
+     * {@link #setFooter}) as a Form XObject overlay appended to the page's
+     * existing content stream.
+     * <p>
+     * PDFNET-38279: when a header/footer is applied to the pages of a document
+     * loaded from disk, the layout engine's full page-rebuild path does not run
+     * (it would discard the original page content). This method instead renders
+     * only the header/footer into a standalone Form XObject — which carries its
+     * own {@code /Resources}, so there is no name collision with the page's
+     * existing resources — and invokes it with a {@code Do} after the original
+     * content. The overlay's text is therefore both visible and extractable
+     * (text extraction recurses into Form XObjects).
+     * </p>
+     * <p>
+     * No-op when the page has neither a header nor a footer, or when the overlay
+     * was already applied (idempotent across repeated saves).
+     * </p>
+     *
+     * @param pageNumber 1-based page number, for {@code $p}/{@code $P} substitution
+     * @param totalPages total page count, for {@code $P} substitution
+     * @throws IOException if content-stream generation fails
+     */
+    public void applyHeaderFooterOverlay(int pageNumber, int totalPages) throws java.io.IOException {
+        if (headerFooterOverlayApplied || (header == null && footer == null)) {
+            return;
+        }
+        org.aspose.pdf.engine.layout.LayoutEngine engine =
+                new org.aspose.pdf.engine.layout.LayoutEngine();
+        engine.setPageNumbering(pageNumber, totalPages);
+        org.aspose.pdf.engine.layout.LayoutEngine.HeaderFooterOverlay overlay =
+                engine.buildHeaderFooterOverlay(this);
+        if (overlay == null || overlay.content.length == 0) {
+            return;
+        }
+
+        Rectangle box = getMediaBox();
+        if (box == null) box = new Rectangle(0, 0, 612, 792);
+
+        // Wrap the rendered header/footer as a Form XObject. The overlay content
+        // is authored in page user space, so no placement matrix is needed and
+        // BBox is the full media box (clip only).
+        org.aspose.pdf.engine.cos.COSStream form = new org.aspose.pdf.engine.cos.COSStream();
+        form.set("Type", COSName.of("XObject"));
+        form.set("Subtype", COSName.of("Form"));
+        form.set("BBox", box.toCOSArray());
+        form.set("Resources", overlay.resources);
+        form.setDecodedData(overlay.content);
+
+        // Register as an indirect object so the form stream serializes correctly
+        // (streams must be indirect; this also routes save() through full rewrite).
+        org.aspose.pdf.engine.cos.COSObjectReference formRef = owningDocument != null
+                ? owningDocument.registerImportedObject(form)
+                : null;
+
+        Resources resources = ensureResources();
+        COSDictionary xObjects = resources.getXObjects();
+        if (xObjects == null) {
+            xObjects = new COSDictionary();
+            resources.getCOSDictionary().set(COSName.of("XObject"), xObjects);
+        }
+        String resName = createUniqueXObjectName(xObjects, "FmHF", 0);
+        xObjects.set(COSName.of(resName), formRef != null ? formRef : form);
+
+        String ops = "\nq\n/" + resName + " Do\nQ\n";
+        appendToContentStream(ops.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        clearContentsCache();
+        headerFooterOverlayApplied = true;
     }
 
     /** Returns the TOC info for this page, or null. */
@@ -1147,8 +1385,25 @@ public class Page {
             double tx = annotRect.getLLX() - bbox.getLLX() * sx;
             double ty = annotRect.getLLY() - bbox.getLLY() * sy;
 
-            // Build content: q <CTM> cm <appearance content> Q
-            byte[] apContent = apStream.getDecodedData();
+            // Place the appearance as a Form XObject invocation rather than
+            // inlining its content. This keeps the appearance's own internal
+            // operators (including any nested `cm`) out of the page content
+            // stream, so the only matrix the flatten step contributes is the
+            // BBox->Rect placement CTM (ISO 32000-1:2008 §12.5.5, Aspose-compat).
+            // BUG-F4 fix (Sprint 21): inlining previously leaked the appearance's
+            // internal cm operators into the page content. Verified zero
+            // regressions vs the inline path across flatten-using regression
+            // classes (text extraction + rendering both recurse into Do forms).
+            apStream.set("Type", COSName.of("XObject"));
+            apStream.set("Subtype", COSName.of("Form"));
+            COSDictionary xObjects = getResources().getXObjects();
+            if (xObjects == null) {
+                xObjects = new COSDictionary();
+                getResources().getCOSDictionary().set(COSName.of("XObject"), xObjects);
+            }
+            String resName = createUniqueXObjectName(xObjects, "FmFlat", 0);
+            xObjects.set(COSName.of(resName), apStream);
+
             StringBuilder sb = new StringBuilder();
             sb.append("\nq\n");
             sb.append(formatDouble(sx)).append(' ')
@@ -1156,13 +1411,10 @@ public class Page {
               .append(formatDouble(sy)).append(' ')
               .append(formatDouble(tx)).append(' ')
               .append(formatDouble(ty)).append(" cm\n");
-            sb.append(new String(apContent, java.nio.charset.StandardCharsets.US_ASCII));
-            sb.append("\nQ\n");
+            sb.append('/').append(resName).append(" Do\n");
+            sb.append("Q\n");
 
             appendToContentStream(sb.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
-
-            // Merge appearance resources into page resources
-            mergeAppearanceResources(apStream);
         }
 
         // Remove /Annots from page dictionary
@@ -1319,7 +1571,27 @@ public class Page {
     public void addStamp(ImageStamp stamp) throws IOException {
         if (stamp == null) throw new IllegalArgumentException("Stamp must not be null");
 
-        ContentStreamBuilder builder = new ContentStreamBuilder();
+        // Materialise the image bytes. ImageStamp may carry either a file path
+        // or an InputStream; prefer the stream when set.
+        byte[] imageBytes = readImageBytes(stamp);
+        if (imageBytes == null || imageBytes.length == 0) {
+            throw new IllegalArgumentException(
+                    "ImageStamp must carry image data (set file or imageStream)");
+        }
+
+        // Build the Image XObject COSStream up-front so we can register it
+        // under a unique resource name before emitting the Do operator.
+        COSStream imageXObject = XImage.createImageStream(imageBytes);
+
+        Resources resources = ensureResources();
+        COSDictionary xObjects = resources.getXObjects();
+        if (xObjects == null) {
+            xObjects = new COSDictionary();
+            resources.getCOSDictionary().set(COSName.of("XObject"), xObjects);
+        }
+        String imageRes = createUniqueXObjectName(xObjects, "Im", stamp.getStampId());
+        xObjects.set(COSName.of(imageRes), imageXObject);
+
         Rectangle box = getMediaBox();
         if (box == null) box = new Rectangle(0, 0, 612, 792);
 
@@ -1328,10 +1600,7 @@ public class Page {
         double x = box.getLLX() + stamp.getXIndent();
         double y = box.getLLY() + stamp.getYIndent();
 
-        // Register image resource
-        String imageKey = "stamp_" + System.identityHashCode(stamp);
-        String imageRes = builder.registerImage(imageKey);
-
+        ContentStreamBuilder builder = new ContentStreamBuilder();
         builder.saveState();
 
         double rotation = stamp.getRotateAngle();
@@ -1348,9 +1617,6 @@ public class Page {
         builder.drawXObject(imageRes);
         builder.restoreState();
 
-        // Note: actual image data must be added to page resources separately
-        // This generates the operator references
-
         byte[] ops = wrapStampContent(builder.toByteArray(), stamp.getStampId(), "ImageStamp", imageRes);
         if (stamp.isBackground()) {
             prependToContentStream(ops);
@@ -1358,6 +1624,28 @@ public class Page {
             appendToContentStream(ops);
         }
         recordStampInfo("ImageStamp", stamp.getStampId(), null, x, y, w, h, imageRes);
+    }
+
+    private static byte[] readImageBytes(ImageStamp stamp) throws IOException {
+        InputStream is = stamp.getImageStream();
+        if (is != null) {
+            return readAllBytes(is);
+        }
+        String file = stamp.getFile();
+        if (file != null && !file.isEmpty()) {
+            try (InputStream fis = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(file))) {
+                return readAllBytes(fis);
+            }
+        }
+        return null;
+    }
+
+    private static byte[] readAllBytes(InputStream is) throws IOException {
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = is.read(buf)) > 0) baos.write(buf, 0, n);
+        return baos.toByteArray();
     }
 
     /**

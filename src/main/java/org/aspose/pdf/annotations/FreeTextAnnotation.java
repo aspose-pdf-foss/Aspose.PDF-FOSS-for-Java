@@ -429,4 +429,44 @@ public class FreeTextAnnotation extends MarkupAnnotation {
         }
         dict.set(N_CL, arr);
     }
+
+    /**
+     * Returns the line-ending style at the endpoint of the callout line
+     * ({@code /LE}, ISO 32000-1:2008 §12.5.6.6). Only meaningful when the
+     * annotation's {@code /IT} is {@code FreeTextCallout}; otherwise the value
+     * is read-only metadata that PDF viewers may ignore.
+     *
+     * <p>Unlike {@link LineAnnotation} (which stores {@code /LE} as a two-entry
+     * array for start+end), a FreeText callout has a single endpoint, so
+     * {@code /LE} is stored as a bare {@link org.aspose.pdf.engine.cos.COSName}.</p>
+     *
+     * @return the ending style, or {@link LineEnding#None} if not set or
+     *         unrecognised
+     */
+    public LineEnding getEndingStyle() {
+        COSBase le = dict.get("LE");
+        if (le instanceof COSName) {
+            try {
+                return LineEnding.valueOf(((COSName) le).getName());
+            } catch (IllegalArgumentException e) {
+                return LineEnding.None;
+            }
+        }
+        return LineEnding.None;
+    }
+
+    /**
+     * Sets the line-ending style at the endpoint of the callout line.
+     * Passing {@code null} or {@link LineEnding#None} removes the {@code /LE}
+     * entry from the dictionary.
+     *
+     * @param style the ending style; null/None clears the entry
+     */
+    public void setEndingStyle(LineEnding style) {
+        if (style == null || style == LineEnding.None) {
+            dict.remove(COSName.of("LE"));
+        } else {
+            dict.set(COSName.of("LE"), COSName.of(style.name()));
+        }
+    }
 }

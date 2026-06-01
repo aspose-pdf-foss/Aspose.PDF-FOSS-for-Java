@@ -70,4 +70,32 @@ public class StrikeOutAnnotation extends MarkupAnnotation {
         }
         dict.set(COSName.of("QuadPoints"), arr);
     }
+
+    /**
+     * Sets multiple quadrilaterals at once. See
+     * {@link HighlightAnnotation#setQuadPoints(double[][])} for the contract;
+     * each sub-array is {@code [TLx TLy TRx TRy BLx BLy BRx BRy]} per
+     * ISO 32000-1:2008 §12.5.6.10 Table 179.
+     *
+     * @param quads array of {@code double[8]} quadrilaterals;
+     *              passing {@code null} removes the {@code /QuadPoints} entry.
+     */
+    public void setQuadPoints(double[][] quads) {
+        if (quads == null) {
+            dict.set(COSName.of("QuadPoints"), (COSBase) null);
+            return;
+        }
+        int total = 0;
+        for (double[] q : quads) {
+            if (q == null) throw new IllegalArgumentException("quad sub-array must not be null");
+            total += q.length;
+        }
+        double[] flat = new double[total];
+        int p = 0;
+        for (double[] q : quads) {
+            System.arraycopy(q, 0, flat, p, q.length);
+            p += q.length;
+        }
+        setQuadPoints(flat);
+    }
 }

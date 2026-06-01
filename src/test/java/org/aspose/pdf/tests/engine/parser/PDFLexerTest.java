@@ -454,4 +454,60 @@ public class PDFLexerTest {
     public void testConstructorRejectsNull() {
         assertThrows(IllegalArgumentException.class, () -> new PDFLexer(null));
     }
+
+    // === BUG-LEX-001 (Sprint 22): signed numbers vs lone sign/dot ===
+
+    @Test
+    public void testPositiveSignedInteger() throws IOException {
+        PDFLexer.Token t = lexerFor("+123 ").nextToken();
+        assertEquals(PDFLexer.TokenType.INTEGER, t.getType());
+        assertEquals("+123", t.getValue());
+    }
+
+    @Test
+    public void testSignedRealWithLeadingDot() throws IOException {
+        PDFLexer.Token t = lexerFor("-.5 ").nextToken();
+        assertEquals(PDFLexer.TokenType.REAL, t.getType());
+        assertEquals("-.5", t.getValue());
+    }
+
+    @Test
+    public void testPositiveRealWithLeadingDot() throws IOException {
+        PDFLexer.Token t = lexerFor("+.25 ").nextToken();
+        assertEquals(PDFLexer.TokenType.REAL, t.getType());
+        assertEquals("+.25", t.getValue());
+    }
+
+    @Test
+    public void testLeadingDotReal() throws IOException {
+        PDFLexer.Token t = lexerFor(".5 ").nextToken();
+        assertEquals(PDFLexer.TokenType.REAL, t.getType());
+        assertEquals(".5", t.getValue());
+    }
+
+    @Test
+    public void testStandalonePlusIsKeywordNotInteger() throws IOException {
+        // A lone '+' followed by whitespace must NOT become a bogus INTEGER
+        // token "+" (which previously triggered the malformed-integer warning).
+        PDFLexer.Token t = lexerFor("+ ").nextToken();
+        assertEquals(PDFLexer.TokenType.KEYWORD, t.getType());
+        assertEquals("+", t.getValue());
+    }
+
+    @Test
+    public void testStandaloneMinusIsKeywordNotInteger() throws IOException {
+        PDFLexer.Token t = lexerFor("- ").nextToken();
+        assertEquals(PDFLexer.TokenType.KEYWORD, t.getType());
+        assertEquals("-", t.getValue());
+    }
+
+    @Test
+    public void testStandaloneDotStaysDegenerateReal() throws IOException {
+        // A lone '.' is intentionally left as a (degenerate) REAL token so
+        // ContentStreamParser can recover it as 0 — its behaviour is unchanged
+        // by the BUG-LEX-001 sign fix, which only affects '+' / '-'.
+        PDFLexer.Token t = lexerFor(". ").nextToken();
+        assertEquals(PDFLexer.TokenType.REAL, t.getType());
+        assertEquals(".", t.getValue());
+    }
 }

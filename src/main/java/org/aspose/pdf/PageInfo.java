@@ -111,6 +111,29 @@ public class PageInfo {
     }
 
     /**
+     * Sets the margin information from the canonical top-level
+     * {@link org.aspose.pdf.MarginInfo} type. The values are translated into
+     * the (now-deprecated) nested representation for internal storage.
+     *
+     * <p>Prefer this overload over {@link #setMargin(MarginInfo)} in new code —
+     * the nested {@code PageInfo.MarginInfo} has a different constructor
+     * argument order and is scheduled for removal.</p>
+     *
+     * @param canonical margin info expressed via {@link org.aspose.pdf.MarginInfo}
+     */
+    public void setMargin(org.aspose.pdf.MarginInfo canonical) {
+        if (canonical == null) {
+            this.margin = null;
+            return;
+        }
+        this.margin = new MarginInfo(
+                canonical.getTop(),
+                canonical.getBottom(),
+                canonical.getLeft(),
+                canonical.getRight());
+    }
+
+    /**
      * Returns whether this page is in landscape orientation.
      * <p>
      * If explicitly set via {@link #setIsLandscape(boolean)}, returns that value.
@@ -162,7 +185,15 @@ public class PageInfo {
 
     /**
      * Holds margin values for the four sides of a page.
+     *
+     * @deprecated Use the canonical top-level {@link org.aspose.pdf.MarginInfo}
+     *     instead — it has a different (left, bottom, right, top) constructor
+     *     order that matches Aspose .NET. This nested class will be removed in
+     *     a future major version. Use the
+     *     {@link PageInfo#setMargin(org.aspose.pdf.MarginInfo)} overload to
+     *     migrate without per-call conversion.
      */
+    @Deprecated
     public static class MarginInfo {
 
         private double top;

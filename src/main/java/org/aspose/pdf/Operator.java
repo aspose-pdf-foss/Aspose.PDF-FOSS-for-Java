@@ -7,6 +7,8 @@ import org.aspose.pdf.engine.cos.COSName;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -120,6 +122,33 @@ public class Operator {
         sb.append(' ');
         sb.append(name);
         return sb.toString();
+    }
+
+    /**
+     * Writes this operator's content-stream serialization to {@code os} preserving
+     * exact operand bytes. Unlike {@link #toString()} (which routes operands through
+     * a {@code US-ASCII} String and replaces any byte &ge; 0x80), this delegates to
+     * each operand's {@link COSBase#writeTo(OutputStream)} directly — so COSString
+     * operands carrying high bytes (CID/Identity-H glyph codes, MacRoman, raw binary)
+     * survive a serialize→reparse round-trip intact. ISO 32000-1:2008 §7.8.2.
+     *
+     * @param os the output stream to write to
+     * @throws IOException if writing fails
+     */
+    public void writeTo(OutputStream os) throws IOException {
+        boolean first = true;
+        for (COSBase operand : operands) {
+            if (!first) {
+                os.write(' ');
+            }
+            operand.writeTo(os);
+            first = false;
+        }
+        if (!operands.isEmpty()) {
+            os.write(' ');
+        }
+        // Operator keywords are always ASCII (ISO 32000-1 §7.8.2).
+        os.write(name.getBytes(StandardCharsets.US_ASCII));
     }
 
     @Override

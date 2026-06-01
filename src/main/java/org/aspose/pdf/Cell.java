@@ -55,6 +55,52 @@ public class Cell {
     }
 
     /**
+     * Convenience overload that wraps a form-field widget in a
+     * {@link FormFieldParagraph} adapter and appends it to this cell's
+     * paragraphs. Mirrors Aspose .NET's {@code cell.Paragraphs.Add(field)}
+     * usage for fields that don't extend {@link BaseParagraph}.
+     *
+     * @param field the form field to embed (must not be null)
+     */
+    public void add(org.aspose.pdf.forms.Field field) {
+        if (field == null) {
+            throw new IllegalArgumentException("field must not be null");
+        }
+        getParagraphs().add(new FormFieldParagraph(field));
+    }
+
+    /**
+     * Convenience overload that wraps a {@link org.aspose.pdf.forms.RadioButtonOptionField}
+     * in a {@link FormFieldParagraph} adapter and appends it to this cell's
+     * paragraphs. Mirrors Aspose .NET's {@code cell.Paragraphs.Add(option)}
+     * usage that previously could not be ported because RBOF does not extend
+     * {@link BaseParagraph}.
+     *
+     * @param option the radio button option to embed (must not be null)
+     */
+    public void add(org.aspose.pdf.forms.RadioButtonOptionField option) {
+        if (option == null) {
+            throw new IllegalArgumentException("option must not be null");
+        }
+        getParagraphs().add(new FormFieldParagraph(option));
+    }
+
+    /**
+     * Appends a {@link BaseParagraph} (text, image, table, etc.) directly.
+     * Equivalent to {@code getParagraphs().add(paragraph)} but provided so
+     * callers don't have to switch between {@code add(...)} and
+     * {@code getParagraphs().add(...)} depending on the argument type.
+     *
+     * @param paragraph the paragraph to append (must not be null)
+     */
+    public void add(BaseParagraph paragraph) {
+        if (paragraph == null) {
+            throw new IllegalArgumentException("paragraph must not be null");
+        }
+        getParagraphs().add(paragraph);
+    }
+
+    /**
      * Returns the number of columns this cell spans.
      *
      * @return the column span; defaults to 1

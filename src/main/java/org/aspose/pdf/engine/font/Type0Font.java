@@ -132,7 +132,7 @@ public class Type0Font extends PdfFont {
     }
 
     private void appendCidDecoded(StringBuilder sb, int cid) {
-        // 1. ToUnicode CMap
+        // 1. ToUnicode CMap (highest priority when present)
         if (toUnicode != null) {
             String mapped = toUnicode.lookup(cid);
             if (mapped != null) {
@@ -140,7 +140,16 @@ public class Type0Font extends PdfFont {
                 return;
             }
         }
-        // 2. Encoding fallback
+        // 2. Embedded font program recovery (CIDFontType2 without /ToUnicode):
+        //    CID → GID → Unicode via the descendant's TrueType post/cmap tables.
+        if (descendantFont != null) {
+            int unicode = descendantFont.cidToUnicode(cid);
+            if (unicode > 0) {
+                sb.appendCodePoint(unicode);
+                return;
+            }
+        }
+        // 3. Encoding fallback
         if (encoding != null && cid < 256) {
             int unicode = encoding.getUnicode(cid);
             if (unicode > 0) {
@@ -148,7 +157,7 @@ public class Type0Font extends PdfFont {
                 return;
             }
         }
-        // 3. Identity fallback
+        // 4. Identity fallback
         sb.append((char) cid);
     }
 

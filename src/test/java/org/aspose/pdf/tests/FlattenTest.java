@@ -84,8 +84,24 @@ public class FlattenTest {
         assertTrue(contentStr.contains("q"), "Flattened content should contain 'q' (save state)");
         assertTrue(contentStr.contains("cm"), "Flattened content should contain 'cm' (CTM)");
         assertTrue(contentStr.contains("Q"), "Flattened content should contain 'Q' (restore state)");
-        assertTrue(contentStr.contains(apContent),
-                "Flattened content should contain original appearance content");
+        // BUG-F4 fix (Sprint 21): the appearance is placed as a Form XObject
+        // invocation (`/FmFlat... Do`) rather than inlined, so its bytes live in
+        // the XObject stream — not the page content stream. This keeps the
+        // appearance's own internal operators out of the page content (ISO
+        // 32000-1:2008 §12.5.5).
+        assertTrue(contentStr.contains("Do"),
+                "Flattened content should invoke the appearance Form XObject via 'Do'");
+        COSDictionary xobjs = page.getResources().getXObjects();
+        assertNotNull(xobjs, "Flattening should register the appearance as an XObject");
+        boolean apFound = false;
+        for (COSName key : xobjs.keySet()) {
+            COSBase v = xobjs.get(key);
+            if (v instanceof COSStream) {
+                String xc = new String(((COSStream) v).getDecodedData(), StandardCharsets.US_ASCII);
+                if (xc.contains(apContent)) { apFound = true; break; }
+            }
+        }
+        assertTrue(apFound, "Original appearance content should live in the placed XObject stream");
     }
 
     @Test

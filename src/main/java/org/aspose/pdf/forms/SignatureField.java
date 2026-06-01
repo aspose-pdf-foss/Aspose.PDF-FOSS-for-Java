@@ -29,6 +29,25 @@ public class SignatureField extends Field {
     }
 
     /**
+     * Creates a new, unsigned signature field on the given page at the given
+     * rectangle. The field has no value ({@code /V}) until a signing operation
+     * populates it.
+     *
+     * @param page the page on which the field's widget annotation appears
+     * @param rect the field's bounding rectangle in page coordinates
+     * @throws IllegalArgumentException if {@code page} or {@code rect} is null
+     */
+    public SignatureField(Page page, Rectangle rect) {
+        super(new COSDictionary(), page, "");
+        if (page == null) throw new IllegalArgumentException("page must not be null");
+        if (rect == null) throw new IllegalArgumentException("rect must not be null");
+        dict.set(COSName.of("Type"), COSName.of("Annot"));
+        dict.set(COSName.of("Subtype"), COSName.of("Widget"));
+        dict.set(COSName.of("FT"), COSName.of("Sig"));
+        setRectLenient(rect);
+    }
+
+    /**
      * Returns whether this signature field has been signed.
      * <p>
      * A field is considered signed if it has a /V entry (signature dictionary).

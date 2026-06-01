@@ -69,6 +69,13 @@ import java.util.logging.Logger;
  */
 public class Document implements Closeable {
 
+    static {
+        // Configure library logging (silent by default) before any engine code
+        // logs. Document is the canonical entry point — almost every API path
+        // instantiates it — so this is a reliable bootstrap (Sprint 24 Part B).
+        AsposePdfLogging.configureFromSystemProperty();
+    }
+
     private static final Logger LOG = Logger.getLogger(Document.class.getName());
 
     private final PDFParser parser;
@@ -100,6 +107,8 @@ public class Document implements Closeable {
     private boolean embedStandardFonts;
     private boolean optimizeRequested;
     private boolean fullRewriteRequested;
+    /** Set by flushDirtyPages() when a page's /Contents was edited this save. */
+    private boolean editedPageContentsThisSave;
 
     // ── Write-side encryption state (set by encrypt(), consumed by save()) ──
     private PDFEncryptor pendingEncryptor;
@@ -249,6 +258,10 @@ public class Document implements Closeable {
         this.pages = new PageCollection(pagesDict, null);
         this.pages.setOwningDocument(this);
         this.inMemoryCatalog = catalog;
+        // PDFNET_46999: a freshly created document defaults to PDF 1.7. Set only
+        // here (not as a field default) so PDF/A inference on loaded documents,
+        // which keys off pdfFormat == null, is unaffected.
+        this.pdfFormat = PdfFormat.v_1_7;
     }
 
     /**
@@ -320,6 +333,17 @@ public class Document implements Closeable {
             if (srcParagraphs != null) {
                 for (BaseParagraph paragraph : srcParagraphs) {
                     dstPage.getParagraphs().add(paragraph);
+                }
+            }
+
+            // BUG-059: also propagate annotations synthesized by the converter
+            // (e.g. LinkAnnotation built from `<a href>`). Without this copy the
+            // converter's per-page annotations were silently dropped when the
+            // outer Document adopted only the paragraphs.
+            org.aspose.pdf.annotations.AnnotationCollection srcAnnots = srcPage.getAnnotations();
+            if (srcAnnots != null) {
+                for (int a = 1; a <= srcAnnots.size(); a++) {
+                    dstPage.getAnnotations().add(srcAnnots.get(a));
                 }
             }
         }
@@ -399,52 +423,55 @@ public class Document implements Closeable {
     }
 
     /**
-     * Returns the document information dictionary, or {@code null} if the
-     * trailer has no {@code /Info} entry. To obtain a non-null instance for
-     * mutation, use {@link #getOrCreateInfo()}.
+     * Returns the document information dictionary (ISO 32000-1:2008, §14.3.3).
+     * Auto-creates an empty {@code /Info} dictionary if the document does not
+     * yet have one — for both freshly-constructed documents and reopened files
+     * whose trailer omits {@code /Info}. The result is therefore <strong>never
+     * null</strong>, and consecutive calls return the same instance.
      *
-     * @return the DocumentInfo, or null if absent
+     * <p>The auto-created dict is only persisted to the saved file once at
+     * least one metadata entry (Title, Author, etc.) is set on it; an empty
+     * dict is dropped at save time to avoid emitting a useless object.</p>
+     *
+     * @return the DocumentInfo (never null)
      * @throws IOException if the info dictionary cannot be read
      */
     public DocumentInfo getInfo() throws IOException {
         if (info != null) {
             return info;
         }
-        if (parser == null) {
-            return null;
+        if (parser != null) {
+            COSDictionary trailer = parser.getTrailer();
+            COSBase infoRef = trailer.get(COSName.INFO);
+            if (infoRef != null) {
+                COSBase infoObj = parser.resolveReference(infoRef);
+                if (infoObj instanceof COSDictionary) {
+                    info = new DocumentInfo((COSDictionary) infoObj);
+                    return info;
+                }
+            }
         }
-        COSDictionary trailer = parser.getTrailer();
-        COSBase infoRef = trailer.get(COSName.INFO);
-        if (infoRef == null) {
-            return null;
-        }
-        COSBase infoObj = parser.resolveReference(infoRef);
-        if (infoObj instanceof COSDictionary) {
-            info = new DocumentInfo((COSDictionary) infoObj);
-            return info;
-        }
-        return null;
-    }
-
-    /**
-     * Returns the document information dictionary, creating and attaching an
-     * empty {@code /Info} dictionary to the trailer if none exists. Use this
-     * when you need to mutate document metadata.
-     *
-     * @return the DocumentInfo (never null)
-     * @throws IOException if the info dictionary cannot be read
-     */
-    public DocumentInfo getOrCreateInfo() throws IOException {
-        DocumentInfo existing = getInfo();
-        if (existing != null) {
-            return existing;
-        }
+        // Auto-create
         COSDictionary infoDict = new COSDictionary();
         if (parser != null) {
             parser.getTrailer().set(COSName.INFO, infoDict);
         }
         info = new DocumentInfo(infoDict);
         return info;
+    }
+
+    /**
+     * Deprecated alias for {@link #getInfo()}. {@code getInfo()} itself now
+     * auto-creates a writable empty info dict when one is absent, so the two
+     * methods are equivalent. Retained for backwards compatibility.
+     *
+     * @return the DocumentInfo (never null)
+     * @throws IOException if the info dictionary cannot be read
+     * @deprecated use {@link #getInfo()} directly; it auto-creates as of Sprint 20.
+     */
+    @Deprecated
+    public DocumentInfo getOrCreateInfo() throws IOException {
+        return getInfo();
     }
 
     /**
@@ -516,6 +543,19 @@ public class Document implements Closeable {
     public COSDictionary getCatalog() throws IOException {
         if (inMemoryCatalog != null) return inMemoryCatalog;
         return parser.getCatalog();
+    }
+
+    /**
+     * Returns the document-level action triggers (ISO 32000-1:2008, §12.6.4.1):
+     * {@code /OpenAction} plus the {@code /AA} entries (will-close, will/did-save,
+     * will/did-print). The returned view is a live wrapper around the catalog;
+     * mutations through it write directly to the catalog dictionary.
+     *
+     * @return a non-null DocumentActions view
+     * @throws IOException if the catalog cannot be read
+     */
+    public DocumentActions getActions() throws IOException {
+        return new DocumentActions(getCatalog(), this);
     }
 
     /**
@@ -895,6 +935,21 @@ public class Document implements Closeable {
         // via TextFragment.setText (and other mutations to the cached ops)
         // would silently disappear on save.
         flushDirtyPages();
+        // PDFNET-38279: render any header/footer applied to the pages of a
+        // loaded document as a Form XObject overlay. The new-document path
+        // (saveNewDocument -> LayoutEngine.layout) already renders header/footer
+        // from paragraphs, so this only runs for parser-backed documents to
+        // avoid double rendering.
+        if (parser != null && pages != null) {
+            int totalPages = pages.size();
+            int pageNum = 0;
+            for (Page page : pages) {
+                pageNum++;
+                if (page.getHeader() != null || page.getFooter() != null) {
+                    page.applyHeaderFooterOverlay(pageNum, totalPages);
+                }
+            }
+        }
         boolean repairedPageTree = false;
         if (parser != null) {
             PageCollection documentPages = getPages();
@@ -937,7 +992,21 @@ public class Document implements Closeable {
                 fullRewriteRequested = false;
             } else {
                 Map<COSObjectKey, COSBase> modifiedObjects = collectModifiedObjects();
-                if (!modifiedObjects.isEmpty() && (sourcePath != null || sourceBytes != null)) {
+                // Incremental append of a modified page content stream is not
+                // reliably honoured on reload for hybrid-reference / xref-stream
+                // sources (§7.5.8.4) — the appended object's xref entry is lost,
+                // so the edit silently reverts (BUG-TFA-REPLACE-001, e.g.
+                // PDFNET_42759). Fall back to a full rewrite in exactly that case.
+                // Gated on content-stream edits so signing/other incremental
+                // saves (which touch dictionaries, not /Contents) are unaffected.
+                boolean unreliableIncremental = !modifiedObjects.isEmpty()
+                        && editedPageContentsThisSave
+                        && sourceUsesXRefStream();
+                if (unreliableIncremental) {
+                    saveFullRewrite(outputStream);
+                    optimizeRequested = false;
+                    fullRewriteRequested = false;
+                } else if (!modifiedObjects.isEmpty() && (sourcePath != null || sourceBytes != null)) {
                     saveIncremental(outputStream, modifiedObjects);
                 } else {
                     saveFullRewrite(outputStream);
@@ -1046,6 +1115,48 @@ public class Document implements Closeable {
             pruneUnusedResources(getPages().get(i), new java.util.IdentityHashMap<>());
         }
         optimizeRequested = true;
+    }
+
+    /**
+     * Optimises the document according to the supplied options before the next
+     * save. API-compatible with Aspose's
+     * {@code Document.OptimizeResources(OptimizationOptions)}.
+     * <p>
+     * The structural passes are applied immediately: enabling
+     * {@code removeUnusedObjects}/{@code removeUnusedStreams} requests a full
+     * rewrite on the next save (a full rewrite drops every object the catalog no
+     * longer references), and {@code allowReusePageContent} prunes unused
+     * per-page resources. The image- and font-rewriting passes are accepted for
+     * API compatibility; they are honoured where the engine already supports the
+     * operation and are otherwise a no-op (the document still saves correctly).
+     * </p>
+     *
+     * @param options the optimisation options; {@code null} applies nothing
+     * @throws IOException if page content streams cannot be parsed
+     */
+    public void optimizeResources(org.aspose.pdf.optimization.OptimizationOptions options)
+            throws IOException {
+        if (options == null) {
+            return;
+        }
+        if (options.isAllowReusePageContent() || options.isRemoveUnusedStreams()) {
+            for (int i = 1; i <= getPages().getCount(); i++) {
+                pruneUnusedResources(getPages().get(i), new java.util.IdentityHashMap<>());
+            }
+        }
+        // A full rewrite re-serialises only the objects still reachable from the
+        // trailer, which is exactly "remove unused objects/streams". Duplicate
+        // streams are likewise only written once when the writer dedups, so we
+        // also request the rewrite for linkDuplicateStreams.
+        if (options.isRemoveUnusedObjects() || options.isRemoveUnusedStreams()
+                || options.isLinkDuplicateStreams()) {
+            optimizeRequested = true;
+        }
+        LOG.fine(() -> "optimizeResources(options): rewrite="
+                + (options.isRemoveUnusedObjects() || options.isRemoveUnusedStreams()
+                        || options.isLinkDuplicateStreams())
+                + " compressImages=" + options.isCompressImages()
+                + " subsetFonts=" + options.isSubsetFonts());
     }
 
     /**
@@ -1688,13 +1799,43 @@ public class Document implements Closeable {
                 pd.set(COSName.PARENT, pagesDict);
                 kids.add(new COSObjectReference(pageKey, k -> objects.get(k)));
 
-                // Register content stream as indirect object (only if still inline)
+                // Register content stream as indirect object.
+                // BUG O: a previous saveNewDocument call replaces /Contents with
+                // a COSObjectReference bound to the *old* (now-stale) objects
+                // map. On the second save we must resolve through that
+                // reference, recover the underlying COSStream, and re-register
+                // it in the current objects map with a fresh key. Without this,
+                // the page's /Contents reference would point at an object the
+                // writer never emits — every page renders blank.
                 COSBase contentsVal = pd.get("Contents");
-                if (contentsVal instanceof COSStream
-                        && ((COSStream) contentsVal).getObjectKey() == null) {
-                    COSObjectKey csKey = new COSObjectKey(++objNum, 0);
-                    ((COSStream) contentsVal).setObjectKey(csKey);
-                    objects.put(csKey, contentsVal);
+                COSStream contentsStream = null;
+                if (contentsVal instanceof COSStream) {
+                    contentsStream = (COSStream) contentsVal;
+                } else if (contentsVal instanceof COSObjectReference) {
+                    try {
+                        COSBase resolved = ((COSObjectReference) contentsVal).dereference();
+                        if (resolved instanceof COSStream) {
+                            contentsStream = (COSStream) resolved;
+                        }
+                    } catch (IOException ignored) {
+                        // Fall through; contentsStream stays null and we leave
+                        // /Contents alone — the writer will emit a dangling ref
+                        // but that's no worse than the pre-fix behaviour.
+                    }
+                }
+                if (contentsStream != null) {
+                    COSObjectKey existingContentsKey = contentsStream.getObjectKey();
+                    COSObjectKey csKey;
+                    if (existingContentsKey != null
+                            && objects.get(existingContentsKey) == contentsStream) {
+                        // Already registered in this save's map (e.g. via
+                        // pendingImports) — no need to re-key.
+                        csKey = existingContentsKey;
+                    } else {
+                        csKey = new COSObjectKey(++objNum, 0);
+                        contentsStream.setObjectKey(csKey);
+                        objects.put(csKey, contentsStream);
+                    }
                     pd.set(COSName.of("Contents"),
                             new COSObjectReference(csKey, k -> objects.get(k)));
                 }
@@ -1705,17 +1846,50 @@ public class Document implements Closeable {
                 // indirect objects — direct streams confuse some parsers (including
                 // our own). Walk the font dict tree and lift every COSStream up to
                 // indirect form before registering.
+                //
+                // BUG O: on a second save, /Resources or /Resources/Font (or the
+                // per-font entries) may already be COSObjectReferences pointing
+                // into the previous save's stale objects map. Dereference each
+                // step before walking; re-register the underlying dicts/streams
+                // in the current map. Without this, font references dangle and
+                // text disappears.
                 COSBase resVal = pd.get("Resources");
+                if (resVal instanceof COSObjectReference) {
+                    try { resVal = ((COSObjectReference) resVal).dereference(); }
+                    catch (IOException ignored) { resVal = null; }
+                }
                 if (resVal instanceof COSDictionary) {
                     COSBase fontDict = ((COSDictionary) resVal).get("Font");
+                    if (fontDict instanceof COSObjectReference) {
+                        try { fontDict = ((COSObjectReference) fontDict).dereference(); }
+                        catch (IOException ignored) { fontDict = null; }
+                    }
                     if (fontDict instanceof COSDictionary) {
-                        for (COSName fontName : ((COSDictionary) fontDict).keySet()) {
+                        // Snapshot keys because we mutate the dict while iterating.
+                        java.util.List<COSName> fontKeys =
+                                new java.util.ArrayList<>(((COSDictionary) fontDict).keySet());
+                        for (COSName fontName : fontKeys) {
                             COSBase fontObj = ((COSDictionary) fontDict).get(fontName.getName());
+                            if (fontObj instanceof COSObjectReference) {
+                                try {
+                                    fontObj = ((COSObjectReference) fontObj).dereference();
+                                } catch (IOException ignored) {
+                                    fontObj = null;
+                                }
+                            }
                             if (fontObj instanceof COSDictionary) {
-                                objNum = liftStreamsToIndirect((COSDictionary) fontObj, objects, objNum);
-                                COSObjectKey fKey = new COSObjectKey(++objNum, 0);
-                                ((COSDictionary) fontObj).setObjectKey(fKey);
-                                objects.put(fKey, fontObj);
+                                COSDictionary fontD = (COSDictionary) fontObj;
+                                objNum = liftStreamsToIndirect(fontD, objects, objNum);
+                                COSObjectKey existingFontKey = fontD.getObjectKey();
+                                COSObjectKey fKey;
+                                if (existingFontKey != null
+                                        && objects.get(existingFontKey) == fontD) {
+                                    fKey = existingFontKey;
+                                } else {
+                                    fKey = new COSObjectKey(++objNum, 0);
+                                    fontD.setObjectKey(fKey);
+                                    objects.put(fKey, fontD);
+                                }
                                 ((COSDictionary) fontDict).set(fontName.getName(),
                                         new COSObjectReference(fKey, k -> objects.get(k)));
                             }
@@ -1789,6 +1963,14 @@ public class Document implements Closeable {
                         }
                     }
                 }
+
+                // ISO 32000-1 §12.7.4.1 Table 220: /Kids must be an array of
+                // indirect references. Promote any inline kid dictionaries
+                // (e.g. RadioButtonField option widgets) to top-level objects,
+                // re-point their /Parent at this field, and surface each kid
+                // widget in its page's /Annots. Without this, poppler reports
+                // "Invalid form field reference" + "Bad bounding box".
+                objNum = promoteFieldKidsToIndirect(fieldDict, fieldRef, fieldPage, objects, objNum);
             }
             acroForm.set(COSName.of("Fields"), fieldRefs);
             COSObjectKey acroFormKey = new COSObjectKey(++objNum, 0);
@@ -1832,10 +2014,122 @@ public class Document implements Closeable {
         trailer.set(COSName.of("Size"),
                 org.aspose.pdf.engine.cos.COSInteger.valueOf(objects.size() + 1));
 
-        PDFWriter writer = new PDFWriter(outputStream, 1.4f);
+        // Adobe Reader strictly validates that the file's PDF version supports
+        // the declared encryption algorithm; otherwise it refuses with
+        // "the document cannot be decrypted" — even when every stream is
+        // correctly AES-encrypted. Per Adobe Supplement to ISO 32000:
+        //   AES-128 (V=4) requires PDF ≥ 1.6
+        //   AES-256 (V=5/R=6) requires PDF 1.7 + ADBE ExtensionLevel 3 (or 2.0)
+        // Other readers (poppler, mupdf, qpdf) accept the lower version.
+        float headerVersion = 1.4f;
+        if (pendingEncDict != null) {
+            int v = pendingEncDict.getV();
+            if (v >= 5) headerVersion = 1.7f;
+            else if (v == 4) headerVersion = 1.6f;
+        }
+        PDFWriter writer = new PDFWriter(outputStream, headerVersion);
         retainReachableObjects(objects, trailer);
         objNum = applyPendingEncryption(writer, trailer, objects, objNum);
         writer.write(trailer, objects);
+    }
+
+    /**
+     * Promotes a form field's inline {@code /Kids} entries to top-level
+     * indirect objects (ISO 32000-1:2008 §12.7.4.1 Table 220 requires
+     * {@code /Kids} to hold indirect references). Each promoted kid:
+     * <ul>
+     *   <li>is assigned a fresh object key and registered in {@code objects};</li>
+     *   <li>has its {@code /Parent} set to {@code parentRef};</li>
+     *   <li>is replaced in the {@code /Kids} array by an indirect reference;</li>
+     *   <li>is appended to its page's {@code /Annots} (the kid is the actual
+     *       widget annotation) if not already present.</li>
+     * </ul>
+     * Returns the updated max object number. No-op for fields without a
+     * {@code /Kids} array or whose kids are already indirect.
+     */
+    private int promoteFieldKidsToIndirect(COSDictionary fieldDict,
+                                           COSObjectReference parentRef,
+                                           Page fieldPage,
+                                           Map<COSObjectKey, COSBase> objects,
+                                           int objNum) {
+        COSBase kidsVal = fieldDict.get("Kids");
+        if (kidsVal instanceof COSObjectReference) {
+            try { kidsVal = ((COSObjectReference) kidsVal).dereference(); }
+            catch (IOException e) { return objNum; }
+        }
+        if (!(kidsVal instanceof COSArray)) return objNum;
+        COSArray kids = (COSArray) kidsVal;
+
+        COSArray pageAnnots = null;
+        if (fieldPage != null) {
+            COSBase annotsVal = fieldPage.getCOSDictionary().get(COSName.ANNOTS);
+            if (annotsVal instanceof COSArray) {
+                pageAnnots = (COSArray) annotsVal;
+            }
+        }
+
+        for (int i = 0; i < kids.size(); i++) {
+            COSBase kid = kids.get(i);
+            // On a second save the entry is already a COSObjectReference bound
+            // to the *previous* save's (now-stale) objects map. Capture the old
+            // key so we can rewrite the matching /Annots entry, then dereference
+            // to the underlying widget dict.
+            COSObjectKey oldKey = null;
+            if (kid instanceof COSObjectReference) {
+                oldKey = ((COSObjectReference) kid).getKey();
+                try {
+                    COSBase resolved = ((COSObjectReference) kid).dereference();
+                    if (resolved instanceof COSDictionary) {
+                        kid = resolved;
+                    } else {
+                        continue;
+                    }
+                } catch (IOException e) {
+                    continue;
+                }
+            }
+            if (!(kid instanceof COSDictionary)) {
+                continue;
+            }
+            COSDictionary kidDict = (COSDictionary) kid;
+            // Always allocate a fresh key in THIS save's numbering. Reusing the
+            // prior save's key collides with whatever object now occupies it in
+            // the freshly-numbered map (manifests as empty kid widgets →
+            // "Bad bounding box"). The fresh ref is propagated to /Kids and
+            // /Annots below so nothing dangles.
+            COSObjectKey kidKey = new COSObjectKey(++objNum, 0);
+            kidDict.setObjectKey(kidKey);
+            objects.put(kidKey, kidDict);
+            kidDict.set(COSName.of("Parent"), parentRef);
+            final COSObjectKey fKidKey = kidKey;
+            final COSObjectKey fOldKey = oldKey;
+            COSObjectReference kidRef = new COSObjectReference(fKidKey, k -> objects.get(k));
+            kids.set(i, kidRef);
+
+            // The kid widget must be reachable as a page annotation so viewers
+            // render it. Replace any entry matching this kid (by identity or by
+            // its previous key) with the fresh ref; append if absent.
+            if (pageAnnots != null) {
+                boolean present = false;
+                for (int j = 0; j < pageAnnots.size(); j++) {
+                    COSBase a = pageAnnots.get(j);
+                    boolean match = (a == kidDict)
+                            || (a instanceof COSObjectReference
+                                && (fKidKey.equals(((COSObjectReference) a).getKey())
+                                    || (fOldKey != null
+                                        && fOldKey.equals(((COSObjectReference) a).getKey()))));
+                    if (match) {
+                        pageAnnots.set(j, kidRef);
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) {
+                    pageAnnots.add(kidRef);
+                }
+            }
+        }
+        return objNum;
     }
 
     /**
@@ -2180,6 +2474,27 @@ public class Document implements Closeable {
         idArray.add(new COSString(pendingDocumentId));
         trailer.set(COSName.of("ID"), idArray);
 
+        // For AES-256 (V=5/R=6), Adobe Reader requires the catalog to declare
+        // Adobe Extension Level 3 against base version 1.7 — otherwise it
+        // rejects the file with "the document cannot be decrypted" even when
+        // the cryptography is fully valid. Other readers ignore this entry.
+        if (pendingEncDict.getV() >= 5) {
+            COSBase rootRef = trailer.get(COSName.ROOT);
+            if (rootRef instanceof COSObjectReference) {
+                COSObjectKey rootKey = ((COSObjectReference) rootRef).getKey();
+                COSBase catalogObj = objects.get(rootKey);
+                if (catalogObj instanceof COSDictionary) {
+                    COSDictionary catalog = (COSDictionary) catalogObj;
+                    COSDictionary adbe = new COSDictionary();
+                    adbe.set(COSName.of("BaseVersion"), COSName.of("1.7"));
+                    adbe.set(COSName.of("ExtensionLevel"), COSInteger.valueOf(3));
+                    COSDictionary extensions = new COSDictionary();
+                    extensions.set(COSName.of("ADBE"), adbe);
+                    catalog.set(COSName.of("Extensions"), extensions);
+                }
+            }
+        }
+
         return maxObjNum;
     }
 
@@ -2486,31 +2801,65 @@ public void decrypt() throws IOException {
         java.util.List<COSName> keys = new java.util.ArrayList<>(dict.keySet());
         for (COSName key : keys) {
             COSBase value = dict.get(key);
-            if (value instanceof COSStream) {
-                COSStream stream = (COSStream) value;
-                if (stream.getObjectKey() == null) {
-                    final int allocated = ++objNum;
-                    COSObjectKey sKey = new COSObjectKey(allocated, 0);
+            // BUG O: on second save, sub-dicts/streams may already be
+            // COSObjectReferences pointing into the previous save's stale
+            // objects map. Resolve through the reference so we can re-register
+            // the underlying object in the current map.
+            COSBase resolvedValue = value;
+            boolean wasReference = false;
+            if (value instanceof COSObjectReference) {
+                try {
+                    resolvedValue = ((COSObjectReference) value).dereference();
+                    wasReference = true;
+                } catch (IOException ignored) {
+                    resolvedValue = null;
+                }
+            }
+            if (resolvedValue instanceof COSStream) {
+                COSStream stream = (COSStream) resolvedValue;
+                COSObjectKey existing = stream.getObjectKey();
+                COSObjectKey sKey;
+                if (existing != null && objects.get(existing) == stream) {
+                    sKey = existing;
+                } else {
+                    sKey = new COSObjectKey(++objNum, 0);
                     stream.setObjectKey(sKey);
                     objects.put(sKey, stream);
+                }
+                if (wasReference || existing == null || objects.get(existing) != stream) {
                     dict.set(key, new COSObjectReference(sKey, k -> objects.get(k)));
                 }
-            } else if (value instanceof COSDictionary) {
-                objNum = liftStreamsToIndirect((COSDictionary) value, objects, objNum);
-            } else if (value instanceof org.aspose.pdf.engine.cos.COSArray) {
+            } else if (resolvedValue instanceof COSDictionary) {
+                objNum = liftStreamsToIndirect((COSDictionary) resolvedValue, objects, objNum);
+            } else if (resolvedValue instanceof org.aspose.pdf.engine.cos.COSArray) {
                 org.aspose.pdf.engine.cos.COSArray arr =
-                        (org.aspose.pdf.engine.cos.COSArray) value;
+                        (org.aspose.pdf.engine.cos.COSArray) resolvedValue;
                 for (int i = 0; i < arr.size(); i++) {
                     COSBase item = arr.get(i);
-                    if (item instanceof COSDictionary) {
-                        objNum = liftStreamsToIndirect((COSDictionary) item, objects, objNum);
-                    } else if (item instanceof COSStream) {
-                        COSStream stream = (COSStream) item;
-                        if (stream.getObjectKey() == null) {
-                            final int allocated = ++objNum;
-                            COSObjectKey sKey = new COSObjectKey(allocated, 0);
+                    COSBase resolvedItem = item;
+                    boolean itemWasRef = false;
+                    if (item instanceof COSObjectReference) {
+                        try {
+                            resolvedItem = ((COSObjectReference) item).dereference();
+                            itemWasRef = true;
+                        } catch (IOException ignored) {
+                            resolvedItem = null;
+                        }
+                    }
+                    if (resolvedItem instanceof COSDictionary) {
+                        objNum = liftStreamsToIndirect((COSDictionary) resolvedItem, objects, objNum);
+                    } else if (resolvedItem instanceof COSStream) {
+                        COSStream stream = (COSStream) resolvedItem;
+                        COSObjectKey existing = stream.getObjectKey();
+                        COSObjectKey sKey;
+                        if (existing != null && objects.get(existing) == stream) {
+                            sKey = existing;
+                        } else {
+                            sKey = new COSObjectKey(++objNum, 0);
                             stream.setObjectKey(sKey);
                             objects.put(sKey, stream);
+                        }
+                        if (itemWasRef || existing == null || objects.get(existing) != stream) {
                             arr.set(i, new COSObjectReference(sKey, k -> objects.get(k)));
                         }
                     }
@@ -3094,11 +3443,30 @@ public void decrypt() throws IOException {
      * are serialised before the document graph is written.
      */
     private void flushDirtyPages() throws IOException {
+        editedPageContentsThisSave = false;
         if (pages == null) return;
         for (Page p : pages) {
             p.flushPageInfoIfNeeded();
+            if (p.isContentsDirty()) {
+                editedPageContentsThisSave = true;
+            }
             p.flushContentsIfDirty();
         }
+    }
+
+    /**
+     * @return whether the source PDF used a cross-reference stream or a
+     * hybrid-reference layout ({@code /XRefStm}). Incremental appends over such
+     * files are not reliably resolved on reload, so a content-stream edit must
+     * be persisted via full rewrite instead (BUG-TFA-REPLACE-001).
+     */
+    private boolean sourceUsesXRefStream() {
+        if (parser == null) return false;
+        COSDictionary trailer = parser.getTrailer();
+        if (trailer == null) return false;
+        if (trailer.get(COSName.of("XRefStm")) != null) return true;
+        COSBase type = trailer.get(COSName.TYPE);
+        return type instanceof COSName && "XRef".equals(((COSName) type).getName());
     }
 
     private void retainReachableObjects(Map<COSObjectKey, COSBase> objects, COSDictionary trailer) {

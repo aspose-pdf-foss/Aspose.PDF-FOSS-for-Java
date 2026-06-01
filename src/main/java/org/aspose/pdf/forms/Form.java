@@ -165,6 +165,7 @@ public class Form implements Iterable<Field> {
         if (field == null) {
             return;
         }
+        ensureDefaultResources();
         if (field.getPage() != null) {
             field.getCOSDictionary().set(COSName.of("P"), field.getPage().getCOSDictionary());
             field.getPage().getAnnotations().add(field);
@@ -177,6 +178,57 @@ public class Form implements Iterable<Field> {
             fieldEntry = document.registerImportedObject(fieldEntry);
         }
         fieldsArray.add(fieldEntry);
+    }
+
+    /**
+     * Lazy-populates the AcroForm {@code /DR /Font} dictionary with the two
+     * Standard-14 entries every variable-text widget needs to resolve its
+     * {@code /DA} font selector: {@code /Helv} (Helvetica/WinAnsiEncoding) and
+     * {@code /ZaDb} (ZapfDingbats). Without these, poppler/mupdf log
+     * "Missing 'Tf' operator in field's DA string" and leave the field blank.
+     *
+     * <p>Idempotent: a second call leaves existing entries untouched.</p>
+     */
+    private void ensureDefaultResources() {
+        COSBase drVal = resolveRef(acroFormDict.get("DR"));
+        COSDictionary dr;
+        if (drVal instanceof COSDictionary) {
+            dr = (COSDictionary) drVal;
+        } else {
+            dr = new COSDictionary();
+            acroFormDict.set(COSName.of("DR"), dr);
+        }
+        COSBase fontsVal = resolveRef(dr.get("Font"));
+        COSDictionary fonts;
+        if (fontsVal instanceof COSDictionary) {
+            fonts = (COSDictionary) fontsVal;
+        } else {
+            fonts = new COSDictionary();
+            dr.set(COSName.of("Font"), fonts);
+        }
+        ensureStandardFont(fonts, "Helv", "Helvetica", "Type1");
+        ensureStandardFont(fonts, "ZaDb", "ZapfDingbats", "Type1");
+
+        // Document-wide default appearance (ISO 32000-1 §12.7.2 Table 218).
+        // Fields that don't carry their own /DA inherit this; without it
+        // poppler/mupdf log "Missing 'Tf' operator in field's DA string" for
+        // such fields. Uses /Helv which the /DR above provides.
+        if (acroFormDict.get("DA") == null) {
+            acroFormDict.set(COSName.of("DA"), new COSString("/Helv 0 Tf 0 g"));
+        }
+    }
+
+    private static void ensureStandardFont(COSDictionary fonts, String resName,
+                                           String baseFont, String subtype) {
+        if (fonts.get(resName) != null) return;
+        COSDictionary f = new COSDictionary();
+        f.set(COSName.of("Type"), COSName.of("Font"));
+        f.set(COSName.of("Subtype"), COSName.of(subtype));
+        f.set(COSName.of("BaseFont"), COSName.of(baseFont));
+        if (!"ZapfDingbats".equals(baseFont)) {
+            f.set(COSName.of("Encoding"), COSName.of("WinAnsiEncoding"));
+        }
+        fonts.set(COSName.of(resName), f);
     }
 
     /**

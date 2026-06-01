@@ -682,7 +682,31 @@ public class XImage {
         return baos.toByteArray();
     }
 
-    private static COSStream createImageStream(byte[] data) throws IOException {
+    /**
+     * Build a spec-compliant {@code /XObject /Image} {@link COSStream} from raw
+     * bytes in any of the formats supported by {@link javax.imageio.ImageIO}.
+     * JPEG bytes (SOI {@code FF D8}) are stored verbatim with
+     * {@code /Filter /DCTDecode}; everything else (PNG, BMP, GIF, …) is decoded
+     * to RGB or grayscale via {@code ImageIO} and re-emitted as
+     * {@code /FlateDecode}-compressed pixel data. The resulting stream carries
+     * all of the entries the spec requires (ISO 32000-1:2008 §8.9.5 Table 89):
+     * {@code /Type /XObject}, {@code /Subtype /Image}, {@code /Width},
+     * {@code /Height}, {@code /ColorSpace}, {@code /BitsPerComponent},
+     * {@code /Filter}.
+     *
+     * <p>Package-private so {@link XImageCollection#add(InputStream)} and
+     * {@link Page#addStamp(ImageStamp)} (Stage 2) can share the same code
+     * path.</p>
+     *
+     * @param data raw image bytes; must not be null or empty
+     * @return a fully-specified Image XObject {@link COSStream}
+     * @throws IOException if the bytes cannot be decoded as a recognised
+     *         image format. The exception message contains "unsupported".
+     */
+    static COSStream createImageStream(byte[] data) throws IOException {
+        if (data == null || data.length == 0) {
+            throw new IOException("unsupported (empty) image data");
+        }
         COSStream newStream = new COSStream();
         newStream.set(COSName.TYPE, COSName.of("XObject"));
         newStream.set(COSName.SUBTYPE, COSName.of("Image"));
@@ -690,7 +714,7 @@ public class XImage {
         if (isJpeg(data)) {
             BufferedImage image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(data));
             if (image == null) {
-                throw new IOException("Unsupported JPEG image data");
+                throw new IOException("unsupported or unrecognised JPEG image data");
             }
             populateImageMetadata(newStream, image);
             newStream.setFilter(COSName.of("DCTDecode"));
@@ -700,12 +724,23 @@ public class XImage {
 
         BufferedImage image = javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(data));
         if (image == null) {
-            throw new IOException("Unsupported replacement image format");
+            throw new IOException("unsupported or unrecognised image format "
+                    + "(first bytes: " + hexHeader(data) + ")");
         }
         populateImageMetadata(newStream, image);
         newStream.setFilter(COSName.of("FlateDecode"));
         newStream.setDecodedData(extractPixelBytes(image, isGray(image)));
         return newStream;
+    }
+
+    private static String hexHeader(byte[] data) {
+        StringBuilder sb = new StringBuilder();
+        int n = Math.min(8, data.length);
+        for (int i = 0; i < n; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format("%02X", data[i] & 0xFF));
+        }
+        return sb.toString();
     }
 
     private static boolean isJpeg(byte[] data) {

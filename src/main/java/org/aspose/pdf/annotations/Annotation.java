@@ -36,7 +36,13 @@ public abstract class Annotation extends org.aspose.pdf.BaseParagraph {
         this.dict = new COSDictionary();
         this.page = page;
         dict.set(COSName.of("Type"), COSName.of("Annot"));
-        setRect(rect);
+        // F-10 sibling fix (Sprint 21): the base constructor stores the rect
+        // leniently. Many annotation types are naturally degenerate — a
+        // horizontal LineAnnotation has zero height, a TextAnnotation note icon
+        // has a point-like /Rect — and Aspose.PDF accepts these. Subtypes that
+        // genuinely require a positive-area box (Square, Caret) re-validate via
+        // {@link #requirePositiveArea(Rectangle)} in their own constructors.
+        setRectLenient(rect);
     }
 
     /**
@@ -58,12 +64,62 @@ public abstract class Annotation extends org.aspose.pdf.BaseParagraph {
     }
 
     /**
-     * Sets the annotation rectangle.
+     * Sets the annotation rectangle (ISO 32000-1:2008 §12.5.2, Table 164,
+     * {@code /Rect} entry). The rectangle must have <strong>positive
+     * area</strong> — both width and height must be strictly greater than
+     * zero. Strict spec-compliant viewers (Poppler, MuPDF) reject annotations
+     * whose {@code /Rect} collapses to a line or point with a
+     * {@code "Bad bounding box for annotation"} error.
      *
-     * @param rect the rectangle to set
+     * <p>For naturally-point-like annotation types (e.g. {@link CaretAnnotation}),
+     * use a dedicated helper that expands the point into a sensible bounding
+     * box — see {@link CaretAnnotation#atPoint(Page, Point)} for the canonical
+     * pattern.</p>
+     *
+     * @param rect the rectangle to set; ignored if null
+     * @throws IllegalArgumentException if {@code rect} has zero or negative
+     *         width or height
      */
     public void setRect(Rectangle rect) {
-        if (rect != null) dict.set(COSName.of("Rect"), rect.toCOSArray());
+        if (rect == null) return;
+        requirePositiveArea(rect);
+        dict.set(COSName.of("Rect"), rect.toCOSArray());
+    }
+
+    /**
+     * Stores the {@code /Rect} entry without enforcing positive area. Used by
+     * the internal annotation/form-field machinery (constructors, incremental
+     * {@code setWidth}/{@code setHeight} builders) where a transiently or
+     * genuinely degenerate rectangle is valid — Aspose.PDF stores such
+     * rectangles rather than rejecting them (F-10 sibling fix, Sprint 21).
+     *
+     * @param rect the rectangle to store; ignored if null
+     */
+    protected void setRectLenient(Rectangle rect) {
+        if (rect == null) return;
+        if (rect.getWidth() <= 0 || rect.getHeight() <= 0) {
+            LOG.fine(() -> "/Rect has non-positive area (width=" + rect.getWidth()
+                    + ", height=" + rect.getHeight() + "); storing anyway (Aspose-compat)");
+        }
+        dict.set(COSName.of("Rect"), rect.toCOSArray());
+    }
+
+    /**
+     * Throws {@link IllegalArgumentException} if the given rectangle has zero
+     * or negative width or height. Used by the public {@link #setRect} setter
+     * and by shape annotation types (e.g. {@link SquareAnnotation}) whose
+     * geometry is meaningless without a positive-area bounding box.
+     *
+     * @param rect the rectangle to validate; null is treated as valid (no-op)
+     * @throws IllegalArgumentException if {@code rect} has non-positive area
+     */
+    protected static void requirePositiveArea(Rectangle rect) {
+        if (rect == null) return;
+        if (rect.getWidth() <= 0 || rect.getHeight() <= 0) {
+            throw new IllegalArgumentException(
+                    "/Rect must have positive area (got width=" + rect.getWidth()
+                            + ", height=" + rect.getHeight() + ")");
+        }
     }
 
     /**
@@ -138,6 +194,42 @@ public abstract class Annotation extends org.aspose.pdf.BaseParagraph {
      * @param flags the flags bitmask
      */
     public void setFlags(int flags) { dict.set(COSName.of("F"), COSInteger.valueOf(flags)); }
+
+    /**
+     * Returns the annotation flags as a typed {@link java.util.EnumSet}.
+     *
+     * @return the set of flags currently set in {@code /F}
+     */
+    public java.util.EnumSet<AnnotationFlags> getFlagsAsEnum() {
+        return AnnotationFlags.fromBits(getFlags());
+    }
+
+    /**
+     * Sets the annotation flags from a typed {@link java.util.EnumSet}.
+     *
+     * @param flags the flags to encode into {@code /F} (must not be null)
+     */
+    public void setFlags(java.util.EnumSet<AnnotationFlags> flags) {
+        if (flags == null) {
+            throw new IllegalArgumentException("flags must not be null");
+        }
+        setFlags(AnnotationFlags.toBits(flags));
+    }
+
+    /**
+     * Convenience: sets the annotation flags from a varargs list of enum values.
+     *
+     * @param flags the flags to set
+     */
+    public void setFlags(AnnotationFlags... flags) {
+        java.util.EnumSet<AnnotationFlags> set = java.util.EnumSet.noneOf(AnnotationFlags.class);
+        if (flags != null) {
+            for (AnnotationFlags f : flags) {
+                if (f != null) set.add(f);
+            }
+        }
+        setFlags(set);
+    }
 
     /**
      * Returns whether the Invisible flag (bit 1) is set.
@@ -422,7 +514,46 @@ public abstract class Annotation extends org.aspose.pdf.BaseParagraph {
      * @return the annotation action collection; never null
      */
     public AnnotationActionCollection getActions() {
-        return new AnnotationActionCollection();
+        AnnotationActionCollection collection = new AnnotationActionCollection();
+        try {
+            // Primary action (/A) and its chained /Next actions (§12.6.3). A
+            // sequence of actions is represented as a linked list through the
+            // /Next entry; Aspose flattens that chain into the Actions list, so
+            // an annotation with /A → URI(google) → /Next URI(yahoo) yields two
+            // entries.
+            COSBase a = resolveRef(dict.get("A"));
+            if (a instanceof COSDictionary) {
+                PdfAction action = PdfAction.fromDictionary((COSDictionary) a, null);
+                while (action != null) {
+                    collection.add(action);
+                    action = action.getNext();
+                }
+            }
+            // Additional actions (/AA): one action per trigger event
+            // (ISO 32000-1:2008, Table 197/198 — /E, /X, /D, /U, /Fo, /Bl, ...).
+            COSBase aa = resolveRef(dict.get("AA"));
+            if (aa instanceof COSDictionary) {
+                COSDictionary aaDict = (COSDictionary) aa;
+                for (COSName key : aaDict.keySet()) {
+                    COSBase entry = resolveRef(aaDict.get(key));
+                    if (entry instanceof COSDictionary) {
+                        PdfAction action = PdfAction.fromDictionary((COSDictionary) entry, null);
+                        if (action != null) {
+                            collection.add(action);
+                            // /E (enter), /X (exit), /D (mouse-down) get exposed
+                            // through the typed accessors as well.
+                            String k = key.getName();
+                            if ("E".equals(k)) collection.setOnEnter(action);
+                            else if ("X".equals(k)) collection.setOnExit(action);
+                            else if ("D".equals(k)) collection.setOnPressMouseBtn(action);
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) {
+            LOG.fine(() -> "Failed to read annotation actions: " + e.getMessage());
+        }
+        return collection;
     }
 
     /**

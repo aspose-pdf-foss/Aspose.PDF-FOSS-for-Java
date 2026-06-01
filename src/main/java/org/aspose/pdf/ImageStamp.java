@@ -31,6 +31,18 @@ public class ImageStamp extends Stamp {
     }
 
     /**
+     * Creates a new ImageStamp from an input stream of encoded image bytes
+     * (JPEG, PNG, BMP or GIF). The stream is read when the stamp is applied
+     * to a page via {@link Page#addStamp(ImageStamp)}.
+     *
+     * @param imageStream the image data stream; must not be {@code null}
+     * @throws NullPointerException if {@code imageStream} is {@code null}
+     */
+    public ImageStamp(InputStream imageStream) {
+        this.imageStream = Objects.requireNonNull(imageStream, "imageStream must not be null");
+    }
+
+    /**
      * Returns the file path of the image.
      *
      * @return the file path

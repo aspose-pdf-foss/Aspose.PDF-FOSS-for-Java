@@ -81,11 +81,17 @@ Field extends WidgetAnnotation implements Iterable<Field> {
      * @param width the width in user-space units
      */
     public void setWidth(double width) {
+        // Clamp width to a strictly positive value — Annotation.setRect rejects
+        // degenerate rectangles per ISO 32000-1:2008 §12.5.2.
+        double w = Math.max(width, 1);
         Rectangle r = getRect();
         if (r != null) {
-            setRect(new Rectangle(r.getLLX(), r.getLLY(), r.getLLX() + width, r.getURY()));
+            setRect(new Rectangle(r.getLLX(), r.getLLY(), r.getLLX() + w, r.getURY()));
         } else {
-            setRect(new Rectangle(0, 0, width, 0));
+            // No prior rect: install a placeholder with positive height so
+            // setRect's validation passes. A subsequent setHeight call can
+            // overwrite the placeholder dimension.
+            setRect(new Rectangle(0, 0, w, 1));
         }
     }
 
@@ -95,11 +101,13 @@ Field extends WidgetAnnotation implements Iterable<Field> {
      * @param height the height in user-space units
      */
     public void setHeight(double height) {
+        // See setWidth for rationale on the positive-area clamp.
+        double h = Math.max(height, 1);
         Rectangle r = getRect();
         if (r != null) {
-            setRect(new Rectangle(r.getLLX(), r.getLLY(), r.getURX(), r.getLLY() + height));
+            setRect(new Rectangle(r.getLLX(), r.getLLY(), r.getURX(), r.getLLY() + h));
         } else {
-            setRect(new Rectangle(0, 0, 0, height));
+            setRect(new Rectangle(0, 0, 1, h));
         }
     }
 
@@ -250,12 +258,61 @@ Field extends WidgetAnnotation implements Iterable<Field> {
     }
 
     /**
+     * Sets the field's default appearance string (/DA entry).
+     *
+     * <p>Per ISO 32000-1:2008 §12.7.3.3, /DA shall contain at least a font
+     * selector (Tf) and a colour-setting operator. For example
+     * {@code "/Helv 12 Tf 0 g"} selects the Helvetica resource named
+     * {@code "Helv"} at 12pt and sets non-stroking colour to black.</p>
+     *
+     * <p>The font resource name referenced here must be present in the
+     * AcroForm's {@code /DR /Font} dictionary; {@link Form#add(Field)}
+     * lazily populates {@code /DR} with {@code /Helv} (Helvetica) and
+     * {@code /ZaDb} (ZapfDingbats) entries.</p>
+     *
+     * @param da the /DA string, or {@code null} to clear the entry
+     */
+    public void setDefaultAppearance(String da) {
+        if (da == null) {
+            dict.remove(COSName.of("DA"));
+        } else {
+            dict.set(COSName.of("DA"), new COSString(da));
+        }
+    }
+
+    /**
      * Returns the appearance characteristics helper backed by the /MK dictionary.
      *
      * @return the appearance characteristics wrapper
      */
     public AppearanceCharacteristics getCharacteristics() {
         return new AppearanceCharacteristics(dict);
+    }
+
+    /**
+     * Returns a typed view over this field's {@code /AP} appearance dictionary
+     * (ISO 32000-1:2008 §12.5.5).
+     *
+     * <p>For multi-state fields (checkbox, radio), iterate with
+     * {@link AppearanceDictionary#getStateNames()} and fetch each with
+     * {@link AppearanceDictionary#get(String)}. For single-state fields (text,
+     * button), use {@link AppearanceDictionary#getNormal()}.</p>
+     *
+     * <p>The /AP sub-dictionary is lazily created if absent so this method
+     * never returns {@code null}.</p>
+     *
+     * @return the typed appearance dictionary (never null)
+     */
+    public AppearanceDictionary getAppearance() {
+        COSBase ap = dict.get(COSName.of("AP"));
+        COSDictionary apDict;
+        if (ap instanceof COSDictionary) {
+            apDict = (COSDictionary) ap;
+        } else {
+            apDict = new COSDictionary();
+            dict.set(COSName.of("AP"), apDict);
+        }
+        return new AppearanceDictionary(apDict);
     }
 
     /**

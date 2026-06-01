@@ -38,7 +38,7 @@ public class ButtonField extends Field {
         dict.set(COSName.of("FT"), COSName.of("Btn"));
         // Set push button flag (bit 17)
         dict.set(COSName.of("Ff"), COSInteger.valueOf(1 << 16));
-        setRect(rect);
+        setRectLenient(rect);
     }
 
     /**

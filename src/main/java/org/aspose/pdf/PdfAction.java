@@ -69,7 +69,10 @@ public abstract class PdfAction {
             case "GoTo":        return new GoToAction(dict, doc);
             case "GoToR":       return new GoToRemoteAction(dict);
             case "GoToE":       return new GoToEmbeddedAction(dict);
-            case "URI":         return new UriAction(dict);
+            // GoToURIAction is the Aspose-named subclass of UriAction; returning
+            // it here keeps both `instanceof UriAction` and the typed cast in
+            // ports like `(GoToURIAction) link.getAction()` working.
+            case "URI":         return new GoToURIAction(dict);
             case "Named":       return new NamedAction(dict);
             case "Launch":      return new LaunchAction(dict);
             case "Hide":        return new HideAction(dict);

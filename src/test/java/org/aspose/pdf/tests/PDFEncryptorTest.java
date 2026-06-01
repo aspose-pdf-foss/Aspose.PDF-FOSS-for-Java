@@ -118,6 +118,9 @@ public class PDFEncryptorTest {
 
     @Test
     public void aes128_roundTrip_emptyData() {
+        // Empty plaintext under AES-128 still produces 32 bytes (IV + padding
+        // block). /Length 0 encrypted streams are rejected by Adobe Reader,
+        // so the writer must always emit a real IV + ciphertext block.
         PDFEncryptionDict encDict = buildAES128Dict();
         byte[] key = new byte[16];
 
@@ -125,7 +128,7 @@ public class PDFEncryptorTest {
         PDFDecryptor decryptor = new PDFDecryptor(key, encDict);
 
         byte[] encrypted = encryptor.encrypt(new byte[0], 1, 0);
-        assertEquals(0, encrypted.length);
+        assertEquals(32, encrypted.length, "Empty input must produce IV(16) + padding block(16)");
         byte[] decrypted = decryptor.decrypt(encrypted, 1, 0);
         assertEquals(0, decrypted.length);
     }

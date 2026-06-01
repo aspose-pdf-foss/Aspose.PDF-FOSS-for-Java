@@ -211,6 +211,34 @@ public class TextBuilderTest {
     }
 
     @Test
+    public void testAppendTextFragmentPreservesTextStateOperators() throws IOException {
+        Document doc = new Document();
+        Page page = doc.getPages().add();
+
+        TextFragment fragment = new TextFragment("H2");
+        fragment.getTextState().setFontName("Helvetica");
+        fragment.getTextState().setFontSize(12);
+        fragment.getTextState().setCharacterSpacing(1.5);
+        fragment.getTextState().setWordSpacing(3.0);
+        fragment.getTextState().setHorizontalScaling(80.0);
+        fragment.getTextState().setRenderingMode(2);
+        fragment.getTextState().setTextRise(6.0);
+        fragment.setPosition(new Position(72, 700));
+
+        TextBuilder builder = new TextBuilder(page);
+        builder.appendText(fragment);
+
+        String content = new String(getPageContentBytes(page), java.nio.charset.StandardCharsets.US_ASCII);
+        assertTrue(content.contains("1.5 Tc"), "Content stream should preserve character spacing");
+        assertTrue(content.contains("3 Tw"), "Content stream should preserve word spacing");
+        assertTrue(content.contains("80 Tz"), "Content stream should preserve horizontal scaling");
+        assertTrue(content.contains("2 Tr"), "Content stream should preserve rendering mode");
+        assertTrue(content.contains("6 Ts"), "Content stream should preserve text rise");
+
+        doc.close();
+    }
+
+    @Test
     public void testParagraphLineSpacing() {
         TextParagraph paragraph = new TextParagraph();
         assertEquals(1.2, paragraph.getLineSpacing(), 0.001, "Default line spacing should be 1.2");

@@ -19,16 +19,22 @@ public class AESCipherTest {
 
     @Test
     public void encryptDecryptRoundTrip_emptyData() {
+        // Empty plaintext under AES-CBC still produces 16-byte IV + 16-byte
+        // PKCS#7 padding block (Adobe Reader rejects /Length 0 encrypted
+        // streams). Decryption round-trips back to empty.
         byte[] key = new byte[16];
         byte[] result = AESCipher.encrypt(key, new byte[0]);
-        assertEquals(0, result.length, "Empty input should produce empty output");
+        assertEquals(32, result.length, "Empty input must produce IV(16) + padding block(16)");
+        byte[] decrypted = AESCipher.decrypt(key, result);
+        assertEquals(0, decrypted.length, "Round-trip of empty plaintext must decrypt to empty");
     }
 
     @Test
     public void encryptDecryptRoundTrip_nullData() {
+        // Null is treated as empty: produces a 32-byte IV+padding stream.
         byte[] key = new byte[16];
         byte[] result = AESCipher.encrypt(key, null);
-        assertEquals(0, result.length, "Null input should produce empty output");
+        assertEquals(32, result.length, "Null input must produce IV(16) + padding block(16)");
     }
 
     @Test

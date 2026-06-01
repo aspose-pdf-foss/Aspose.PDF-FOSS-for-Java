@@ -43,4 +43,24 @@ public class FileAttachmentAnnotation extends MarkupAnnotation {
         String name = dict.getNameAsString("Name");
         return name != null ? name : "PushPin";
     }
+
+    /**
+     * Sets the icon name for this file attachment annotation
+     * (ISO 32000-1:2008 §12.5.6.15, Table 184 — {@code /Name} entry).
+     *
+     * <p>The standard predefined values are {@code "Graph"}, {@code "PushPin"},
+     * {@code "Paperclip"} and {@code "Tag"}. Any other name is preserved
+     * verbatim; viewers that don't recognise it fall back to their default
+     * icon.</p>
+     *
+     * @param icon the icon name to set; pass {@code null} to remove the
+     *             {@code /Name} entry entirely (viewer will use its default).
+     */
+    public void setIcon(String icon) {
+        if (icon == null) {
+            dict.set(COSName.of("Name"), (COSBase) null);
+        } else {
+            dict.set(COSName.of("Name"), COSName.of(icon));
+        }
+    }
 }

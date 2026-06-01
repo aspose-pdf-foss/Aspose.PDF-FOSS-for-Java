@@ -109,11 +109,20 @@ public class PdfFileSignature implements AutoCloseable {
     }
 
     /**
-     * Returns the names of all signature fields in the document.
-     * Equivalent to {@code getSignatureNames(false)}, returning only the names
-     * as strings (all signature fields regardless of whether they are signed).
+     * Returns the names of the <em>signed</em> signature fields in the document.
+     * <p>
+     * Mirrors the C# {@code PdfFileSignature.GetSignNames()} semantic: a
+     * signature field is reported only when it actually carries a signature
+     * value (its {@code /V} entry is present — ISO 32000-1:2008 §12.8). A
+     * blank/unsigned signature field — including one left behind after
+     * {@link #removeSignature(String, boolean)} clears {@code /V} without
+     * deleting the field — is intentionally excluded; use
+     * {@link #getBlankSignNames()} for those. This uses the same
+     * {@link SignatureField#isSigned()} gate already applied by
+     * {@link #containsSignature()} and {@link #getTotalRevision()}.
+     * </p>
      *
-     * @return list of signature field names
+     * @return list of signed signature field names
      */
     public List<String> getSignNames() {
         List<String> result = new ArrayList<>();
@@ -122,7 +131,7 @@ public class PdfFileSignature implements AutoCloseable {
             Form form = document.getForm();
             if (form == null) return result;
             for (Field field : form.getFields()) {
-                if (field instanceof SignatureField) {
+                if (field instanceof SignatureField && ((SignatureField) field).isSigned()) {
                     result.add(field.getFullName());
                 }
             }

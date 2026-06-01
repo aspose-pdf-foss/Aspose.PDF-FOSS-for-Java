@@ -30,10 +30,12 @@ public final class AESCipher {
      *
      * @param key  16 or 32 byte AES key
      * @param data plaintext data (may be empty)
-     * @return IV-prefixed ciphertext, or empty array if data is null/empty
+     * @return IV-prefixed ciphertext (32 bytes minimum: 16-byte IV + at least
+     *         one 16-byte PKCS#7-padded block, even for empty input — Adobe
+     *         Reader rejects /Length 0 encrypted streams)
      */
     public static byte[] encrypt(byte[] key, byte[] data) {
-        if (data == null || data.length == 0) return new byte[0];
+        if (data == null) data = new byte[0];
         try {
             byte[] iv = new byte[16];
             RANDOM.nextBytes(iv);

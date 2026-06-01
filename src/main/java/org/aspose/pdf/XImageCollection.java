@@ -139,20 +139,25 @@ public class XImageCollection implements Iterable<XImage> {
     }
 
     /**
-     * Adds an image from an input stream to this collection.
+     * Adds an image from an input stream to this collection. The bytes may be
+     * JPEG (stored verbatim with {@code /Filter /DCTDecode}) or any format
+     * decodable by {@link javax.imageio.ImageIO} — PNG, BMP, GIF — in which
+     * case the image is decoded to RGB/grayscale and re-emitted as
+     * {@code /FlateDecode}-compressed pixels. The resulting Image XObject
+     * carries every entry required by ISO 32000-1:2008 §8.9.5 Table 89
+     * ({@code /Type /XObject}, {@code /Subtype /Image}, {@code /Width},
+     * {@code /Height}, {@code /ColorSpace}, {@code /BitsPerComponent},
+     * {@code /Filter}). Animation in GIF inputs is lost — only the first
+     * frame is embedded.
      *
-     * @param imageStream the image data (JPEG or PNG)
-     * @throws IOException if reading fails
+     * @param imageStream the image data (JPEG, PNG, BMP, GIF)
+     * @throws IOException if reading the stream fails or the bytes are not a
+     *                     recognised image format
      */
     public void add(InputStream imageStream) throws IOException {
         byte[] data = readAll(imageStream);
         String name = "Im" + (getCount() + 1);
-        COSStream imgStream = new COSStream(data);
-        imgStream.set(COSName.of("Subtype"), COSName.of("Image"));
-        // Detect JPEG by header bytes
-        if (data.length >= 2 && (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8) {
-            imgStream.set(COSName.of("Filter"), COSName.of("DCTDecode"));
-        }
+        COSStream imgStream = XImage.createImageStream(data);
         xobjectDict.set(COSName.of(name), imgStream);
         invalidateCache();
     }

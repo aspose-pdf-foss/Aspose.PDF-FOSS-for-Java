@@ -24,6 +24,20 @@ public class TextAbsorber {
 
     private static final Logger LOG = Logger.getLogger(TextAbsorber.class.getName());
 
+    // Precompiled patterns (Sprint 27 Part C). These were previously compiled on
+    // every call — estimateAvgCharWidth() ran replaceAll inside per-fragment loops,
+    // and the normalize* helpers recompiled on every text block.
+    private static final java.util.regex.Pattern TRAILING_WHITESPACE =
+            java.util.regex.Pattern.compile("[\\s\\n]+$");
+    private static final java.util.regex.Pattern ALL_WHITESPACE =
+            java.util.regex.Pattern.compile("\\s+");
+    private static final java.util.regex.Pattern LETTER_SPACED_WORDS =
+            java.util.regex.Pattern.compile("(?<!\\S)([\\p{L}\\p{N}](?:\\s+[\\p{L}\\p{N}]){2,})(?!\\S)");
+    private static final java.util.regex.Pattern UPPERCASE_CHUNKS =
+            java.util.regex.Pattern.compile("(?<!\\S)([\\p{Lu}\\p{N}]{1,3}(?:\\s+[\\p{Lu}\\p{N}]{1,3}){1,})(?!\\S)");
+    private static final java.util.regex.Pattern DUPLICATED_GLYPH_TOKEN =
+            java.util.regex.Pattern.compile("(?<!\\S)[\\p{L}\\p{N}\\p{Punct}&&[^\\s]]{4,}(?!\\S)");
+
     private final StringBuilder extractedText = new StringBuilder();
     private TextExtractionOptions extractionOptions;
     private TextSearchOptions textSearchOptions;
@@ -68,17 +82,28 @@ public class TextAbsorber {
         boolean rawMode = extractionOptions != null
                 && extractionOptions.getFormattingMode() == TextExtractionOptions.TextFormattingMode.Raw;
 
+        // BUG-EXT-WSPC: detect rotated (90°/270°) text. When a page is laid out
+        // with rotated text the reading direction runs along Y and successive
+        // lines stack along X, the opposite of ordinary horizontal text. The
+        // line-grouping logic below is written for horizontal text (lines differ
+        // in Y, glyphs advance in X); for rotated pages we simply remap the
+        // line/advance coordinates so the same generic logic applies. Horizontal
+        // pages (the overwhelming majority) take the identical original path.
+        int pageRot = dominantRotation(fragments);
+        boolean rotated = pageRot == 90 || pageRot == 270;
+
         // Pure mode: sort fragments by visual position (top→bottom, then left→right)
         // so that form-XObject appearance overlays drawn AFTER the page content
         // (e.g. AcroForm field values rendered via `Do /XiN`) merge into the
         // same visual line as the page content they cover. Raw mode keeps
         // content-stream order to preserve the original glyph sequence.
         if (!rawMode) {
-            fragments = sortByVisualPosition(fragments);
+            fragments = rotated ? sortByVisualPositionRotated(fragments, pageRot)
+                                : sortByVisualPosition(fragments);
         }
 
         // Estimate average character width from fragment data
-        double avgCharWidth = estimateAvgCharWidth(fragments);
+        double avgCharWidth = estimateAvgCharWidth(fragments, rotated);
         if (avgCharWidth <= 0) avgCharWidth = 5.0; // fallback
 
         double lastY = Double.NaN;
@@ -91,8 +116,13 @@ public class TextAbsorber {
 
         for (TextFragment fragment : fragments) {
             Position pos = fragment.getPosition();
-            double y = pos != null ? pos.getYIndent() : Double.NaN;
-            double x = pos != null ? pos.getXIndent() : 0;
+            // For rotated pages remap coordinates so that `y` is always the
+            // cross-axis used to detect line breaks and `x` is always the
+            // advance position along the reading direction. The advance sign is
+            // flipped for 270° so "x increases as you read" holds in both cases.
+            double advSign = pageRot == 270 ? -1.0 : 1.0;
+            double y = pos != null ? (rotated ? pos.getXIndent() : pos.getYIndent()) : Double.NaN;
+            double x = pos != null ? (rotated ? pos.getYIndent() * advSign : pos.getXIndent()) : 0;
             // PDF stores RTL glyphs in visual (left-to-right display) order — to
             // recover logical Unicode order we reverse each Hebrew/Arabic run
             // within the fragment. Inside an RTL band, neutral-only fragments
@@ -104,6 +134,17 @@ public class TextAbsorber {
             String fragmentText = inRtlBand && !containsStrongRtl(rawText) && !containsStrongLtr(rawText)
                     ? reverseString(rawText)
                     : reverseRtlRuns(rawText);
+
+            // BUG-EXT-SPACE fix (Sprint 24): some fonts map the inter-word space
+            // glyph to U+00A0 (NBSP). Java's \s regex does not treat NBSP as
+            // whitespace, so callers normalizing with \s+ get "word word" instead
+            // of "word word". Aspose emits a plain space. Normalize here in the
+            // extraction-output layer only — NOT in the per-fragment decode path,
+            // so text-removal/replacement (which maps fragments back to content
+            // operators) is unaffected.
+            if (fragmentText.indexOf(' ') >= 0) {
+                fragmentText = fragmentText.replace(' ', ' ');
+            }
 
             if (extractedText.length() > 0 && !Double.isNaN(y) && !Double.isNaN(lastY)) {
                 if (Math.abs(y - lastY) > 2.0) {
@@ -158,8 +199,18 @@ public class TextAbsorber {
             // Use last line of text (in case fragment contains newlines)
             int lastNl = text.lastIndexOf('\n');
             String lastLine = lastNl >= 0 ? text.substring(lastNl + 1) : text;
-            if (fragment.getRectangle() != null && fragment.getRectangle().getURX() > fragment.getRectangle().getLLX()) {
-                lastEndX = fragment.getRectangle().getURX();
+            Rectangle fr = fragment.getRectangle();
+            if (rotated) {
+                // Advance runs along Y; the end of the run is the far Y edge
+                // (top for 90°, bottom for 270°), normalised by advSign so it
+                // stays comparable with the advance position `x` above.
+                if (fr != null && fr.getHeight() > 0) {
+                    lastEndX = (pageRot == 270 ? -fr.getLLY() : fr.getURY());
+                } else {
+                    lastEndX = x + lastLine.length() * avgCharWidth;
+                }
+            } else if (fr != null && fr.getURX() > fr.getLLX()) {
+                lastEndX = fr.getURX();
             } else {
                 lastEndX = x + lastLine.length() * avgCharWidth;
             }
@@ -337,6 +388,65 @@ public class TextAbsorber {
      * that form-XObject overlays rendered after the page content can merge into
      * the page line they visually cover (PDFNEWNET-31272).
      */
+    /**
+     * Returns the dominant baseline rotation (0/90/180/270) across the given
+     * fragments, weighted by glyph count so a few stray rotated marks don't
+     * flip a horizontal page. Returns 0 when there is no clear majority.
+     */
+    private static int dominantRotation(java.util.List<TextFragment> fragments) {
+        if (fragments == null || fragments.isEmpty()) return 0;
+        java.util.Map<Integer, Integer> weight = new java.util.HashMap<>();
+        int total = 0;
+        for (TextFragment f : fragments) {
+            String t = f.getText();
+            int w = t == null ? 0 : t.length();
+            if (w == 0) continue;
+            int r = ((f.getRotation() % 360) + 360) % 360;
+            weight.merge(r, w, Integer::sum);
+            total += w;
+        }
+        if (total == 0) return 0;
+        int best = 0, bestW = 0;
+        for (java.util.Map.Entry<Integer, Integer> e : weight.entrySet()) {
+            if (e.getValue() > bestW) {
+                bestW = e.getValue();
+                best = e.getKey();
+            }
+        }
+        // Require a real majority before switching axes (avoids destabilising
+        // ordinary horizontal pages that contain a rotated caption or stamp).
+        return bestW * 2 > total ? best : 0;
+    }
+
+    /**
+     * Visual-position sort for rotated (90°/270°) pages: lines stack along X,
+     * glyphs advance along Y. Bands the X axis into columns (one per rotated
+     * line), orders columns left-to-right, and within a column orders by Y in
+     * the reading direction (ascending for 90°, descending for 270°).
+     */
+    private static java.util.List<TextFragment> sortByVisualPositionRotated(
+            java.util.List<TextFragment> fragments, int pageRot) {
+        if (fragments == null || fragments.size() < 2) return fragments;
+        final double BAND = 3.0;
+        final int ySign = pageRot == 270 ? -1 : 1;
+        java.util.List<TextFragment> copy = new java.util.ArrayList<>(fragments);
+        copy.sort((a, b) -> {
+            Position pa = a.getPosition();
+            Position pb = b.getPosition();
+            double xa = pa != null ? pa.getXIndent() : 0;
+            double xb = pb != null ? pb.getXIndent() : 0;
+            long ba = (long) Math.floor(xa / BAND);
+            long bb = (long) Math.floor(xb / BAND);
+            if (ba != bb) {
+                return Long.compare(ba, bb); // columns left → right
+            }
+            double ya = pa != null ? pa.getYIndent() : 0;
+            double yb = pb != null ? pb.getYIndent() : 0;
+            return Double.compare(ya * ySign, yb * ySign);
+        });
+        return copy;
+    }
+
     private static java.util.List<TextFragment> sortByVisualPosition(
             java.util.List<TextFragment> fragments) {
         if (fragments == null || fragments.size() < 2) return fragments;
@@ -500,15 +610,25 @@ public class TextAbsorber {
      * Falls back to heuristic based on page width if rectangles are not available.
      */
     private double estimateAvgCharWidth(java.util.List<TextFragment> fragments) {
+        return estimateAvgCharWidth(fragments, false);
+    }
+
+    /**
+     * Estimates the average glyph advance. For rotated text the advance runs
+     * along Y, so the rectangle height and the Y position differences are used
+     * instead of width and X.
+     */
+    private double estimateAvgCharWidth(java.util.List<TextFragment> fragments, boolean rotated) {
         // Method 1: from rectangles (most reliable)
         double totalWidth = 0;
         int totalChars = 0;
         for (TextFragment f : fragments) {
             Rectangle r = f.getRectangle();
-            if (r != null && r.getWidth() > 1) {
-                String text = f.getText().replaceAll("[\\s\\n]+$", "");
+            double adv = r == null ? 0 : (rotated ? r.getHeight() : r.getWidth());
+            if (r != null && adv > 1) {
+                String text = TRAILING_WHITESPACE.matcher(f.getText()).replaceAll("");
                 if (text.length() > 5) {
-                    totalWidth += r.getWidth();
+                    totalWidth += adv;
                     totalChars += text.length();
                 }
             }
@@ -527,8 +647,9 @@ public class TextAbsorber {
         for (TextFragment f : fragments) {
             Position p = f.getPosition();
             if (p == null) continue;
-            double x = p.getXIndent();
-            double y = p.getYIndent();
+            // x = advance axis, y = cross axis (swapped for rotated text)
+            double x = rotated ? p.getYIndent() : p.getXIndent();
+            double y = rotated ? p.getXIndent() : p.getYIndent();
             if (!Double.isNaN(prevY) && Math.abs(y - prevY) < 1 && prevLen > 3 && x > prevX) {
                 double charW = (x - prevX) / prevLen;
                 if (charW >= 2 && charW <= 20) {
@@ -536,7 +657,7 @@ public class TextAbsorber {
                     countCharW++;
                 }
             }
-            String text = f.getText().replaceAll("[\\s\\n]+$", "");
+            String text = TRAILING_WHITESPACE.matcher(f.getText()).replaceAll("");
             prevX = x;
             prevLen = text.length();
             prevY = y;
@@ -682,9 +803,7 @@ public class TextAbsorber {
         if (text == null || text.isEmpty()) {
             return text;
         }
-        java.util.regex.Pattern pattern =
-                java.util.regex.Pattern.compile("(?<!\\S)([\\p{L}\\p{N}](?:\\s+[\\p{L}\\p{N}]){2,})(?!\\S)");
-        java.util.regex.Matcher matcher = pattern.matcher(text);
+        java.util.regex.Matcher matcher = LETTER_SPACED_WORDS.matcher(text);
         StringBuffer sb = new StringBuffer();
         while (matcher.find()) {
             matcher.appendReplacement(sb,
@@ -692,9 +811,7 @@ public class TextAbsorber {
         }
         matcher.appendTail(sb);
         String normalized = sb.toString();
-        java.util.regex.Pattern uppercaseChunks =
-                java.util.regex.Pattern.compile("(?<!\\S)([\\p{Lu}\\p{N}]{1,3}(?:\\s+[\\p{Lu}\\p{N}]{1,3}){1,})(?!\\S)");
-        java.util.regex.Matcher uppercaseMatcher = uppercaseChunks.matcher(normalized);
+        java.util.regex.Matcher uppercaseMatcher = UPPERCASE_CHUNKS.matcher(normalized);
         StringBuffer uppercaseSb = new StringBuffer();
         while (uppercaseMatcher.find()) {
             uppercaseMatcher.appendReplacement(uppercaseSb,
@@ -718,16 +835,14 @@ public class TextAbsorber {
         if (run.contains("  ")) {
             return run;
         }
-        return run.replaceAll("\\s+", "");
+        return ALL_WHITESPACE.matcher(run).replaceAll("");
     }
 
     private String normalizeDuplicatedGlyphWords(String text) {
         if (text == null || text.isEmpty()) {
             return text;
         }
-        java.util.regex.Pattern tokenPattern =
-                java.util.regex.Pattern.compile("(?<!\\S)[\\p{L}\\p{N}\\p{Punct}&&[^\\s]]{4,}(?!\\S)");
-        java.util.regex.Matcher matcher = tokenPattern.matcher(text);
+        java.util.regex.Matcher matcher = DUPLICATED_GLYPH_TOKEN.matcher(text);
         StringBuffer sb = new StringBuffer();
         while (matcher.find()) {
             String token = matcher.group();

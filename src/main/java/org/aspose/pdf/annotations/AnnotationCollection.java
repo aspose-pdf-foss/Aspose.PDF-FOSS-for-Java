@@ -65,8 +65,14 @@ public class AnnotationCollection implements Iterable<Annotation> {
      * @param annotation the annotation to add
      */
     public void add(Annotation annotation) {
-        ensureLoaded();
-        annotations.add(annotation);
+        // Do NOT force ensureLoaded() here: each Page.getAnnotations() hands back a
+        // fresh, unloaded wrapper, so loading the whole /Annots array on every add()
+        // makes a sequence of N adds cost O(N^2) (e.g. HTML→PDF with thousands of
+        // <a href> links — see PDFNET_40534). Appending to the COS array is enough;
+        // a later ensureLoaded() rebuilds the list from the array, new entry included.
+        if (annotations != null) {
+            annotations.add(annotation);
+        }
         annotsArray.add(annotation.getCOSDictionary());
     }
 

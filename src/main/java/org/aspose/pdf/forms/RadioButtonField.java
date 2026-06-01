@@ -45,6 +45,54 @@ public class RadioButtonField extends Field {
     }
 
     /**
+     * Convenience overload — creates a radio-button group on {@code page} and
+     * uses {@code rect} as the field-level {@code /Rect} (most viewers ignore
+     * it for radio groups but Aspose-compat ports often set it).
+     *
+     * @param page the page
+     * @param rect the optional rectangle for the field widget
+     */
+    public RadioButtonField(Page page, Rectangle rect) {
+        this(page);
+        if (rect != null) {
+            setRectLenient(rect);
+        }
+    }
+
+    /**
+     * Attaches a {@link RadioButtonOptionField} to this radio group.
+     *
+     * <p>Adds the option's dictionary to {@code /Kids}, links its {@code /Parent}
+     * back to this field, and — if the option's {@code /AP/N} is missing or
+     * contains {@link org.aspose.pdf.engine.cos.COSNull} placeholders — calls
+     * {@link RadioButtonOptionField#regenerateAppearance()} so that the
+     * option renders correctly in viewers that don't honour
+     * {@code /NeedAppearances}.</p>
+     *
+     * @param option the option to attach (must not be null)
+     */
+    public void add(RadioButtonOptionField option) {
+        if (option == null) {
+            throw new IllegalArgumentException("option must not be null");
+        }
+        COSBase kids = dict.get("Kids");
+        COSArray kidsArray;
+        if (kids instanceof COSArray) {
+            kidsArray = (COSArray) kids;
+        } else {
+            kidsArray = new COSArray();
+            dict.set(COSName.of("Kids"), kidsArray);
+        }
+        kidsArray.add(option.getCOSDictionary());
+        option.getCOSDictionary().set(COSName.of("Parent"), dict);
+        if (FieldAppearanceBuilder.isAppearanceIncomplete(option.getCOSDictionary())) {
+            option.regenerateAppearance();
+        }
+        // Invalidate cached options view
+        options = null;
+    }
+
+    /**
      * Adds a radio button option with the given value and rectangle.
      *
      * @param optionValue the export value for this option
@@ -66,33 +114,22 @@ public class RadioButtonField extends Field {
             kidDict.set(COSName.of("Rect"), rect.toCOSArray());
         }
         kidDict.set(COSName.of("AS"), COSName.of("Off"));
-        // Build /AP /N with the option value as a key. /AP/N values must be
-        // appearance streams (Form XObjects) per §12.5.5; an empty placeholder
-        // stream is enough for getOptionValue() to discover the key.
+        // Build /AP /N with real on/off appearance streams. An earlier version
+        // emitted /BBox [0 0 0 0] /Length 0 placeholders here; Adobe Reader
+        // rejects /Length 0 streams under AES encryption (no IV) and refuses
+        // to open the document. Real appearances use the option rectangle for
+        // /BBox and a Zapf-Dingbats glyph for the on-state.
+        COSStream onStream  = FieldAppearanceBuilder.buildRadioAppearance(rect, true,  BoxStyle.Circle);
+        COSStream offStream = FieldAppearanceBuilder.buildRadioAppearance(rect, false, BoxStyle.Circle);
         COSDictionary apN = new COSDictionary();
-        apN.set(COSName.of(optionValue), createPlaceholderAppearance());
-        apN.set(COSName.of("Off"), createPlaceholderAppearance());
+        apN.set(COSName.of(optionValue), onStream);
+        apN.set(COSName.of("Off"), offStream);
         COSDictionary ap = new COSDictionary();
         ap.set(COSName.of("N"), apN);
         kidDict.set(COSName.of("AP"), ap);
         kidsArray.add(kidDict);
         // Invalidate cached options
         options = null;
-    }
-
-    /** Minimal Form XObject placeholder used as /AP/N value when widgets are built without explicit appearances. */
-    private static COSStream createPlaceholderAppearance() {
-        COSStream stream = new COSStream();
-        stream.set(COSName.of("Type"), COSName.of("XObject"));
-        stream.set(COSName.of("Subtype"), COSName.of("Form"));
-        stream.set(COSName.of("FormType"), COSInteger.valueOf(1));
-        COSArray bbox = new COSArray();
-        bbox.add(COSInteger.valueOf(0));
-        bbox.add(COSInteger.valueOf(0));
-        bbox.add(COSInteger.valueOf(0));
-        bbox.add(COSInteger.valueOf(0));
-        stream.set(COSName.of("BBox"), bbox);
-        return stream;
     }
 
     /**

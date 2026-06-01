@@ -67,7 +67,9 @@ public class PDFEncryptor {
      * @return the encrypted bytes
      */
     public byte[] encrypt(byte[] data, int objectNumber, int generationNumber) {
-        if (data == null || data.length == 0) return data;
+        if (data == null) return null;
+        // Empty input under AES still produces 32 bytes (IV + one PKCS#7 pad
+        // block); under RC4 it stays empty. The dispatch below handles both.
         try {
             if (customHandler != null) {
                 return customHandler.encrypt(data, objectNumber, generationNumber, encryptionKey);
@@ -80,6 +82,7 @@ public class PDFEncryptor {
                     encryptionKey, objectNumber, generationNumber, cipherType);
             switch (cipherType) {
                 case RC4:
+                    if (data.length == 0) return data;
                     return RC4Cipher.process(objectKey, data);
                 case AES_128:
                     return AESCipher.encrypt(objectKey, data);

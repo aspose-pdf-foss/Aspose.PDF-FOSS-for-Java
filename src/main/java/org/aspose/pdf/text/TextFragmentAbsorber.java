@@ -90,14 +90,26 @@ public class TextFragmentAbsorber extends TextAbsorber {
     public void visit(Page page) throws IOException {
         super.visit(page);
 
-        TextExtractor extractor = new TextExtractor(null);
+        // Sprint 34 Bug A: pass document.getParser() so indirect references
+        // inside the page (font dictionaries, XObject streams) can be resolved.
+        // visitDocumentCombined (L465) already does this; the per-page path
+        // was an oversight that left TFA unable to dereference indirect objects.
+        TextExtractor extractor = new TextExtractor(
+                page.getOwningDocument() != null ? page.getOwningDocument().getParser() : null);
         List<TextFragment> allFragments = extractor.extract(page);
 
         if (searchPhrase == null || searchPhrase.isEmpty()) {
+            // Empty-phrase TFA extracts all visible text. Sprint 41 (PDFNEWNET_27157_3_1):
+            // the TextSearchOptions area filter (and exclude/page-bounds filters) must
+            // still be honoured here — previously this path bypassed shouldIncludeMatch
+            // entirely, returning every fragment regardless of the rectangle filter.
+            Rectangle areaFilter = textSearchOptions != null ? textSearchOptions.getRectangle() : null;
             List<TextFragment> visibleFragments = normalizeVisibleFragments(allFragments);
             for (TextFragment frag : visibleFragments) {
                 frag.setPage(page);
-                textFragments.add(frag);
+                if (shouldIncludeMatch(frag, page, areaFilter)) {
+                    textFragments.add(frag);
+                }
             }
         } else {
             boolean isRegex = textSearchOptions != null && textSearchOptions.isRegularExpressionUsed();
@@ -248,7 +260,10 @@ public class TextFragmentAbsorber extends TextAbsorber {
         int idx = 0;
         while ((idx = haystack.indexOf(needle, idx)) >= 0) {
             TextFragment match = buildMatchFragment(searchPhrase, spans, idx, searchPhrase.length(), page);
-            if (shouldIncludeMatch(match, page, areaFilter)) {
+            // Mirror searchRegex(): dedup equivalent matches. Without this, exact
+            // search could emit duplicates that the regex path already suppresses
+            // (asymmetry — see Sprint 29 Bug #3).
+            if (shouldIncludeMatch(match, page, areaFilter) && !containsEquivalentMatch(match)) {
                 textFragments.add(match);
             }
             idx += Math.max(1, needle.length());
@@ -268,11 +283,26 @@ public class TextFragmentAbsorber extends TextAbsorber {
         Matcher matcher = pattern.matcher(fullText.toString());
         while (matcher.find()) {
             String matchedText = matcher.group();
+            if (isWhitespaceOnlyMatch(matchedText)) {
+                continue;
+            }
             TextFragment match = buildMatchFragment(matchedText, spans, matcher.start(), matchedText.length(), page);
             if (shouldIncludeMatch(match, page, areaFilter) && !containsEquivalentMatch(match)) {
                 textFragments.add(match);
             }
         }
+    }
+
+    /**
+     * A regex such as {@code [a-zA-Z0-9 ]+} that permits spaces can match a
+     * lone synthetic separator space that {@link #buildSpans} inserts between
+     * two non-adjacent runs (e.g. between punctuation-only watermarks drawn at
+     * very different x positions). Such whitespace-only matches carry no
+     * searchable content and are not surfaced by Aspose, so they are skipped
+     * (PDFNET_47103). A genuinely empty pattern match is also skipped.
+     */
+    private static boolean isWhitespaceOnlyMatch(String matchedText) {
+        return matchedText == null || matchedText.trim().isEmpty();
     }
 
     private boolean isSingleCharacterWordPattern() {
@@ -603,6 +633,9 @@ public class TextFragmentAbsorber extends TextAbsorber {
         Matcher matcher = pattern.matcher(fullText.toString());
         while (matcher.find()) {
             String matchedText = matcher.group();
+            if (isWhitespaceOnlyMatch(matchedText)) {
+                continue;
+            }
             TextFragment match = buildDocumentMatchFragment(matchedText, spans, matcher.start(), matchedText.length(), document);
             textFragments.add(match);
         }
@@ -666,6 +699,8 @@ public class TextFragmentAbsorber extends TextAbsorber {
         }
         match.setSourceOperatorIndex(source.getSourceOperatorIndex());
         match.setLastSourceOperatorIndex(source.getLastSourceOperatorIndex());
+        match.setSourceOperator(source.getSourceOperator());
+        match.setLastSourceOperator(source.getLastSourceOperator());
         match.setSourceFontName(source.getSourceFontName());
         match.setSourceTextStart(source.getSourceTextStart() + offsetInSource);
         match.setSourceTextLength(len);
@@ -695,6 +730,8 @@ public class TextFragmentAbsorber extends TextAbsorber {
         TextFragment lastSource = participatingSpans.get(participatingSpans.size() - 1).fragment;
         match.setSourceOperatorIndex(firstSource.getSourceOperatorIndex());
         match.setLastSourceOperatorIndex(lastSource.getLastSourceOperatorIndex());
+        match.setSourceOperator(firstSource.getSourceOperator());
+        match.setLastSourceOperator(lastSource.getLastSourceOperator());
         match.setSourceFontName(firstSource.getSourceFontName());
         match.setSourceTextStart(firstSource.getSourceTextStart() + Math.max(0, idx - participatingSpans.get(0).start));
         match.setSourceTextLength(len);

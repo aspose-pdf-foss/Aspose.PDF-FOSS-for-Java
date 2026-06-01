@@ -134,7 +134,7 @@ public final class ContentStreamParser {
                         // This is an operator — create typed subclass
                         Operator op = createTypedOperator(keyword, operands);
                         operators.add(op);
-                        LOGGER.log(Level.FINE, "Parsed operator: {0} with {1} operands",
+                        LOGGER.log(Level.FINER, "Parsed operator: {0} with {1} operands",
                                 new Object[]{keyword, operands.size()});
                         operands = new ArrayList<>();
                     }

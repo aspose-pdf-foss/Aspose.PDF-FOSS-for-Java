@@ -34,7 +34,10 @@ public class ListBoxField extends Field {
         dict.set(COSName.of("Type"), COSName.of("Annot"));
         dict.set(COSName.of("Subtype"), COSName.of("Widget"));
         dict.set(COSName.of("FT"), COSName.of("Ch"));
-        setRect(rect);
+        setRectLenient(rect);
+        if (getDefaultAppearance() == null) {
+            setDefaultAppearance("/Helv 12 Tf 0 g");
+        }
     }
 
     /**

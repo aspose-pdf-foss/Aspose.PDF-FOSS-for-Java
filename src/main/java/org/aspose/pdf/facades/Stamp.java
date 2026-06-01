@@ -51,6 +51,17 @@ public class Stamp {
     }
 
     /**
+     * Convenience overload: binds an image file as the logo. Equivalent to
+     * {@link #bindImage(String)} — mirrors the Aspose .NET overload that
+     * accepts a file path under the same {@code BindLogo} name.
+     *
+     * @param logoFile the image file path
+     */
+    public void bindLogo(String logoFile) {
+        bindImage(logoFile);
+    }
+
+    /**
      * Binds an image file as the stamp source.
      *
      * @param imageFile the image file path
@@ -76,6 +87,35 @@ public class Stamp {
         this.pdfDocument = null;
         this.imageStream = imageStream;
         LOG.fine("Bound image stamp stream");
+    }
+
+    /**
+     * Convenience overload: binds the first page of {@code pdfFile} as the
+     * stamp source.
+     *
+     * @param pdfFile the source PDF file path
+     */
+    public void bindPdf(String pdfFile) {
+        bindPdf(pdfFile, 1);
+    }
+
+    /**
+     * Binds the first page of a PDF stream as the stamp source. The stream is
+     * eagerly buffered into a {@link Document} so the caller can close it
+     * immediately after this call returns.
+     *
+     * @param pdfStream the source PDF input stream (must not be null)
+     */
+    public void bindPdf(InputStream pdfStream) {
+        if (pdfStream == null) {
+            throw new IllegalArgumentException("pdfStream must not be null");
+        }
+        try {
+            Document doc = new Document(pdfStream);
+            bindPdf(doc, 1);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Failed to bind PDF stream: " + e.getMessage(), e);
+        }
     }
 
     /**

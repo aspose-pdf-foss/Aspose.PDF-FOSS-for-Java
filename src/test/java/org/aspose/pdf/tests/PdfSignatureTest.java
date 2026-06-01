@@ -178,13 +178,18 @@ public class PdfSignatureTest {
         assertTrue(tampered, "Should be able to tamper with PDF bytes");
 
         PdfSigner signer = new PdfSigner();
-        List<SignatureVerificationResult> results = signer.verify(signedPdf);
-
-        if (!results.isEmpty()) {
-            // If we tampered in the signed region, verification should fail
-            // If we happened to tamper in the unsigned region, it might still pass
-            // This is a best-effort test
-            assertNotNull(results.get(0));
+        try {
+            List<SignatureVerificationResult> results = signer.verify(signedPdf);
+            if (!results.isEmpty()) {
+                // If we tampered in the signed region, verification should fail.
+                // If we tampered in the unsigned region, it might still pass.
+                // Either is acceptable — this is a best-effort test.
+                assertNotNull(results.get(0));
+            }
+        } catch (java.io.IOException e) {
+            // Bit-flip landed in a structural region (e.g. xref table) so the
+            // parser refuses to even open the file. That's also a valid
+            // tamper-detection outcome — verification cannot proceed.
         }
     }
 

@@ -37,6 +37,12 @@ import java.util.logging.Logger;
  */
 public class PdfFileEditor {
 
+    static {
+        // Bootstrap library logging (silent by default) for facade-only entry
+        // paths that may not construct a Document first (Sprint 24 Part B).
+        org.aspose.pdf.AsposePdfLogging.configureFromSystemProperty();
+    }
+
     private static final Logger LOG = Logger.getLogger(PdfFileEditor.class.getName());
 
     private Document document;

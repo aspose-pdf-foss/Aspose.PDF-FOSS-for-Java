@@ -33,6 +33,16 @@ public class TrueTypeReader {
     private int[] advanceWidths;     // indexed by glyph ID
     private Map<Integer, Integer> cmapTable;
     private Map<Integer, Integer> reverseCmapTable;
+    /**
+     * GID → Unicode reverse map populated ONLY from true-Unicode cmap subtables
+     * (platform 3 / encoding 1 or 10, and platform 0). Mac (platform 1) subtables
+     * carry platform-specific code points (e.g. Mac Roman 0xA4 == section sign)
+     * that must NOT be treated as Unicode, so they are excluded here. Used by the
+     * CID-font extraction path which needs an unambiguous Unicode value.
+     */
+    private Map<Integer, Integer> unicodeReverseCmap;
+    /** Set per-subtable during {@link #parseCmap}; true for true-Unicode platforms. */
+    private boolean currentSubtableIsUnicode;
     private String fontName;
     /** Glyph names indexed by glyph ID (from /post table). null until parsePost runs. */
     private String[] glyphNames;
@@ -90,6 +100,22 @@ public class TrueTypeReader {
     public int getUnicodeForGlyphId(int glyphId) {
         if (reverseCmapTable == null) return 0;
         Integer unicode = reverseCmapTable.get(glyphId);
+        return unicode != null ? unicode : 0;
+    }
+
+    /**
+     * Returns the Unicode code point for the given glyph ID using ONLY the
+     * true-Unicode cmap subtables (see {@link #unicodeReverseCmap}). Prefer this
+     * over {@link #getUnicodeForGlyphId(int)} when an unambiguous Unicode value
+     * is required, because the general reverse map can be polluted by Mac
+     * platform code points that collide with unrelated Unicode characters.
+     *
+     * @param glyphId the glyph ID
+     * @return the Unicode code point, or 0 if no Unicode subtable maps it
+     */
+    public int getUnicodeForGlyphIdPreferUnicode(int glyphId) {
+        if (unicodeReverseCmap == null) return 0;
+        Integer unicode = unicodeReverseCmap.get(glyphId);
         return unicode != null ? unicode : 0;
     }
 
@@ -230,6 +256,7 @@ public class TrueTypeReader {
     private void parseCmap(int tableOffset, int tableLength) {
         cmapTable = new HashMap<>();
         reverseCmapTable = new HashMap<>();
+        unicodeReverseCmap = new HashMap<>();
         if (tableOffset + 4 > data.length) return;
 
         int numSubtables = readUInt16(tableOffset + 2);
@@ -237,6 +264,8 @@ public class TrueTypeReader {
         int bestPriority = -1;
         int[] subtableOffsets = new int[numSubtables];
         int[] subtableFormats = new int[numSubtables];
+        boolean[] subtableUnicode = new boolean[numSubtables];
+        boolean bestIsUnicode = false;
 
         for (int i = 0; i < numSubtables; i++) {
             int recOffset = tableOffset + 4 + i * 8;
@@ -252,6 +281,13 @@ public class TrueTypeReader {
                 subtableFormats[i] = -1;
             }
 
+            // True-Unicode subtables: Microsoft BMP/full (3,1)/(3,10) and the
+            // Unicode platform (0). Mac (1,0) and Microsoft Symbol (3,0) carry
+            // non-Unicode code points and are excluded from unicodeReverseCmap.
+            boolean isUnicode = (platformId == 3 && (encodingId == 1 || encodingId == 10))
+                    || platformId == 0;
+            subtableUnicode[i] = isUnicode;
+
             int priority = -1;
             if (platformId == 3 && encodingId == 10) priority = 12;
             else if (platformId == 3 && encodingId == 1) priority = 11;
@@ -262,14 +298,17 @@ public class TrueTypeReader {
             if (priority > bestPriority) {
                 bestPriority = priority;
                 bestOffset = absoluteOffset;
+                bestIsUnicode = isUnicode;
             }
         }
 
         if (bestOffset < 0 || bestOffset >= data.length) return;
 
         for (int i = 0; i < numSubtables; i++) {
+            currentSubtableIsUnicode = subtableUnicode[i];
             parseCmapSubtable(subtableOffsets[i], subtableFormats[i], false);
         }
+        currentSubtableIsUnicode = bestIsUnicode;
         parseCmapSubtable(bestOffset, readUInt16(bestOffset), true);
     }
 
@@ -379,6 +418,12 @@ public class TrueTypeReader {
         Integer existing = reverseCmapTable.get(glyphId);
         if (shouldReplaceReverseMapping(existing, charCode)) {
             reverseCmapTable.put(glyphId, charCode);
+        }
+        if (currentSubtableIsUnicode) {
+            Integer existingU = unicodeReverseCmap.get(glyphId);
+            if (shouldReplaceReverseMapping(existingU, charCode)) {
+                unicodeReverseCmap.put(glyphId, charCode);
+            }
         }
     }
 

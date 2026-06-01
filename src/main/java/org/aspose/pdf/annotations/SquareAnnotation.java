@@ -31,6 +31,8 @@ public class SquareAnnotation extends MarkupAnnotation {
      */
     public SquareAnnotation(Page page, Rectangle rect) {
         super(page, rect);
+        // A square is meaningless without a positive-area bounding box.
+        requirePositiveArea(rect);
         dict.set(COSName.of("Subtype"), COSName.of("Square"));
     }
 }

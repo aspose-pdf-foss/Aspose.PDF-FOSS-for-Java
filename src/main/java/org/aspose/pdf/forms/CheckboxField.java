@@ -33,16 +33,22 @@ public class CheckboxField extends Field {
      * Constructs a new empty checkbox field.
      * The field must be added to a form via {@code Form.add(field)} or
      * {@code Form.add(field, pageNumber)}.
+     *
+     * <p>The {@code /AP/N} entry is created as an empty dictionary; concrete
+     * appearance streams for the {@code Yes} and {@code Off} states are
+     * generated on the next {@link #regenerateAppearance()} call (triggered
+     * automatically by {@link #CheckboxField(Page, Rectangle)} or
+     * {@link #setExportValue(String)} / {@link #setStyle(BoxStyle)}).</p>
      */
     public CheckboxField() {
         super(new COSDictionary(), null, "");
         dict.set(COSName.of("Type"), COSName.of("Annot"));
         dict.set(COSName.of("Subtype"), COSName.of("Widget"));
         dict.set(COSName.of("FT"), COSName.of("Btn"));
-        // Build default /AP /N with "Yes" and "Off"
+        // Reserve /AP/N as a dictionary so getAllowedStates / state discovery
+        // works even before regenerateAppearance() runs. Empty so the next
+        // regenerate cleanly populates it.
         COSDictionary apN = new COSDictionary();
-        apN.set(COSName.of("Yes"), COSNull.INSTANCE);
-        apN.set(COSName.of("Off"), COSNull.INSTANCE);
         COSDictionary ap = new COSDictionary();
         ap.set(COSName.of("N"), apN);
         dict.set(COSName.of("AP"), ap);
@@ -50,6 +56,8 @@ public class CheckboxField extends Field {
 
     /**
      * Constructs a new checkbox field on the specified page with the given rectangle.
+     * <p>Automatically generates Form-XObject {@code /AP/N/Yes} and {@code /AP/N/Off}
+     * appearance streams via {@link FieldAppearanceBuilder} (F-10 fix).</p>
      *
      * @param page the page this checkbox belongs to
      * @param rect the rectangle defining the checkbox position and size
@@ -60,8 +68,25 @@ public class CheckboxField extends Field {
             this.page = page;
         }
         if (rect != null) {
-            setRect(rect);
+            setRectLenient(rect);
         }
+        regenerateAppearance();
+    }
+
+    /**
+     * Rebuilds the {@code /AP/N/Yes} and {@code /AP/N/Off} appearance streams
+     * from the current rectangle, style and export-value name.
+     *
+     * <p>Idempotent: safe to call after any property change. No-op when the
+     * widget has no {@code /Rect} set yet.</p>
+     */
+    public void regenerateAppearance() {
+        Rectangle r = getRect();
+        if (r == null) return;
+        String onState = getOnValue();
+        COSStream onStream = FieldAppearanceBuilder.buildCheckboxAppearance(r, true, style);
+        COSStream offStream = FieldAppearanceBuilder.buildCheckboxAppearance(r, false, style);
+        FieldAppearanceBuilder.installAppearance(dict, onStream, onState, offStream);
     }
 
     /**
@@ -72,11 +97,15 @@ public class CheckboxField extends Field {
     public BoxStyle getStyle() { return style; }
 
     /**
-     * Sets the check mark style of this checkbox.
+     * Sets the check mark style of this checkbox and regenerates the
+     * {@code /AP/N} appearance streams so the new glyph is reflected.
      *
      * @param style the box style
      */
-    public void setStyle(BoxStyle style) { this.style = style; }
+    public void setStyle(BoxStyle style) {
+        this.style = style;
+        regenerateAppearance();
+    }
 
     /**
      * Sets the width of this checkbox by updating the /Rect entry.
@@ -88,7 +117,7 @@ public class CheckboxField extends Field {
         double llx = r != null ? r.getLLX() : 0;
         double lly = r != null ? r.getLLY() : 0;
         double ury = r != null ? r.getURY() : 0;
-        setRect(new Rectangle(llx, lly, llx + width, ury));
+        setRectLenient(new Rectangle(llx, lly, llx + width, ury));
     }
 
     /**
@@ -101,7 +130,7 @@ public class CheckboxField extends Field {
         double llx = r != null ? r.getLLX() : 0;
         double lly = r != null ? r.getLLY() : 0;
         double urx = r != null ? r.getURX() : 0;
-        setRect(new Rectangle(llx, lly, urx, lly + height));
+        setRectLenient(new Rectangle(llx, lly, urx, lly + height));
     }
 
     /**
@@ -161,6 +190,8 @@ public class CheckboxField extends Field {
             setValue(exportValue);
             dict.set(COSName.of("AS"), COSName.of(exportValue));
         }
+        // F-10 fix: regenerate streams so the on-state name matches the rendered glyph.
+        regenerateAppearance();
     }
 
     /**
@@ -240,12 +271,10 @@ public class CheckboxField extends Field {
 
     private COSDictionary ensureNormalAppearanceDictionary(COSDictionary ap) {
         COSBase n = ap.get("N");
-        if (n instanceof COSDictionary) {
+        if (n instanceof COSDictionary && !(n instanceof COSStream)) {
             return (COSDictionary) n;
         }
         COSDictionary result = new COSDictionary();
-        result.set(COSName.of("Yes"), COSNull.INSTANCE);
-        result.set(COSName.of("Off"), COSNull.INSTANCE);
         ap.set(COSName.of("N"), result);
         return result;
     }

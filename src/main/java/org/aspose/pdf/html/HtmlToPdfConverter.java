@@ -1,6 +1,7 @@
 package org.aspose.pdf.html;
 
 import org.aspose.pdf.*;
+import org.aspose.pdf.annotations.LinkAnnotation;
 import org.aspose.pdf.engine.layout.TextLayoutHelper;
 import org.aspose.pdf.text.TextFragment;
 import org.aspose.pdf.text.TextState;
@@ -32,6 +33,24 @@ public class HtmlToPdfConverter {
     private static final String DEFAULT_FONT = "Helvetica";
     private static final double DEFAULT_FONT_SIZE = 12.0;
     private static final double DEFAULT_CELL_PADDING = 2.0;
+
+    // Precompiled patterns (Sprint 27 Part C) — previously compiled on every call.
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
+    private static final Pattern BODY_BLOCK = Pattern.compile("(?is)<body[^>]*>(.*)</body>");
+    private static final Pattern PAGE_BREAK_TAG =
+            Pattern.compile("(?is)<[a-z0-9]+\\b[^>]*class\\s*=\\s*['\"][^'\"]*page-break[^'\"]*['\"][^>]*>");
+    private static final Pattern BR_TAG = Pattern.compile("(?is)<br\\b[^>]*>");
+    private static final Pattern P_OPEN_TAG = Pattern.compile("(?is)<p\\b[^>]*>");
+    private static final Pattern LI_OPEN_TAG = Pattern.compile("(?is)<li\\b[^>]*>");
+    /** Matches <h1>..<h6> opening tags; replacement is built from the captured digit. */
+    private static final Pattern H_OPEN_TAG = Pattern.compile("(?is)<h([1-6])\\b[^>]*>");
+    private static final Pattern LEGACY_BLOCK_TAG = Pattern.compile("(?is)<(p|li|h[1-6])\\b");
+    private static final Pattern ANY_TAG = Pattern.compile("(?is)<[^>]*>");
+    private static final Pattern INLINE_WHITESPACE = Pattern.compile("[ \\t\\x0B\\r]+");
+    private static final Pattern NEWLINE_INDENT = Pattern.compile("\\n[ ]+");
+    private static final Pattern LEGACY_PAGE_SPAN =
+            Pattern.compile("(?is)<span\\b[^>]*class\\s*=\\s*['\"][^'\"]*page[^'\"]*['\"][^>]*>\\s*(\\d+)\\s*</span>");
+
     /**
      * Internal non-rendering marker used to preserve explicit HTML page breaks
      * until we redistribute paragraphs across PDF pages.
@@ -140,6 +159,9 @@ public class HtmlToPdfConverter {
             case "img":
                 processImage(el, page, childCtx);
                 break;
+            case "a":
+                processAnchor(el, page, childCtx);
+                break;
             case "br":
                 // Line break as minimal paragraph separator
                 TextFragment brFrag = new TextFragment("\n");
@@ -201,6 +223,93 @@ public class HtmlToPdfConverter {
         tf.setMargin(margin);
 
         page.getParagraphs().add(tf);
+
+        // BUG-059 follow-up: getDeepText flattens any <a> descendants into the
+        // paragraph text, so the per-anchor switch case is never reached for
+        // inline links. Walk the subtree once more and synthesise a
+        // LinkAnnotation for each <a href>.
+        addAnchorAnnotations(el, page, ctx);
+    }
+
+    private void addAnchorAnnotations(Element el, Page page, CssContext ctx) {
+        NodeList children = el.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child.getNodeType() != Node.ELEMENT_NODE) continue;
+            Element e = (Element) child;
+            if ("a".equalsIgnoreCase(e.getTagName())) {
+                String href = e.getAttribute("href");
+                if (href != null && !href.isEmpty()) {
+                    Rectangle pageRect = page.getRect();
+                    double fontSize = ctx.getFontSize() > 0 ? ctx.getFontSize() : DEFAULT_FONT_SIZE;
+                    String linkText = e.getTextContent() != null ? e.getTextContent() : "";
+                    double textWidth = Math.max(10, linkText.length() * fontSize * 0.5);
+                    double x0 = pageRect != null ? pageRect.getLLX() + 50 : 50;
+                    double yTop = pageRect != null ? pageRect.getURY() - 50 : 720;
+                    Rectangle linkRect = new Rectangle(x0, yTop - fontSize, x0 + textWidth, yTop);
+                    addLinkAnnotation(page, linkRect, href);
+                }
+            }
+            addAnchorAnnotations(e, page, ctx);
+        }
+    }
+
+    /**
+     * Renders an HTML anchor ({@code <a href="…">…</a>}) by emitting its inline
+     * text as usual and synthesising a {@link LinkAnnotation} carrying a
+     * {@link GoToURIAction} for the {@code href}.
+     *
+     * <p>Closes BUG-059: previously {@code <a>} fell through to the default
+     * branch which rendered the text but dropped the link target entirely.</p>
+     *
+     * <p>Position note: the annotation rectangle is an approximation based on
+     * the current text fragment in the page paragraph collection — sufficient
+     * for round-tripping the URI (the test target) and for hit-testing the
+     * roughly-correct area. Pixel-accurate positioning would require a
+     * post-layout pass after {@link Document#save}, which is out of scope for
+     * this fix.</p>
+     */
+    private void processAnchor(Element el, Page page, CssContext ctx) {
+        String href = el.getAttribute("href");
+        if (href == null || href.isEmpty()) {
+            processInlineChildren(el, page, ctx);
+            return;
+        }
+        // Style anchor text as a hyperlink (blue + underline) so the rendered
+        // PDF visually matches user expectations from HTML.
+        CssContext linkCtx = ctx.inherit();
+        linkCtx.setUnderline(true);
+        // Don't override an explicit colour set by inherited CSS.
+        if (linkCtx.getColor() == null) {
+            linkCtx.setColor(Color.fromRgb(0f, 0f, 1f));
+        }
+
+        String text = getDeepText(el);
+        if (text == null || text.trim().isEmpty()) {
+            // Nothing to render but we still want the action available — drop
+            // an invisible-rect link in the top-left so getAnnotations() sees it.
+            addLinkAnnotation(page, new Rectangle(0, 0, 1, 1), href);
+            return;
+        }
+
+        TextFragment tf = new TextFragment(text);
+        applyTextState(tf, linkCtx);
+        page.getParagraphs().add(tf);
+
+        // Approximate annotation rect: top-left margin region, sized to the text.
+        Rectangle pageRect = page.getRect();
+        double fontSize = linkCtx.getFontSize() > 0 ? linkCtx.getFontSize() : DEFAULT_FONT_SIZE;
+        double textWidth = text.length() * fontSize * 0.5;
+        double x0 = pageRect != null ? pageRect.getLLX() + 50 : 50;
+        double yTop = pageRect != null ? pageRect.getURY() - 50 : 720;
+        Rectangle linkRect = new Rectangle(x0, yTop - fontSize, x0 + textWidth, yTop);
+        addLinkAnnotation(page, linkRect, href);
+    }
+
+    private static void addLinkAnnotation(Page page, Rectangle rect, String href) {
+        LinkAnnotation link = new LinkAnnotation(page, rect);
+        link.setAction(new GoToURIAction(href));
+        page.getAnnotations().add(link);
     }
 
     private void processInlineChildren(Element el, Page page, CssContext ctx) {
@@ -210,7 +319,7 @@ public class HtmlToPdfConverter {
             if (child.getNodeType() == Node.TEXT_NODE) {
                 String text = child.getTextContent();
                 if (text != null && !text.trim().isEmpty()) {
-                    TextFragment tf = new TextFragment(text.replaceAll("\\s+", " "));
+                    TextFragment tf = new TextFragment(WHITESPACE.matcher(text).replaceAll(" "));
                     applyTextState(tf, ctx);
                     page.getParagraphs().add(tf);
                 }
@@ -239,21 +348,17 @@ public class HtmlToPdfConverter {
 
     private void populateFromLegacyBlocks(String html, Page page) {
         String body = html;
-        Matcher bodyMatcher = Pattern.compile("(?is)<body[^>]*>(.*)</body>").matcher(html);
+        Matcher bodyMatcher = BODY_BLOCK.matcher(html);
         if (bodyMatcher.find()) {
             body = bodyMatcher.group(1);
         }
 
-        body = body.replaceAll("(?is)<[a-z0-9]+\\b[^>]*class\\s*=\\s*['\"][^'\"]*page-break[^'\"]*['\"][^>]*>", "\f");
-        body = body.replaceAll("(?is)<br\\b[^>]*>", "\n");
-        body = body.replaceAll("(?is)<h1\\b[^>]*>", "\n[[H1]]");
-        body = body.replaceAll("(?is)<h2\\b[^>]*>", "\n[[H2]]");
-        body = body.replaceAll("(?is)<h3\\b[^>]*>", "\n[[H3]]");
-        body = body.replaceAll("(?is)<h4\\b[^>]*>", "\n[[H4]]");
-        body = body.replaceAll("(?is)<h5\\b[^>]*>", "\n[[H5]]");
-        body = body.replaceAll("(?is)<h6\\b[^>]*>", "\n[[H6]]");
-        body = body.replaceAll("(?is)<p\\b[^>]*>", "\n[[P]]");
-        body = body.replaceAll("(?is)<li\\b[^>]*>", "\n[[LI]]");
+        body = PAGE_BREAK_TAG.matcher(body).replaceAll("\f");
+        body = BR_TAG.matcher(body).replaceAll("\n");
+        // h1..h6 in a single pass: replacement built from the captured level digit.
+        body = H_OPEN_TAG.matcher(body).replaceAll("\n[[H$1]]");
+        body = P_OPEN_TAG.matcher(body).replaceAll("\n[[P]]");
+        body = LI_OPEN_TAG.matcher(body).replaceAll("\n[[LI]]");
 
         String text = legacyExtractText(body);
         String[] pageChunks = text.split("\f");
@@ -338,7 +443,7 @@ public class HtmlToPdfConverter {
 
     private int countLegacyBlocks(String html) {
         int count = 0;
-        Matcher matcher = Pattern.compile("(?is)<(p|li|h[1-6])\\b").matcher(html);
+        Matcher matcher = LEGACY_BLOCK_TAG.matcher(html);
         while (matcher.find()) {
             count++;
         }
@@ -349,8 +454,7 @@ public class HtmlToPdfConverter {
         if (html == null || html.isEmpty()) {
             return "";
         }
-        String text = html
-                .replaceAll("(?is)<[^>]*>", " ")
+        String text = ANY_TAG.matcher(html).replaceAll(" ")
                 .replace("\f", " \f ")
                 .replace("[[H1]]", "\n[[H1]] ")
                 .replace("[[H2]]", "\n[[H2]] ")
@@ -366,8 +470,8 @@ public class HtmlToPdfConverter {
                 .replace("&lt;", "<")
                 .replace("&gt;", ">")
                 .replace("&quot;", "\"");
-        text = text.replaceAll("[ \\t\\x0B\\r]+", " ");
-        text = text.replaceAll("\\n[ ]+", "\n");
+        text = INLINE_WHITESPACE.matcher(text).replaceAll(" ");
+        text = NEWLINE_INDENT.matcher(text).replaceAll("\n");
         return text.trim();
     }
 
@@ -512,8 +616,7 @@ public class HtmlToPdfConverter {
             return -1;
         }
         int maxPage = -1;
-        Matcher matcher = Pattern.compile("(?is)<span\\b[^>]*class\\s*=\\s*['\"][^'\"]*page[^'\"]*['\"][^>]*>\\s*(\\d+)\\s*</span>")
-                .matcher(html);
+        Matcher matcher = LEGACY_PAGE_SPAN.matcher(html);
         while (matcher.find()) {
             maxPage = Math.max(maxPage, Integer.parseInt(matcher.group(1)));
         }
@@ -780,7 +883,7 @@ public class HtmlToPdfConverter {
             String text = node.getTextContent();
             if (text != null) {
                 // Normalize whitespace
-                text = text.replaceAll("\\s+", " ");
+                text = WHITESPACE.matcher(text).replaceAll(" ");
                 sb.append(text);
             }
         } else if (node.getNodeType() == Node.ELEMENT_NODE) {

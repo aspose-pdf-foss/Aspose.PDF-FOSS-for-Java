@@ -187,6 +187,13 @@ public class PDFEncryptionDict {
 
         d.set(COSName.of("V"), COSInteger.valueOf(V));
         d.set(COSName.of("R"), COSInteger.valueOf(R));
+        // Top-level /Length is required by Adobe Acrobat for V=5 per the
+        // Adobe Supplement to ISO 32000 (PDF 1.7 Extension Level 3) — Acrobat
+        // refuses to open the file with "the document cannot be decrypted"
+        // when this entry is missing. ISO 32000-2 Annex K's example dict also
+        // includes /Length 256 for V=5/R=6. (In PDF 2.0 it is marked
+        // deprecated but still tolerated.) For V ∈ {1, 2, 4} the entry is
+        // also defined by ISO 32000-1 Table 20.
         d.set(COSName.of("Length"), COSInteger.valueOf(length));
         d.set(COSName.of("P"), COSInteger.valueOf(permissions));
         d.set(COSName.of("O"), new COSString(O));
@@ -196,11 +203,16 @@ public class PDFEncryptionDict {
         if (V >= 4) {
             d.set(COSName.of("StmF"), COSName.of("StdCF"));
             d.set(COSName.of("StrF"), COSName.of("StdCF"));
+            // /EncryptMetadata default is true but Adobe Acrobat is strict
+            // about its presence on the encrypt dict for V≥4. Set it
+            // explicitly to keep Perms[8]='T' (set by encrypt()) consistent.
+            d.set(COSName.of("EncryptMetadata"), org.aspose.pdf.engine.cos.COSBoolean.TRUE);
 
             String cfm = (V == 4) ? "AESV2" : "AESV3";
             int cfLen = (V == 4) ? 16 : 32;
 
             COSDictionary stdCF = new COSDictionary();
+            stdCF.set(COSName.of("Type"), COSName.of("CryptFilter"));
             stdCF.set(COSName.of("CFM"), COSName.of(cfm));
             stdCF.set(COSName.of("AuthEvent"), COSName.of("DocOpen"));
             stdCF.set(COSName.of("Length"), COSInteger.valueOf(cfLen));

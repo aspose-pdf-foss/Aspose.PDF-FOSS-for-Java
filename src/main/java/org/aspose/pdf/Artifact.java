@@ -228,6 +228,27 @@ public class Artifact {
     }
 
     /**
+     * Synthesises a self-contained {@code /Artifact BMC ... EMC} (or
+     * {@code BDC ... EMC}) sequence as raw content-stream bytes, registering
+     * any supporting resources (fonts, ExtGState) on the page's
+     * {@code /Resources}.
+     *
+     * <p>Returns {@code null} by default; concrete subclasses (e.g.
+     * {@link BackgroundArtifact}, {@link WatermarkArtifact}) override this
+     * to render their high-level properties. When non-null is returned and
+     * the artifact's {@link #getContents()} is empty, {@link Page} writes
+     * the bytes directly into the content stream instead of emitting an
+     * empty marked-content pair.</p>
+     *
+     * @param page the page on which the artifact will appear
+     * @return raw content-stream bytes (including BMC/EMC wrapper), or
+     *         {@code null} if no synthesis is provided
+     */
+    byte[] synthesizeContentBytes(Page page) {
+        return null;
+    }
+
+    /**
      * Sets the content stream operators for this artifact.
      *
      * @param operators the operators

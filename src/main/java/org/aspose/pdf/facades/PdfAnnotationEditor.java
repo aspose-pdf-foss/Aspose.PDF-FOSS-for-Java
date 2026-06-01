@@ -87,9 +87,16 @@ public class PdfAnnotationEditor {
     }
 
     /**
-     * Flattens all annotations in the document.
-     * This is a simplified implementation that removes annotations from all pages,
-     * effectively merging their appearance into the page content.
+     * Flattens all annotations in the document: each annotation that carries a
+     * normal appearance stream ({@code /AP /N}) has that appearance burned into
+     * the page content stream — wrapped in a {@code q <CTM> cm ... Q} block
+     * whose CTM scales the appearance {@code /BBox} onto the annotation
+     * {@code /Rect} (ISO 32000-1:2008 §12.5.5) — and is then removed from the
+     * page {@code /Annots} array.
+     *
+     * <p>Previously this only deleted annotations without burning their
+     * appearance (Sprint 21 / BUG-F4 fix: delegate to
+     * {@link Page#flattenAnnotations()}).</p>
      *
      * @return {@code true} on success
      */
@@ -97,12 +104,7 @@ public class PdfAnnotationEditor {
         try {
             PageCollection pages = document.getPages();
             for (int i = 1; i <= pages.getCount(); i++) {
-                Page page = pages.get(i);
-                AnnotationCollection annots = page.getAnnotations();
-                // Delete all annotations in reverse order
-                for (int j = annots.getCount(); j >= 1; j--) {
-                    annots.delete(j);
-                }
+                pages.get(i).flattenAnnotations();
             }
             LOG.fine("Flattened all annotations in the document");
             return true;

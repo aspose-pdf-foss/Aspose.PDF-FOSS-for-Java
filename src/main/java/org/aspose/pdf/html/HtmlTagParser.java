@@ -3,6 +3,7 @@ package org.aspose.pdf.html;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Map;
 import java.util.Set;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
@@ -26,6 +27,69 @@ public class HtmlTagParser {
         "default","defer","disabled","formnovalidate","hidden","ismap","loop",
         "multiple","muted","nomodule","novalidate","open","playsinline",
         "readonly","required","reversed","selected");
+
+    // ---------------------------------------------------------------------
+    // Precompiled patterns. ISO note: none here; this is HTML-cleanup tooling.
+    // Compiling these once (rather than on every cleanHtml() call) removes a
+    // large fixed cost and, combined with the alternation patterns below,
+    // turns ~70 full string passes into ~6. See Sprint 27 Part A.
+    // ---------------------------------------------------------------------
+    private static final Pattern IE_CONDITIONAL_PATTERN =
+        Pattern.compile("<!--\\[if[^]]*\\]>[\\s\\S]*?<!\\[endif\\]-->");
+    private static final Pattern IE_OPEN_PATTERN =
+        Pattern.compile("<!\\[if[^]]*\\]>");
+    private static final Pattern IE_ENDIF_PATTERN =
+        Pattern.compile("<!\\[endif\\]>");
+    private static final Pattern CDATA_PATTERN =
+        Pattern.compile("<!\\[CDATA\\[[\\s\\S]*?\\]\\]>");
+    private static final Pattern SCRIPT_PATTERN =
+        Pattern.compile("(?i)<script[^>]*>[\\s\\S]*?</script>");
+    private static final Pattern STYLE_PATTERN =
+        Pattern.compile("(?i)<style[^>]*>[\\s\\S]*?</style>");
+    private static final Pattern COMMENT_PATTERN =
+        Pattern.compile("<!--[\\s\\S]*?-->");
+    private static final Pattern XMLNS_DQ_PATTERN =
+        Pattern.compile("\\s+xmlns\\s*=\\s*\"[^\"]*\"");
+    private static final Pattern XMLNS_SQ_PATTERN =
+        Pattern.compile("\\s+xmlns\\s*=\\s*'[^']*'");
+    /** Missing space between an attribute value's closing quote and the next attr. */
+    private static final Pattern ATTR_GAP_PATTERN =
+        Pattern.compile("([\"'])([a-zA-Z])");
+    /** Unquoted attribute values: name=value -> name="value". */
+    private static final Pattern UNQUOTED_ATTR_PATTERN =
+        Pattern.compile("(?<=\\s)(\\w+)=([a-zA-Z][a-zA-Z0-9_.:-]*)(?=\\s|/?>)");
+
+    /** Single alternation over all void elements: 1 pass instead of 14. */
+    private static final Pattern VOID_ELEMENTS_PATTERN =
+        Pattern.compile("(?i)<(" + String.join("|", VOID_ELEMENTS)
+            + ")(\\s[^>]*?)?\\s*(?<!/)>");
+    /** Single alternation over all boolean attributes: 1 pass instead of 21. */
+    private static final Pattern BOOLEAN_ATTRS_PATTERN =
+        Pattern.compile("(?i)(<[a-zA-Z][^>]*\\s)(" + String.join("|", BOOLEAN_ATTRS)
+            + ")(?=\\s|/?>)");
+
+    /**
+     * Named HTML entities mapped to their replacement characters. Used by the
+     * single-pass entity scanner. XML built-ins (amp/lt/gt/quot/apos) and
+     * numeric entities are intentionally absent — they are passed through.
+     */
+    private static final Map<String, String> NAMED_ENTITIES = Map.ofEntries(
+        Map.entry("nbsp", " "),    Map.entry("mdash", "—"),
+        Map.entry("ndash", "–"),   Map.entry("laquo", "«"),
+        Map.entry("raquo", "»"),   Map.entry("copy", "©"),
+        Map.entry("reg", "®"),     Map.entry("trade", "™"),
+        Map.entry("bull", "•"),    Map.entry("hellip", "…"),
+        Map.entry("ldquo", "“"),   Map.entry("rdquo", "”"),
+        Map.entry("lsquo", "‘"),   Map.entry("rsquo", "’"),
+        Map.entry("euro", "€"),    Map.entry("pound", "£"),
+        Map.entry("yen", "¥"),     Map.entry("cent", "¢"),
+        Map.entry("times", "×"),   Map.entry("divide", "÷"),
+        Map.entry("deg", "°"),     Map.entry("micro", "µ"),
+        Map.entry("para", "¶"),    Map.entry("sect", "§"),
+        Map.entry("acute", "´"),   Map.entry("cedil", "¸"),
+        Map.entry("ordf", "ª"),    Map.entry("ordm", "º"),
+        Map.entry("iquest", "¿"),  Map.entry("iexcl", "¡"),
+        Map.entry("lsaquo", "‹"),  Map.entry("rsaquo", "›"));
 
     private HtmlTagParser() {} // utility class
 
@@ -81,53 +145,47 @@ public class HtmlTagParser {
      */
     static String cleanHtml(String html) {
         // Remove IE conditional comments: <!--[if ...]>...<![endif]-->
-        html = html.replaceAll("<!--\\[if[^]]*\\]>[\\s\\S]*?<!\\[endif\\]-->", "");
+        html = IE_CONDITIONAL_PATTERN.matcher(html).replaceAll("");
         // Remove non-comment IE conditionals: <![if ...]>...<![endif]>
-        html = html.replaceAll("<!\\[if[^]]*\\]>", "");
-        html = html.replaceAll("<!\\[endif\\]>", "");
+        html = IE_OPEN_PATTERN.matcher(html).replaceAll("");
+        html = IE_ENDIF_PATTERN.matcher(html).replaceAll("");
         // Remove CDATA sections
-        html = html.replaceAll("<!\\[CDATA\\[[\\s\\S]*?\\]\\]>", "");
+        html = CDATA_PATTERN.matcher(html).replaceAll("");
 
         // Remove <script> and <style> content (often contains bare < > that break XML)
-        html = html.replaceAll("(?i)<script[^>]*>[\\s\\S]*?</script>", "");
-        html = html.replaceAll("(?i)<style[^>]*>[\\s\\S]*?</style>", "");
+        html = SCRIPT_PATTERN.matcher(html).replaceAll("");
+        html = STYLE_PATTERN.matcher(html).replaceAll("");
 
         // Remove HTML comments (after IE conditionals are handled)
-        html = html.replaceAll("<!--[\\s\\S]*?-->", "");
+        html = COMMENT_PATTERN.matcher(html).replaceAll("");
 
         // Strip xmlns attributes (cause namespace issues in non-namespace-aware mode)
-        html = html.replaceAll("\\s+xmlns\\s*=\\s*\"[^\"]*\"", "");
-        html = html.replaceAll("\\s+xmlns\\s*=\\s*'[^']*'", "");
+        html = XMLNS_DQ_PATTERN.matcher(html).replaceAll("");
+        html = XMLNS_SQ_PATTERN.matcher(html).replaceAll("");
 
         // Fix missing space between attributes: ="value"attr= → ="value" attr=
-        html = html.replaceAll("\"([a-zA-Z])", "\" $1");
-        // Same for single-quoted
-        html = html.replaceAll("'([a-zA-Z])", "' $1");
+        // (handles both " and ' in a single pass)
+        html = ATTR_GAP_PATTERN.matcher(html).replaceAll("$1 $2");
 
-        // Close void elements: <br> -> <br/>, <BR> -> <BR/>, <img src="x"> -> <img src="x"/>
-        // Case-insensitive to handle <BR>, <Hr>, etc.
-        for (String ve : VOID_ELEMENTS) {
-            html = html.replaceAll("(?i)<(" + ve + ")(\\s[^>]*?)?\\s*(?<!/)>", "<$1$2/>");
-        }
+        // Close void elements (single alternation pass): <br> -> <br/>, <BR> -> <BR/>
+        html = VOID_ELEMENTS_PATTERN.matcher(html).replaceAll("<$1$2/>");
 
-        // Fix boolean attributes: <audio controls> → <audio controls="controls">
-        for (String ba : BOOLEAN_ATTRS) {
-            html = html.replaceAll(
-                "(?i)(<[a-zA-Z][^>]*\\s)" + ba + "(?=\\s|/?>)",
-                "$1" + ba + "=\"" + ba + "\"");
+        // Fix boolean attributes (single alternation pass): controls → controls="controls".
+        // A tag may carry several (<input checked disabled>); each pass fixes the first
+        // boolean attr after a '<', so repeat until stable (capped for safety).
+        for (int i = 0; i < 8; i++) {
+            String next = BOOLEAN_ATTRS_PATTERN.matcher(html).replaceAll("$1$2=\"$2\"");
+            if (next.equals(html)) break;
+            html = next;
         }
 
         // Fix unquoted attribute values: name=value → name="value"
         // But skip already-quoted values and numeric entities
-        html = html.replaceAll(
-            "(?<=\\s)(\\w+)=([a-zA-Z][a-zA-Z0-9_.:-]*)(?=\\s|/?>)",
-            "$1=\"$2\"");
+        html = UNQUOTED_ATTR_PATTERN.matcher(html).replaceAll("$1=\"$2\"");
 
-        // Replace named HTML entities with numeric equivalents
-        html = replaceHtmlEntities(html);
-
-        // Catch-all: replace any remaining unknown &name; entities (except XML built-ins)
-        html = html.replaceAll("&(?!amp;|lt;|gt;|quot;|apos;|#)([a-zA-Z]{2,10});", "&#xFFFD;");
+        // Replace named HTML entities, escape bare ampersands, and map unknown
+        // entities — all in a single forward scan (was 32+ separate passes).
+        html = replaceHtmlEntitiesAndEscapeAmps(html);
 
         // Auto-close unclosed tags (skip for very large documents)
         if (html.length() < 500_000) {
@@ -140,49 +198,66 @@ public class HtmlTagParser {
             html = autoCloseTag(html, "dd");
         }
 
-        // Escape bare ampersands (& not followed by # or letter+;)
-        html = html.replaceAll("&(?![a-zA-Z#][a-zA-Z0-9]*;)", "&amp;");
-
         return html;
     }
 
     /**
-     * Replaces common named HTML entities with numeric equivalents.
+     * Single forward scan that, in one pass over the input:
+     * <ul>
+     *   <li>passes through XML built-in entities ({@code &amp; &lt; &gt; &quot; &apos;});</li>
+     *   <li>passes through numeric entities ({@code &#123;}, {@code &#x1A;});</li>
+     *   <li>replaces known named entities (e.g. {@code &nbsp;}) with their character;</li>
+     *   <li>maps unknown named entities to U+FFFD;</li>
+     *   <li>escapes a bare {@code &} (not starting an entity) to {@code &amp;}.</li>
+     * </ul>
+     * This replaces the previous ~31 sequential {@link String#replace} calls plus
+     * two catch-all regex passes, which on a 5&nbsp;MB document meant dozens of full
+     * copies of the string.
      */
-    private static String replaceHtmlEntities(String html) {
-        html = html.replace("&nbsp;", "&#160;");
-        html = html.replace("&mdash;", "&#8212;");
-        html = html.replace("&ndash;", "&#8211;");
-        html = html.replace("&laquo;", "&#171;");
-        html = html.replace("&raquo;", "&#187;");
-        html = html.replace("&copy;", "&#169;");
-        html = html.replace("&reg;", "&#174;");
-        html = html.replace("&trade;", "&#8482;");
-        html = html.replace("&bull;", "&#8226;");
-        html = html.replace("&hellip;", "&#8230;");
-        html = html.replace("&ldquo;", "&#8220;");
-        html = html.replace("&rdquo;", "&#8221;");
-        html = html.replace("&lsquo;", "&#8216;");
-        html = html.replace("&rsquo;", "&#8217;");
-        html = html.replace("&euro;", "&#8364;");
-        html = html.replace("&pound;", "&#163;");
-        html = html.replace("&yen;", "&#165;");
-        html = html.replace("&cent;", "&#162;");
-        html = html.replace("&times;", "&#215;");
-        html = html.replace("&divide;", "&#247;");
-        html = html.replace("&deg;", "&#176;");
-        html = html.replace("&micro;", "&#181;");
-        html = html.replace("&para;", "&#182;");
-        html = html.replace("&sect;", "&#167;");
-        html = html.replace("&acute;", "&#180;");
-        html = html.replace("&cedil;", "&#184;");
-        html = html.replace("&ordf;", "&#170;");
-        html = html.replace("&ordm;", "&#186;");
-        html = html.replace("&iquest;", "&#191;");
-        html = html.replace("&iexcl;", "&#161;");
-        html = html.replace("&lsaquo;", "&#8249;");
-        html = html.replace("&rsaquo;", "&#8250;");
-        return html;
+    private static String replaceHtmlEntitiesAndEscapeAmps(String html) {
+        int len = html.length();
+        StringBuilder sb = new StringBuilder(len + len / 16); // small slack
+        int i = 0;
+        while (i < len) {
+            char c = html.charAt(i);
+            if (c != '&') {
+                sb.append(c);
+                i++;
+                continue;
+            }
+            // Find ';' within a reasonable distance (entity names are short).
+            int semi = -1;
+            int maxScan = Math.min(i + 12, len);
+            for (int j = i + 1; j < maxScan; j++) {
+                char cj = html.charAt(j);
+                if (cj == ';') { semi = j; break; }
+                // An entity body is [A-Za-z0-9#] only; anything else means it is
+                // a bare ampersand, not an entity.
+                if (!Character.isLetterOrDigit(cj) && cj != '#') break;
+            }
+            if (semi < 0) {
+                sb.append("&amp;"); // bare ampersand
+                i++;
+                continue;
+            }
+            String inner = html.substring(i + 1, semi);
+            // XML built-ins and numeric entities: pass through verbatim.
+            if (inner.equals("amp") || inner.equals("lt") || inner.equals("gt")
+                    || inner.equals("quot") || inner.equals("apos")
+                    || (!inner.isEmpty() && inner.charAt(0) == '#')) {
+                sb.append('&').append(inner).append(';');
+                i = semi + 1;
+                continue;
+            }
+            String repl = NAMED_ENTITIES.get(inner);
+            if (repl != null) {
+                sb.append(repl);
+            } else {
+                sb.append('�'); // unknown named entity
+            }
+            i = semi + 1;
+        }
+        return sb.toString();
     }
 
     /**

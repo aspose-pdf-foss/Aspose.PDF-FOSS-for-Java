@@ -43,6 +43,12 @@ import java.util.logging.Logger;
  */
 public class PdfExtractor implements Closeable {
 
+    static {
+        // Bootstrap library logging (silent by default) for facade-only entry
+        // paths that may not construct a Document first (Sprint 24 Part B).
+        org.aspose.pdf.AsposePdfLogging.configureFromSystemProperty();
+    }
+
     private static final Logger LOG = Logger.getLogger(PdfExtractor.class.getName());
 
     private Document document;
@@ -56,7 +62,10 @@ public class PdfExtractor implements Closeable {
     private int startPage = 1;
     private int endPage = Integer.MAX_VALUE;
     private int extractTextMode = -1;
-    private Charset outputEncoding = StandardCharsets.UTF_8;
+    // BUG-ENC-001 (Sprint 22): default to UTF-16LE without BOM, matching the
+    // Aspose.PDF for .NET wire format that ported tests decode with. Callers can
+    // override via setOutputEncoding(...) / extractText(Charset).
+    private Charset outputEncoding = StandardCharsets.UTF_16LE;
     private boolean bidi;
     private TextSearchOptions textSearchOptions;
     private Resolution resolution = new Resolution(72);
@@ -261,7 +270,7 @@ public class PdfExtractor implements Closeable {
      */
     public void extractText(Charset encoding) throws IOException {
         if (document == null) throw new IllegalStateException("No document bound");
-        this.outputEncoding = encoding != null ? encoding : StandardCharsets.UTF_8;
+        this.outputEncoding = encoding != null ? encoding : StandardCharsets.UTF_16LE;
         extractedPageTexts.clear();
         pageTextIndex = -1;
         TextAbsorber documentAbsorber = new TextAbsorber(createTextExtractionOptions());
@@ -606,7 +615,7 @@ public class PdfExtractor implements Closeable {
     }
 
     private byte[] getTextBytes(String text) {
-        return (text != null ? text : "").getBytes(outputEncoding != null ? outputEncoding : StandardCharsets.UTF_8);
+        return (text != null ? text : "").getBytes(outputEncoding != null ? outputEncoding : StandardCharsets.UTF_16LE);
     }
 
     private byte[] getNextPageTextBytes() {

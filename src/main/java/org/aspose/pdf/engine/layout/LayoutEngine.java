@@ -59,6 +59,16 @@ public class LayoutEngine {
 
     private static final Logger LOG = Logger.getLogger(LayoutEngine.class.getName());
 
+    // Precompiled tag-stripping patterns for stripHtmlTags (Sprint 27 Part C).
+    private static final java.util.regex.Pattern BR_TAG =
+            java.util.regex.Pattern.compile("(?i)<br\\s*/?>");
+    private static final java.util.regex.Pattern P_OPEN_TAG =
+            java.util.regex.Pattern.compile("(?i)<p[^>]*>");
+    private static final java.util.regex.Pattern P_CLOSE_TAG =
+            java.util.regex.Pattern.compile("(?i)</p>");
+    private static final java.util.regex.Pattern ANY_TAG =
+            java.util.regex.Pattern.compile("<[^>]+>");
+
     /** Default font when none is specified in the TextState. */
     private static final String DEFAULT_FONT = "Helvetica";
 
@@ -67,6 +77,10 @@ public class LayoutEngine {
 
     /** Default cell padding when none is specified. */
     private static final double DEFAULT_CELL_PADDING = 2.0;
+
+    /** Fallback per-column width used when a table has no explicit ColumnWidths
+     *  and the available content width could not be determined. */
+    private static final double DEFAULT_AUTO_COLUMN_WIDTH = 100.0;
 
     /** Current page number (1-based) for $p substitution. */
     private int currentPageNumber = 1;
@@ -296,6 +310,121 @@ public class LayoutEngine {
     }
 
     /**
+     * The rendered header/footer of a page, ready to be wrapped as a Form
+     * XObject overlay. Used for documents loaded from disk, where the full
+     * layout pass ({@link #layout(Page)}) does not run and would otherwise
+     * overwrite the page's existing content.
+     */
+    public static final class HeaderFooterOverlay {
+        /** Content-stream bytes drawing the header/footer in page user space. */
+        public final byte[] content;
+        /** The {@code /Resources} dictionary (fonts, image XObjects) referenced by {@link #content}. */
+        public final COSDictionary resources;
+
+        HeaderFooterOverlay(byte[] content, COSDictionary resources) {
+            this.content = content;
+            this.resources = resources;
+        }
+    }
+
+    /**
+     * Lays out only this page's header and footer paragraphs (set via
+     * {@link Page#setHeader}/{@link Page#setFooter}) into a standalone content
+     * stream, WITHOUT touching the page's existing {@code /Contents} or
+     * {@code /Resources}. Callers wrap the result as a Form XObject overlay.
+     * <p>
+     * This is the loaded-document counterpart to {@link #layout(Page)}: that
+     * method rebuilds the whole page from paragraphs (replacing content), which
+     * is correct only for newly authored pages. PDFNET-38279: footers applied
+     * to the pages of an existing PDF must be appended, not replace the original
+     * content.
+     * </p>
+     *
+     * @param page the page whose header/footer to render
+     * @return the overlay content + resources, or {@code null} if the page has
+     *         neither a header nor a footer with paragraphs
+     */
+    public HeaderFooterOverlay buildHeaderFooterOverlay(Page page) {
+        if (page == null) {
+            throw new IllegalArgumentException("Page must not be null");
+        }
+        HeaderFooter header = page.getHeader();
+        HeaderFooter footer = page.getFooter();
+        boolean hasHeader = header != null && header.getParagraphs() != null
+                && !header.getParagraphs().isEmpty();
+        boolean hasFooter = footer != null && footer.getParagraphs() != null
+                && !footer.getParagraphs().isEmpty();
+        if (!hasHeader && !hasFooter) {
+            return null;
+        }
+
+        // Page dimensions / margins — mirror layout()'s resolution so footer
+        // positions line up with the rest of the engine.
+        double pageWidth;
+        double pageHeight;
+        MarginInfo margins;
+        PageInfo pageInfo = page.getPageInfo();
+        if (pageInfo != null) {
+            pageWidth = pageInfo.getWidth();
+            pageHeight = pageInfo.getHeight();
+            margins = pageInfo.getMargin() != null
+                    ? toMarginInfo(pageInfo.getMargin())
+                    : new MarginInfo();
+        } else {
+            Rectangle mediaBox = page.getMediaBox();
+            if (mediaBox != null) {
+                pageWidth = mediaBox.getWidth();
+                pageHeight = mediaBox.getHeight();
+            } else {
+                pageWidth = 595;
+                pageHeight = 842;
+            }
+            margins = new MarginInfo(90, 90, 90, 90);
+        }
+
+        lastLineBaselineY = Double.NaN;
+        lastLineRightX = Double.NaN;
+        lastLineHeight = Double.NaN;
+        inlineFirstLineX = Double.NaN;
+
+        LayoutContext ctx = new LayoutContext(pageWidth, pageHeight, margins);
+        ContentStreamBuilder builder = new ContentStreamBuilder();
+        ResourceBuilder resources = new ResourceBuilder();
+
+        if (hasHeader) {
+            for (BaseParagraph para : header.getParagraphs()) {
+                layoutParagraph(para, builder, resources, ctx);
+            }
+        }
+
+        if (hasFooter) {
+            // The footer occupies the bottom-margin band. Lay it out in a
+            // context whose content floor is the page bottom (bottom margin 0)
+            // and start the cursor at the original bottom-margin line, so a
+            // multi-paragraph footer (e.g. image + text + page number) flows
+            // downward into the band instead of being clipped by the main
+            // content floor after the first paragraph (PDFNET-38279).
+            MarginInfo footerMargins = new MarginInfo(
+                    margins.getLeft(), 0, margins.getRight(), margins.getTop());
+            LayoutContext footerCtx = new LayoutContext(pageWidth, pageHeight, footerMargins);
+            footerCtx.setCursorY(margins.getBottom() > 0 ? margins.getBottom() : 72);
+            for (BaseParagraph para : footer.getParagraphs()) {
+                layoutParagraph(para, builder, resources, footerCtx);
+            }
+        }
+
+        // Sync any fonts the builder registered into the resource builder
+        // (mirrors layout() step 8) so the overlay's /Resources is complete.
+        for (java.util.Map.Entry<String, String> entry : builder.getFontResources().entrySet()) {
+            if (resources.getFontResourceName(entry.getKey()) == null) {
+                resources.addFont(entry.getKey());
+            }
+        }
+
+        return new HeaderFooterOverlay(builder.toByteArray(), resources.buildResourcesDictionary());
+    }
+
+    /**
      * Dispatches a paragraph to the appropriate type-specific renderer.
      *
      * @param para      the paragraph to lay out
@@ -381,6 +510,15 @@ public class LayoutEngine {
         }
         if (text == null || text.isEmpty()) {
             return 0;
+        }
+
+        // Rich multi-segment fragment: when the segments carry heterogeneous
+        // styles (differing font style or color), render each as its own
+        // styled run on a shared baseline so per-segment bold/italic/color
+        // survives the save→reload round trip (PDFNEWNET_48777). Uniform and
+        // single-segment fragments fall through to the word-wrapping path.
+        if (hasHeterogeneousSegments(tf)) {
+            return layoutRichSegments(tf, builder, resources, ctx);
         }
 
         // Substitute page number variables ($p = current page, $P = total pages)
@@ -534,6 +672,173 @@ public class LayoutEngine {
         }
 
         return totalHeight;
+    }
+
+    /**
+     * Returns {@code true} when the fragment has at least two non-empty
+     * segments whose styles differ in font style or foreground color. Such
+     * fragments must be rendered run-by-run (see {@link #layoutRichSegments});
+     * uniform or single-segment fragments render via the normal concatenated
+     * path. The font name is deliberately NOT part of the test: many
+     * fragments carry font/size only on the first segment as a placeholder,
+     * and treating that as "heterogeneous" would needlessly divert them.
+     */
+    private boolean hasHeterogeneousSegments(TextFragment tf) {
+        if (tf.getSegments() == null || tf.getSegments().size() < 2) {
+            return false;
+        }
+        boolean first = true;
+        int style0 = 0;
+        Color color0 = null;
+        for (TextSegment seg : tf.getSegments()) {
+            if (seg.getText() == null || seg.getText().isEmpty()) {
+                continue;
+            }
+            TextState st = seg.getTextState();
+            int style = st != null ? st.getFontStyle() : 0;
+            Color color = st != null ? st.getForegroundColor() : null;
+            if (first) {
+                style0 = style;
+                color0 = color;
+                first = false;
+            } else {
+                if (style != style0) return true;
+                if (!java.util.Objects.equals(color, color0)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Renders a fragment whose segments carry heterogeneous styles as a
+     * sequence of styled runs sharing one baseline. Each segment emits its
+     * own fill color and font (including a synthesized bold/italic standard-14
+     * variant via {@link #applyFontStyle}), so per-segment styling survives a
+     * save→reload round trip. No intra-fragment word wrapping is performed —
+     * styled rich runs are assumed short, matching the Aspose generator.
+     */
+    private double layoutRichSegments(TextFragment tf, ContentStreamBuilder builder,
+                                      ResourceBuilder resources, LayoutContext ctx) {
+        // Each segment is rendered with its OWN TextState. We deliberately do
+        // NOT inherit from tf.getTextState(): in this API that getter aliases
+        // segments.get(0), so treating it as a "fragment default" would leak
+        // the first segment's style/color onto the others. Unset properties
+        // fall back to the engine defaults instead.
+
+        // First pass: size the line (largest segment font) and total width
+        // (for center/right alignment).
+        double maxSize = DEFAULT_FONT_SIZE;
+        double totalWidth = 0;
+        for (TextSegment seg : tf.getSegments()) {
+            String segText = seg.getText();
+            if (segText == null || segText.isEmpty()) continue;
+            TextState st = seg.getTextState();
+            double size = (st != null && st.getFontSize() > 0) ? st.getFontSize() : DEFAULT_FONT_SIZE;
+            int style = st != null ? st.getFontStyle() : 0;
+            String base = (st != null && st.getFontName() != null) ? st.getFontName() : DEFAULT_FONT;
+            String styled = applyFontStyle(base, style);
+            maxSize = Math.max(maxSize, size);
+            totalWidth += TextLayoutHelper.measureTextWidth(segText, styled, size);
+        }
+
+        double lineHeight = TextLayoutHelper.getLineHeight(DEFAULT_FONT, maxSize);
+        if (!ctx.hasSpace(lineHeight)) {
+            return 0;
+        }
+        double baselineY = ctx.getCursorY() - lineHeight;
+
+        double availWidth = ctx.getAvailableWidth();
+        double x = ctx.getContentLeft();
+        HorizontalAlignment align = tf.getHorizontalAlignment();
+        if (align == HorizontalAlignment.Center) {
+            x = ctx.getContentLeft() + (availWidth - totalWidth) / 2.0;
+        } else if (align == HorizontalAlignment.Right) {
+            x = ctx.getContentRight() - totalWidth;
+        }
+
+        // Second pass: emit one styled run per segment.
+        for (TextSegment seg : tf.getSegments()) {
+            String segText = seg.getText();
+            if (segText == null || segText.isEmpty()) continue;
+            TextState st = seg.getTextState();
+            double size = (st != null && st.getFontSize() > 0) ? st.getFontSize() : DEFAULT_FONT_SIZE;
+            int style = st != null ? st.getFontStyle() : 0;
+            String base = (st != null && st.getFontName() != null) ? st.getFontName() : DEFAULT_FONT;
+            Color color = st != null ? st.getForegroundColor() : null;
+            String styled = applyFontStyle(base, style);
+            String fontResource = registerFontResource(st, styled, resources, builder);
+
+            builder.beginText();
+            if (color != null) {
+                emitColor(color, builder, true);
+            }
+            builder.setFont(fontResource, size);
+            builder.moveText(x, baselineY);
+            builder.showText(segText);
+            builder.endText();
+
+            x += TextLayoutHelper.measureTextWidth(segText, styled, size);
+        }
+
+        ctx.advanceCursor(lineHeight);
+        // Publish baseline so a following inline-continuation paragraph aligns.
+        lastLineBaselineY = baselineY;
+        lastLineRightX = x;
+        lastLineHeight = lineHeight;
+        return lineHeight;
+    }
+
+    /**
+     * Maps a base font name + {@link org.aspose.pdf.text.FontStyles} bitmask
+     * to a styled BaseFont name. Standard-14 families map to their canonical
+     * variant ("Helvetica" + Bold → "Helvetica-Bold"); other families get a
+     * "<name>,Bold" suffix so the weight is still encoded in the name and
+     * recoverable on reload even when the exact face is substituted.
+     */
+    private String applyFontStyle(String base, int style) {
+        boolean bold = (style & org.aspose.pdf.text.FontStyles.Bold) != 0;
+        boolean italic = (style & org.aspose.pdf.text.FontStyles.Italic) != 0;
+        if ((!bold && !italic) || base == null) {
+            return base;
+        }
+        String lower = base.toLowerCase();
+        if (lower.contains("bold") || lower.contains("italic") || lower.contains("oblique")) {
+            return base;   // already carries a style marker
+        }
+        String family = standard14Family(lower);
+        if (family != null) {
+            return styledStandard14(family, bold, italic);
+        }
+        String suffix = (bold && italic) ? "BoldItalic" : (bold ? "Bold" : "Italic");
+        return base + "," + suffix;
+    }
+
+    /** Canonical standard-14 family for a (lower-cased) base name, or null. */
+    private String standard14Family(String lowerName) {
+        if (lowerName.startsWith("helvetica") || lowerName.startsWith("arial")) return "Helvetica";
+        if (lowerName.startsWith("times")) return "Times";
+        if (lowerName.startsWith("courier")) return "Courier";
+        return null;
+    }
+
+    /** Standard-14 styled variant name for a family + bold/italic flags. */
+    private String styledStandard14(String family, boolean bold, boolean italic) {
+        switch (family) {
+            case "Helvetica":
+                if (bold && italic) return "Helvetica-BoldOblique";
+                if (bold) return "Helvetica-Bold";
+                return "Helvetica-Oblique";
+            case "Courier":
+                if (bold && italic) return "Courier-BoldOblique";
+                if (bold) return "Courier-Bold";
+                return "Courier-Oblique";
+            case "Times":
+                if (bold && italic) return "Times-BoldItalic";
+                if (bold) return "Times-Bold";
+                return "Times-Italic";
+            default:
+                return family;
+        }
     }
 
     /**
@@ -1049,15 +1354,29 @@ public class LayoutEngine {
      */
     public double layoutTable(Table table, ContentStreamBuilder builder,
                                ResourceBuilder resources, LayoutContext ctx) {
-        // Parse column widths
-        double[] colWidths = parseColumnWidths(table.getColumnWidths());
-        if (colWidths.length == 0) {
-            LOG.warning("Table has no column widths defined");
-            return 0;
-        }
-
         double tableStartY = ctx.getCursorY();
         double tableX = ctx.getContentLeft();
+
+        // Parse column widths. If none are specified, Aspose auto-sizes the table:
+        // the number of columns is derived from the widest row (counting colspans)
+        // and the available content width is distributed evenly across them.
+        double[] colWidths = parseColumnWidths(table.getColumnWidths());
+        if (colWidths.length == 0) {
+            int columnCount = countColumns(table);
+            if (columnCount == 0) {
+                LOG.fine("Table has no rows/cells; nothing to lay out");
+                return 0;
+            }
+            double available = ctx.getContentRight() - tableX;
+            if (available <= 0) {
+                available = columnCount * DEFAULT_AUTO_COLUMN_WIDTH;
+            }
+            double each = available / columnCount;
+            colWidths = new double[columnCount];
+            for (int i = 0; i < columnCount; i++) {
+                colWidths[i] = each;
+            }
+        }
         double totalTableWidth = 0;
         for (double w : colWidths) {
             totalTableWidth += w;
@@ -1257,15 +1576,16 @@ public class LayoutEngine {
      */
     private String stripHtmlTags(String html) {
         String text = html;
-        text = text.replaceAll("(?i)<br\\s*/?>", "\n");
-        text = text.replaceAll("(?i)<p[^>]*>", "\n");
-        text = text.replaceAll("(?i)</p>", "");
-        text = text.replaceAll("<[^>]+>", "");
-        text = text.replaceAll("&amp;", "&");
-        text = text.replaceAll("&lt;", "<");
-        text = text.replaceAll("&gt;", ">");
-        text = text.replaceAll("&nbsp;", " ");
-        text = text.replaceAll("&quot;", "\"");
+        text = BR_TAG.matcher(text).replaceAll("\n");
+        text = P_OPEN_TAG.matcher(text).replaceAll("\n");
+        text = P_CLOSE_TAG.matcher(text).replaceAll("");
+        text = ANY_TAG.matcher(text).replaceAll("");
+        // Entities are literal substitutions — no regex needed.
+        text = text.replace("&amp;", "&");
+        text = text.replace("&lt;", "<");
+        text = text.replace("&gt;", ">");
+        text = text.replace("&nbsp;", " ");
+        text = text.replace("&quot;", "\"");
         return text.trim();
     }
 
@@ -1623,16 +1943,42 @@ public class LayoutEngine {
         for (BaseParagraph para : paras) {
             if (para instanceof TextFragment) {
                 TextFragment tf = (TextFragment) para;
+
+                // When a fragment is built segment-by-segment (no setText), the
+                // top-level getText() is empty but the segments carry the content.
+                // Mirror layoutTextFragment so both construction styles render.
+                String text = tf.getText();
+                if ((text == null || text.isEmpty())
+                        && tf.getSegments() != null && !tf.getSegments().isEmpty()) {
+                    StringBuilder sb = new StringBuilder();
+                    for (TextSegment seg : tf.getSegments()) {
+                        if (seg.getText() != null) sb.append(seg.getText());
+                    }
+                    text = sb.toString();
+                }
+                if (text == null || text.isEmpty()) {
+                    continue;
+                }
+
+                // Prefer the first segment's TextState when it carries font info;
+                // the fragment-level state is often a barebones placeholder.
                 TextState ts = tf.getTextState();
+                if (!tf.getSegments().isEmpty() && tf.getSegments().get(0).getTextState() != null) {
+                    TextState segTs = tf.getSegments().get(0).getTextState();
+                    if (segTs.getFontName() != null || segTs.getFontSize() > 0
+                            || segTs.getLineSpacing() > 0) {
+                        ts = segTs;
+                    }
+                }
                 String fontName = (ts != null && ts.getFontName() != null) ? ts.getFontName() : DEFAULT_FONT;
                 double fontSize = (ts != null && ts.getFontSize() > 0) ? ts.getFontSize() : DEFAULT_FONT_SIZE;
 
                 String fontResource = resources.addFont(fontName);
                 builder.registerFont(fontName);
 
-                String text = tf.getText();
-                if (text == null || text.isEmpty()) {
-                    continue;
+                // Normalize line breaks: a leftover \r would render as '?' in WinAnsi.
+                if (text.indexOf('\r') >= 0) {
+                    text = text.replace("\r\n", "\n").replace('\r', '\n');
                 }
 
                 List<String> lines = TextLayoutHelper.wrapText(text, fontName, fontSize, width);
@@ -1784,6 +2130,27 @@ public class LayoutEngine {
      * @param columnWidths the column widths string (e.g. "100 200 150")
      * @return the parsed widths array, or empty array if null/empty
      */
+    /**
+     * Determines the number of columns of a table that has no explicit
+     * ColumnWidths, by taking the widest row (summing each cell's colspan).
+     *
+     * @param table the table
+     * @return the column count, or 0 if the table has no cells
+     */
+    private int countColumns(Table table) {
+        int max = 0;
+        for (Row row : table.getRows()) {
+            int count = 0;
+            for (Cell cell : row.getCells()) {
+                count += Math.max(1, cell.getColSpan());
+            }
+            if (count > max) {
+                max = count;
+            }
+        }
+        return max;
+    }
+
     private double[] parseColumnWidths(String columnWidths) {
         if (columnWidths == null || columnWidths.trim().isEmpty()) {
             return new double[0];

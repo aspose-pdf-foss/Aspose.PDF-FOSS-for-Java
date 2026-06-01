@@ -138,6 +138,23 @@ public class Resources {
     }
 
     /**
+     * Returns the collection of Form XObjects from /XObject (ISO 32000-1:2008, §8.10).
+     * <p>The collection is a live view: entries added to the underlying /XObject
+     * dictionary with {@code /Subtype /Form} appear on subsequent access. Lazily
+     * creates the /XObject sub-dictionary if absent.</p>
+     *
+     * @return the form collection (never null; may be empty)
+     */
+    public XFormCollection getForms() {
+        COSDictionary xobjects = getXObjects();
+        if (xobjects == null) {
+            xobjects = new COSDictionary();
+            dict.set(XOBJECT, xobjects);
+        }
+        return new XFormCollection(xobjects, parser);
+    }
+
+    /**
      * Returns the underlying COS dictionary.
      *
      * @return the raw COS dictionary

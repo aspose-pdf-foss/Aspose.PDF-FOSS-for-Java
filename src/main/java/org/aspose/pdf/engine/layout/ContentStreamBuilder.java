@@ -434,7 +434,7 @@ public class ContentStreamBuilder {
      * @param ch the Unicode character
      * @return the WinAnsi byte value (0-255), or -1 if not representable
      */
-    static int unicodeToWinAnsi(char ch) {
+    public static int unicodeToWinAnsi(char ch) {
         // Direct mapping for ASCII and Latin-1 supplement (160-255)
         if (ch < 128) {
             return ch;

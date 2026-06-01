@@ -3,11 +3,21 @@ package org.aspose.pdf;
 import java.util.logging.Logger;
 
 /**
- * Represents margin information (top, bottom, left, right) for a content element.
- * <p>
- * All margin values are expressed in PDF user-space units (1/72 inch).
- * Default values are 0 for all sides.
- * </p>
+ * Represents margin information for a content element. All margin values are
+ * expressed in PDF user-space units (1/72 inch), default 0 for all sides.
+ *
+ * <p><strong>Constructor argument order: (left, bottom, right, top)</strong> —
+ * this matches Aspose .NET's {@code MarginInfo(double, double, double, double)}.
+ * Note that this is <em>not</em> the same order as the (now-deprecated) nested
+ * {@code PageInfo.MarginInfo(top, bottom, left, right)}. Example:</p>
+ *
+ * <pre>{@code
+ * // 50pt left + 80pt right margins, 60pt top/bottom:
+ * MarginInfo m = new MarginInfo(50, 60, 80, 60);
+ * pageInfo.setMargin(m);
+ * }</pre>
+ *
+ * <p>If you only need uniform margins, use {@link #MarginInfo(double)}.</p>
  */
 public class MarginInfo {
 

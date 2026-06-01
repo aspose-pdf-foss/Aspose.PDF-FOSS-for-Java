@@ -181,6 +181,47 @@ public final class OperatorCollection implements Iterable<Operator> {
         operators.remove(index - 1);
     }
 
+    /**
+     * Removes every operator contained in {@code toDelete} from this
+     * collection, matching by reference identity (not {@code equals}). Mirrors
+     * the C# {@code OperatorCollection.Delete(List&lt;Operator&gt;)} overload,
+     * which is typically fed the {@code Selected} list of one or more
+     * {@link OperatorSelector}s.
+     * <p>
+     * Identity semantics matter: two distinct operator instances that happen to
+     * be equal by value are treated as different — only the exact instances in
+     * {@code toDelete} are removed.
+     * </p>
+     *
+     * @param toDelete operators to remove; null or empty is a no-op
+     */
+    public void delete(java.util.List<Operator> toDelete) {
+        if (toDelete == null || toDelete.isEmpty()) {
+            return;
+        }
+        java.util.Set<Operator> deleteSet =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        deleteSet.addAll(toDelete);
+        operators.removeIf(deleteSet::contains);
+    }
+
+    /**
+     * Visitor entry point: invokes {@link IOperatorSelector#visit(Operator)}
+     * for each operator in this collection, in order. Mirrors the C#
+     * {@code OperatorCollection.Accept(IOperatorSelector)}.
+     *
+     * @param visitor the selector that processes each operator
+     * @throws IllegalArgumentException if {@code visitor} is null
+     */
+    public void accept(org.aspose.pdf.operators.IOperatorSelector visitor) {
+        if (visitor == null) {
+            throw new IllegalArgumentException("Visitor must not be null");
+        }
+        for (Operator op : operators) {
+            visitor.visit(op);
+        }
+    }
+
     /** Removes every operator from this collection. */
     public void clear() {
         operators.clear();

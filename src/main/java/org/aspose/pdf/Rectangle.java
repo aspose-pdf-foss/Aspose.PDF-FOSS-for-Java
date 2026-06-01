@@ -36,7 +36,7 @@ public class Rectangle {
         this.lly = lly;
         this.urx = urx;
         this.ury = ury;
-        LOG.fine(() -> "Rectangle created: [" + llx + ", " + lly + ", " + urx + ", " + ury + "]");
+        LOG.finer(() -> "Rectangle created: [" + llx + ", " + lly + ", " + urx + ", " + ury + "]"); // per-object trace: debug level (Sprint 32 A)
     }
 
     /**

@@ -12,6 +12,12 @@ import org.aspose.pdf.engine.cos.COSBase;
 import org.aspose.pdf.engine.cos.COSName;
 import org.aspose.pdf.engine.cos.COSStream;
 import org.aspose.pdf.engine.cos.COSString;
+import org.aspose.pdf.operators.BT;
+import org.aspose.pdf.operators.ET;
+import org.aspose.pdf.operators.MoveToNextLineShowText;
+import org.aspose.pdf.operators.SelectFont;
+import org.aspose.pdf.operators.SetGlyphsPositionShowText;
+import org.aspose.pdf.operators.SetSpacingMoveToNextLineShowText;
 import org.aspose.pdf.operators.ShowText;
 
 import java.io.IOException;
@@ -44,12 +50,25 @@ public class TextFragment extends BaseParagraph {
     private Rectangle rectangle;
     private Page page;
 
+    // Text baseline rotation in device space, quantized to {0,90,180,270}.
+    // Computed by the extractor from the combined text-matrix×CTM. 0 means the
+    // ordinary horizontal left-to-right writing direction. Used by
+    // TextAbsorber to group extracted glyphs into lines along the correct axis
+    // (rotated text advances along Y and stacks lines along X). See BUG-EXT-WSPC.
+    private int rotation = 0;
+
     private org.aspose.pdf.Note footNote;
     private org.aspose.pdf.Note endNote;
 
     // Source location for content stream modification
     private int sourceOperatorIndex = -1;
     private int lastSourceOperatorIndex = -1;
+    // Sprint 36: track the source operator by identity so we can re-derive its
+    // current index after a sibling fragment's update inserted/removed ops in
+    // the same collection. Stale `sourceOperatorIndex` would otherwise point
+    // at the wrong operator and silently corrupt subsequent replacements.
+    private Operator sourceOperator;
+    private Operator lastSourceOperator;
     private String sourceFontName;
     private int sourceTextStart = 0;
     private int sourceTextLength = -1;
@@ -187,7 +206,9 @@ public class TextFragment extends BaseParagraph {
         double pageWidth = page.getRect() != null ? page.getRect().getURX() - startX : 0;
         double bestWidth = pageWidth;
         boolean foundRightNeighbor = false;
-        List<TextFragment> pageFragments = new TextExtractor(null).extract(page);
+        List<TextFragment> pageFragments = new TextExtractor(
+                page.getOwningDocument() != null ? page.getOwningDocument().getParser() : null)
+                .extract(page);
         for (TextFragment candidate : pageFragments) {
             Rectangle candidateRect = candidate.getRectangle();
             if (candidateRect == null) {
@@ -250,7 +271,24 @@ public class TextFragment extends BaseParagraph {
         if (ops == null) {
             return;
         }
-        if (sourceOperatorIndex >= ops.size()) return;
+        // Sprint 36: re-derive the index from operator identity so a sibling
+        // fragment's insert (e.g. font-restore via insertFontRestoreAfter)
+        // doesn't leave us pointing at the wrong op.
+        if (sourceOperator != null) {
+            int refreshed = indexOfByIdentity(ops, sourceOperator);
+            if (refreshed >= 0) {
+                sourceOperatorIndex = refreshed;
+            }
+        }
+        if (lastSourceOperator != null && lastSourceOperator != sourceOperator) {
+            int refreshed = indexOfByIdentity(ops, lastSourceOperator);
+            if (refreshed >= 0) {
+                lastSourceOperatorIndex = refreshed;
+            }
+        } else if (lastSourceOperator == sourceOperator && sourceOperator != null) {
+            lastSourceOperatorIndex = sourceOperatorIndex;
+        }
+        if (sourceOperatorIndex < 0 || sourceOperatorIndex >= ops.size()) return;
 
         boolean mutated = false;
         int last = lastSourceOperatorIndex >= sourceOperatorIndex
@@ -271,6 +309,16 @@ public class TextFragment extends BaseParagraph {
             }
         }
 
+        // Sprint 36: emit a font-restore operator (`Tf /FontName Size`)
+        // immediately after the last modified text-show op. Mirrors Aspose
+        // redaction-pipeline behaviour where the original font state is
+        // re-asserted after every replacement so subsequent content keeps
+        // rendering in the right font and assertions like PDFNET_43250's
+        // "original font really restored after text replacement" succeed.
+        if (mutated) {
+            insertFontRestoreAfter(ops, last);
+        }
+
         if (mutated) {
             if (sourceContentStream != null) {
                 // setDecodedData clears the encoded cache; the writer's
@@ -285,12 +333,62 @@ public class TextFragment extends BaseParagraph {
         }
     }
 
-    private static byte[] serializeOperators(OperatorCollection ops) {
-        StringBuilder sb = new StringBuilder();
-        for (Operator op : ops) {
-            sb.append(op.toString()).append('\n');
+    /** Returns the 0-based index of {@code op} in {@code ops} by reference, or -1. */
+    private static int indexOfByIdentity(OperatorCollection ops, Operator op) {
+        if (op == null) return -1;
+        for (int i = 0; i < ops.size(); i++) {
+            if (ops.getAt(i) == op) return i;
         }
-        return sb.toString().getBytes(StandardCharsets.US_ASCII);
+        return -1;
+    }
+
+    /**
+     * Inserts a copy of the currently active {@code Tf} (font selection)
+     * operator immediately after {@code textShowIdx}. Walks backwards within
+     * the enclosing {@code BT..ET} block to find the most recent SelectFont
+     * and clones its font name + size. No-op if none is found (e.g. the
+     * modified op sits outside a text object, which would be a malformed
+     * content stream).
+     */
+    private static int insertFontRestoreAfter(OperatorCollection ops, int textShowIdx) {
+        if (textShowIdx < 0 || textShowIdx + 1 > ops.size()) {
+            return -1;
+        }
+        for (int i = textShowIdx - 1; i >= 0; i--) {
+            Operator op = ops.getAt(i);
+            if (op instanceof SelectFont) {
+                SelectFont src = (SelectFont) op;
+                String name = src.getFontName();
+                if (name == null || name.isEmpty()) {
+                    return -1;
+                }
+                ops.addAt(textShowIdx + 1, new SelectFont(name, src.getSize()));
+                return textShowIdx + 1;
+            }
+            // Stop searching once we leave the current text object — there is
+            // no in-scope SelectFont before a BT, and any SelectFont before
+            // a prior ET applies to a different text object.
+            if (op instanceof BT || op instanceof ET) {
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private static byte[] serializeOperators(OperatorCollection ops) {
+        // Byte-level serialization (Sprint 30): op.toString()→US-ASCII would corrupt
+        // COSString operands with bytes >= 0x80 (CID/Identity-H, non-Latin literals).
+        // ByteArrayOutputStream never actually throws IOException.
+        java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+        try {
+            for (Operator op : ops) {
+                op.writeTo(baos);
+                baos.write('\n');
+            }
+        } catch (java.io.IOException e) {
+            throw new IllegalStateException("Unexpected IO error serializing operators", e);
+        }
+        return baos.toByteArray();
     }
 
     private boolean replaceTextInSingleOp(OperatorCollection ops, int idx, String oldText, String newText) {
@@ -389,7 +487,10 @@ public class TextFragment extends BaseParagraph {
                 newArr.add(new COSString(newText.getBytes(StandardCharsets.ISO_8859_1)));
                 List<COSBase> newOperands = new ArrayList<>(operands);
                 newOperands.set(0, newArr);
-                ops.setAt(idx, new Operator("TJ", newOperands));
+                // Sprint 35: preserve TextShowOperator subclass so downstream
+                // `instanceof TextShowOperator` checks (used by extractor and
+                // regression tests verifying operator sequences) keep working.
+                ops.setAt(idx, new SetGlyphsPositionShowText(newOperands));
                 return true;
             }
         } else if ("'".equals(name) || "\"".equals(name)) {
@@ -401,7 +502,10 @@ public class TextFragment extends BaseParagraph {
                 if (newOperands.get(textPos) instanceof COSString) {
                     newOperands.set(textPos,
                             new COSString(newText.getBytes(StandardCharsets.ISO_8859_1)));
-                    ops.setAt(idx, new Operator(name, newOperands));
+                    Operator replacement = "'".equals(name)
+                            ? new MoveToNextLineShowText(newOperands)
+                            : new SetSpacingMoveToNextLineShowText(newOperands);
+                    ops.setAt(idx, replacement);
                     return true;
                 }
             }
@@ -425,7 +529,8 @@ public class TextFragment extends BaseParagraph {
                 newArr.add(new COSString(new byte[0]));
                 List<COSBase> newOperands = new ArrayList<>(operands);
                 newOperands.set(0, newArr);
-                ops.setAt(idx, new Operator("TJ", newOperands));
+                // Sprint 35: preserve TextShowOperator subclass (see replaceTextOp).
+                ops.setAt(idx, new SetGlyphsPositionShowText(newOperands));
                 return true;
             }
         } else if ("'".equals(name) || "\"".equals(name)) {
@@ -435,7 +540,10 @@ public class TextFragment extends BaseParagraph {
                 int textPos = newOperands.size() - 1;
                 if (newOperands.get(textPos) instanceof COSString) {
                     newOperands.set(textPos, new COSString(new byte[0]));
-                    ops.setAt(idx, new Operator(name, newOperands));
+                    Operator replacement = "'".equals(name)
+                            ? new MoveToNextLineShowText(newOperands)
+                            : new SetSpacingMoveToNextLineShowText(newOperands);
+                    ops.setAt(idx, replacement);
                     return true;
                 }
             }
@@ -494,6 +602,25 @@ public class TextFragment extends BaseParagraph {
      */
     public Rectangle getRectangle() {
         return rectangle;
+    }
+
+    /**
+     * Returns the text baseline rotation in device space, quantized to one of
+     * {@code 0, 90, 180, 270}. {@code 0} is ordinary horizontal text.
+     *
+     * @return the rotation in degrees
+     */
+    public int getRotation() {
+        return rotation;
+    }
+
+    /**
+     * Sets the text baseline rotation (quantized to {@code 0/90/180/270}).
+     *
+     * @param rotation the rotation in degrees
+     */
+    public void setRotation(int rotation) {
+        this.rotation = rotation;
     }
 
     /**
@@ -600,6 +727,28 @@ public class TextFragment extends BaseParagraph {
      */
     public void setLastSourceOperatorIndex(int index) {
         this.lastSourceOperatorIndex = index;
+    }
+
+    /**
+     * Sprint 36: store source operator by identity. After a sibling fragment
+     * mutates the shared {@link OperatorCollection} (e.g. inserts a
+     * font-restore op), our cached {@code sourceOperatorIndex} would be stale;
+     * the reference lets us re-derive the current index before each mutation.
+     */
+    public void setSourceOperator(Operator op) {
+        this.sourceOperator = op;
+    }
+
+    public void setLastSourceOperator(Operator op) {
+        this.lastSourceOperator = op;
+    }
+
+    public Operator getSourceOperator() {
+        return sourceOperator;
+    }
+
+    public Operator getLastSourceOperator() {
+        return lastSourceOperator;
     }
 
     /**

@@ -195,7 +195,7 @@ public final class PDFLexer {
         int c = reader.read();
 
         if (c == -1) {
-            LOGGER.log(Level.FINE, "EOF at position {0}", pos);
+            LOGGER.log(Level.FINER, "EOF at position {0}", pos);
             return new Token(TokenType.EOF, "", pos);
         }
 
@@ -225,8 +225,26 @@ public final class PDFLexer {
             case '/':
                 return readName(pos);
             default:
-                if (c == '+' || c == '-' || c == '.' || (c >= '0' && c <= '9')) {
+                // A digit or a leading '.' always begins a number. A lone '.'
+                // ("." with no following digit) stays a (degenerate) REAL token
+                // that ContentStreamParser intentionally recovers as 0 — see
+                // ContentStreamParserTest.parseMalformedStandaloneRealAsZeroForRecovery.
+                if ((c >= '0' && c <= '9') || c == '.') {
                     return readNumber(c, pos);
+                }
+                // BUG-LEX-001 (Sprint 22): a sign only begins a number when a
+                // digit (or a leading '.') follows. A lone '+' / '-' previously
+                // fell into readNumber and produced a bogus INTEGER token (value
+                // "+" or "-"), which ContentStreamParser could not parse —
+                // emitting 155 "Recovering malformed integer token" warnings
+                // across the corpus. There is no sensible numeric value for a
+                // bare sign, so treat it as a keyword/operator token instead.
+                if (c == '+' || c == '-') {
+                    int next = reader.peek();
+                    if ((next >= '0' && next <= '9') || next == '.') {
+                        return readNumber(c, pos);
+                    }
+                    return readKeyword(c, pos);
                 }
                 // Regular character → keyword
                 return readKeyword(c, pos);
@@ -327,7 +345,7 @@ public final class PDFLexer {
 
         // Use ISO-8859-1 to preserve raw bytes 1:1 as chars
         String value = new String(baos.toByteArray(), StandardCharsets.ISO_8859_1);
-        LOGGER.log(Level.FINE, "Literal string at {0}: length={1}", new Object[]{pos, value.length()});
+        LOGGER.log(Level.FINER, "Literal string at {0}: length={1}", new Object[]{pos, value.length()});
         return new Token(TokenType.LITERAL_STRING, value, pos);
     }
 
@@ -378,7 +396,7 @@ public final class PDFLexer {
         }
 
         String value = new String(decoded, StandardCharsets.ISO_8859_1);
-        LOGGER.log(Level.FINE, "Hex string at {0}: {1} hex chars", new Object[]{pos, hexChars.length()});
+        LOGGER.log(Level.FINER, "Hex string at {0}: {1} hex chars", new Object[]{pos, hexChars.length()});
         return new Token(TokenType.HEX_STRING, value, pos);
     }
 
@@ -409,7 +427,7 @@ public final class PDFLexer {
             }
         }
 
-        LOGGER.log(Level.FINE, "Name at {0}: /{1}", new Object[]{pos, sb.toString()});
+        LOGGER.log(Level.FINER, "Name at {0}: /{1}", new Object[]{pos, sb.toString()});
         return new Token(TokenType.NAME, sb.toString(), pos);
     }
 
@@ -437,7 +455,7 @@ public final class PDFLexer {
         }
 
         TokenType type = hasDecimalPoint ? TokenType.REAL : TokenType.INTEGER;
-        LOGGER.log(Level.FINE, "{0} at {1}: {2}", new Object[]{type, pos, sb.toString()});
+        LOGGER.log(Level.FINER, "{0} at {1}: {2}", new Object[]{type, pos, sb.toString()});
         return new Token(type, sb.toString(), pos);
     }
 
@@ -469,7 +487,7 @@ public final class PDFLexer {
         }
 
         String kw = sb.toString();
-        LOGGER.log(Level.FINE, "Keyword at {0}: {1}", new Object[]{pos, kw});
+        LOGGER.log(Level.FINER, "Keyword at {0}: {1}", new Object[]{pos, kw});
         return new Token(TokenType.KEYWORD, kw, pos);
     }
 

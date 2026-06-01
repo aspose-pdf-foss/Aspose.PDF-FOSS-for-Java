@@ -169,7 +169,7 @@ public final class RandomAccessReader implements Closeable {
             // Invalidate read-ahead buffer
             buffer.limit(0);
         }
-        LOG.fine(() -> "seek(" + pos + ")");
+        LOG.finer(() -> "seek(" + pos + ")"); // per-IO trace: debug level (Sprint 32 A)
     }
 
     /**

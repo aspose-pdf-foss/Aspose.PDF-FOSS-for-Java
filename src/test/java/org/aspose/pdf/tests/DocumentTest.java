@@ -144,11 +144,16 @@ public class DocumentTest {
     }
 
     @Test
-    public void getInfoReturnsNullWhenAbsent() throws IOException {
+    public void getInfoAutoCreatesWhenAbsent() throws IOException {
+        // As of Stage 12 / Bug K, getInfo() auto-creates an empty writable
+        // DocumentInfo on documents whose trailer has no /Info entry, so
+        // callers don't have to differentiate between "fresh doc" and
+        // "loaded but no metadata".
         byte[] pdfBytes = createMinimalPdf();
         try (Document doc = new Document(new ByteArrayInputStream(pdfBytes))) {
             DocumentInfo info = doc.getInfo();
-            assertNull(info);
+            assertNotNull(info, "getInfo() must auto-create when trailer lacks /Info");
+            assertNull(info.getTitle(), "the auto-created info is empty");
         }
     }
 

@@ -97,6 +97,13 @@ public final class PDFWriter {
     public void write(COSDictionary trailer, Map<COSObjectKey, COSBase> objects) throws IOException {
         LOGGER.log(Level.FINE, "Writing PDF {0} with {1} objects", new Object[]{pdfVersion, objects.size()});
 
+        // 0. Promote any in-graph COSStream that lacks an object key to an
+        //    indirect object — per ISO 32000-1:2008 §7.3.8.1 streams MUST be
+        //    indirect objects. (Bug N2: without this pass the writer emitted
+        //    inline `<<…>> stream…endstream` constructs inside parent dicts,
+        //    which strict readers reject.)
+        registerOrphanStreams(objects, trailer);
+
         // 1. Write header
         writeHeader();
 
@@ -153,6 +160,10 @@ public final class PDFWriter {
         // Find the old xref offset from the original file (we need it for /Prev)
         long oldXrefOffset = findOldXrefOffset(original);
 
+        // Promote orphan streams in the modified set to indirect objects
+        // before writing (Bug N2 — see write(...) above for rationale).
+        registerOrphanStreams(modifiedObjects, trailer);
+
         // Write modified objects
         for (Map.Entry<COSObjectKey, COSBase> entry : modifiedObjects.entrySet()) {
             writeObject(entry.getKey(), entry.getValue());
@@ -189,6 +200,167 @@ public final class PDFWriter {
     }
 
     // ========== Private implementation methods ==========
+
+    /**
+     * Walks the object graph rooted at {@code objects.values()} (and the
+     * trailer) and ensures every {@link COSStream} reachable from it has an
+     * object key and is registered in {@code objects}. After this pass
+     * {@link COSDictionary#writeTo} sees an object key on every stream and
+     * emits a reference ({@code N G R}) rather than serialising the stream
+     * inline — which would violate ISO 32000-1:2008 §7.3.8.1 ("All streams
+     * shall be indirect objects").
+     *
+     * <p>Three cases are handled:</p>
+     * <ul>
+     *   <li><strong>Inline orphan</strong> — {@code COSStream} with no
+     *       object key. Assigned a fresh key and added to {@code objects}.</li>
+     *   <li><strong>Stale reference</strong> — {@code COSObjectReference}
+     *       whose target is a {@code COSStream} with a key from a previous
+     *       save, but the target is missing from the current {@code objects}
+     *       map. The target is re-registered under the reference's key (if
+     *       free) or under a fresh key (in which case the parent slot is
+     *       rewritten to point at the new key). Surfaces on the second save
+     *       of any {@code Document} that contains annotation appearance
+     *       streams ({@code /AP /N}) or imported content streams — those
+     *       sit behind {@code COSObjectReference} after the first save.</li>
+     *   <li><strong>Active reference</strong> — target stream is already
+     *       in {@code objects}; no-op but descend into the target so nested
+     *       streams (e.g. a Form XObject's {@code /Resources}) get walked.</li>
+     * </ul>
+     */
+    private void registerOrphanStreams(Map<COSObjectKey, COSBase> objects,
+                                       COSDictionary trailer) {
+        java.util.Set<COSBase> visited =
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        // Visit every existing indirect object so its key marks the stream as
+        // already registered (and so we walk its children).
+        for (COSBase root : new java.util.ArrayList<>(objects.values())) {
+            collectOrphanStreams(root, visited, objects);
+        }
+        if (trailer != null) {
+            collectOrphanStreams(trailer, visited, objects);
+        }
+    }
+
+    /**
+     * Registers a stream that is the target of a reference into
+     * {@code objects}, returning the key the reference should point at.
+     * If the reference's original key is free, the stream is registered
+     * under it. If the key collides with a different object, a fresh key
+     * is allocated and the caller is expected to rewrite the parent slot
+     * to use the new key.
+     */
+    private COSObjectKey registerStreamUnderRefKey(COSStream s,
+                                                    COSObjectKey refKey,
+                                                    Map<COSObjectKey, COSBase> objects) {
+        COSBase existing = objects.get(refKey);
+        if (existing == s) {
+            return refKey;  // already registered, nothing to do
+        }
+        if (existing == null) {
+            s.setObjectKey(refKey);
+            objects.put(refKey, s);
+            return refKey;
+        }
+        // Collision: another object owns refKey. Allocate fresh.
+        int next = getMaxObjectNumber(objects) + 1;
+        COSObjectKey fresh = new COSObjectKey(next, 0);
+        s.setObjectKey(fresh);
+        objects.put(fresh, s);
+        return fresh;
+    }
+
+    /**
+     * Recursively walks {@code node}, registering any orphan / stale
+     * streams it encounters per the contract on
+     * {@link #registerOrphanStreams(Map, COSDictionary)}.
+     */
+    private void collectOrphanStreams(COSBase node,
+                                      java.util.Set<COSBase> visited,
+                                      Map<COSObjectKey, COSBase> objects) {
+        if (node == null || !visited.add(node)) return;
+
+        if (node instanceof COSStream) {
+            COSStream s = (COSStream) node;
+            COSObjectKey existing = s.getObjectKey();
+            if (existing == null) {
+                // Inline orphan — assign fresh key.
+                int next = getMaxObjectNumber(objects) + 1;
+                COSObjectKey fresh = new COSObjectKey(next, 0);
+                s.setObjectKey(fresh);
+                objects.put(fresh, s);
+            } else if (objects.get(existing) != s) {
+                // Has a key from a previous save / import but not in the
+                // current objects map. Try to register under the same key,
+                // re-key on collision.
+                registerStreamUnderRefKey(s, existing, objects);
+            }
+            // fall through to descend into the stream's dict entries
+        }
+
+        if (node instanceof COSDictionary) {
+            // Snapshot keys because we may rewrite entries when a reference
+            // collides and forces a re-key.
+            java.util.List<COSName> keys =
+                    new java.util.ArrayList<>(((COSDictionary) node).keySet());
+            for (COSName k : keys) {
+                COSBase value = ((COSDictionary) node).get(k);
+                COSBase recurseInto = walkReferenceForReregistration(
+                        value, objects,
+                        newRef -> ((COSDictionary) node).set(k, newRef));
+                collectOrphanStreams(recurseInto != null ? recurseInto : value,
+                        visited, objects);
+            }
+        } else if (node instanceof COSArray) {
+            COSArray arr = (COSArray) node;
+            for (int i = 0; i < arr.size(); i++) {
+                final int idx = i;
+                COSBase value = arr.get(i);
+                COSBase recurseInto = walkReferenceForReregistration(
+                        value, objects, newRef -> arr.set(idx, newRef));
+                collectOrphanStreams(recurseInto != null ? recurseInto : value,
+                        visited, objects);
+            }
+        }
+    }
+
+    /**
+     * If {@code value} is a {@link COSObjectReference} whose target is a
+     * {@link COSStream}, ensure the target is registered in {@code objects}
+     * (possibly under a fresh key, in which case {@code slotSetter} is
+     * invoked to rewrite the parent slot to point at the new key). Returns
+     * the dereferenced target so the caller can continue walking into it,
+     * or {@code null} when {@code value} is not a reference (caller falls
+     * through to walking {@code value} directly).
+     */
+    private COSBase walkReferenceForReregistration(COSBase value,
+                                                    Map<COSObjectKey, COSBase> objects,
+                                                    java.util.function.Consumer<COSObjectReference> slotSetter) {
+        if (!(value instanceof COSObjectReference)) return null;
+        COSObjectReference ref = (COSObjectReference) value;
+        COSObjectKey refKey = ref.getKey();
+        COSBase target;
+        try {
+            target = ref.dereference();
+        } catch (IOException | IllegalStateException e) {
+            // No resolver attached (e.g. references built by test fixtures
+            // or low-level callers that bypass the parser/writer wiring).
+            // The reference will be emitted verbatim — that's acceptable
+            // as long as the target it points at has already been
+            // registered by some other code path.
+            return null;
+        }
+        if (target instanceof COSStream) {
+            COSStream s = (COSStream) target;
+            COSObjectKey effectiveKey = registerStreamUnderRefKey(s, refKey, objects);
+            if (!effectiveKey.equals(refKey)) {
+                // Re-keyed due to collision — rewrite the slot so the
+                // parent points at the new key.
+                slotSetter.accept(new COSObjectReference(effectiveKey, k -> objects.get(k)));
+            }
+        }
+        return target;
+    }
 
     /**
      * Writes the PDF header: %PDF-X.Y followed by a binary hint comment.
@@ -387,7 +559,11 @@ public final class PDFWriter {
 
     /**
      * Writes the cross-reference table.
-     * Each entry is EXACTLY 20 bytes: "OOOOOOOOOO GGGGG n \r\n" (or "f" for free).
+     * Each entry is EXACTLY 20 bytes: "OOOOOOOOOO GGGGG n \n" (or "f" for free).
+     * Per ISO 32000-1:2008 §7.5.4, the EOL marker is SP CR or SP LF —
+     * NOT SP CR LF — the latter produces 21-byte entries and breaks readers
+     * that index xref by absolute byte offset (Ghostscript, Adobe Reader,
+     * mupdf).
      */
     private void writeXRefTable(Map<COSObjectKey, COSBase> objects) throws IOException {
         // Determine the range of object numbers
@@ -401,8 +577,8 @@ public final class PDFWriter {
         writeBytes(subsectionHeader.getBytes(StandardCharsets.US_ASCII));
 
         // Entry 0: free head entry
-        // "0000000000 65535 f \r\n" — exactly 20 bytes
-        writeBytes("0000000000 65535 f \r\n".getBytes(StandardCharsets.US_ASCII));
+        // "0000000000 65535 f \n" — exactly 20 bytes
+        writeBytes("0000000000 65535 f \n".getBytes(StandardCharsets.US_ASCII));
 
         // Build lookup map: objectNumber → (offset, generation)
         Map<Integer, Map.Entry<Long, Integer>> objNumToInfo = new java.util.HashMap<>();
@@ -415,12 +591,13 @@ public final class PDFWriter {
         for (int i = 1; i <= maxObjNum; i++) {
             Map.Entry<Long, Integer> info = objNumToInfo.get(i);
             if (info != null) {
-                // In-use entry: "OOOOOOOOOO GGGGG n \r\n" — exactly 20 bytes
-                String xrefEntry = String.format("%010d %05d n \r\n", info.getKey(), info.getValue());
+                // In-use entry: "OOOOOOOOOO GGGGG n \n" — exactly 20 bytes
+                String xrefEntry = String.format(Locale.ROOT, "%010d %05d n \n",
+                        info.getKey(), info.getValue());
                 writeBytes(xrefEntry.getBytes(StandardCharsets.US_ASCII));
             } else {
                 // Free entry
-                writeBytes("0000000000 00000 f \r\n".getBytes(StandardCharsets.US_ASCII));
+                writeBytes("0000000000 00000 f \n".getBytes(StandardCharsets.US_ASCII));
             }
         }
     }
@@ -468,7 +645,10 @@ public final class PDFWriter {
             for (COSObjectKey key : sub) {
                 Long offset = objectOffsets.get(key);
                 if (offset != null) {
-                    String entry = String.format("%010d %05d n \r\n", offset, key.getGenerationNumber());
+                    // 20-byte entry — see comment on writeXRefTable for the
+                    // ISO 32000-1:2008 §7.5.4 rationale.
+                    String entry = String.format(Locale.ROOT, "%010d %05d n \n",
+                            offset, key.getGenerationNumber());
                     writeBytes(entry.getBytes(StandardCharsets.US_ASCII));
                 }
             }

@@ -1,5 +1,6 @@
 package org.aspose.pdf.engine.text;
 
+import org.aspose.pdf.Color;
 import org.aspose.pdf.Matrix;
 import org.aspose.pdf.Operator;
 import org.aspose.pdf.OperatorCollection;
@@ -65,6 +66,12 @@ public class TextExtractor {
     // Current transformation matrix stack
     private double[] ctm;
     private final Deque<double[]> ctmStack = new ArrayDeque<>();
+
+    // Current fill color (set by rg/g/k); saved/restored with q/Q so the
+    // value active at flush time can be recorded as the fragment's
+    // foreground color (PDFNEWNET_48777). Null until the first color op.
+    private Color currentFillColor;
+    private final Deque<Color> fillColorStack = new ArrayDeque<>();
 
     // Results
     private final List<TextFragment> fragments = new ArrayList<>();
@@ -164,10 +171,35 @@ public class TextExtractor {
             // -- Graphics state --
             case "q":
                 ctmStack.push(ctm.clone());
+                fillColorStack.push(currentFillColor);
                 break;
             case "Q":
                 if (!ctmStack.isEmpty()) {
                     ctm = ctmStack.pop();
+                }
+                if (!fillColorStack.isEmpty()) {
+                    currentFillColor = fillColorStack.pop();
+                }
+                break;
+
+            // -- Fill color (non-stroking). Recorded so the color active when
+            // a text run is flushed becomes the fragment's foreground color.
+            case "rg":
+                if (operands.size() >= 3) {
+                    currentFillColor = Color.fromRgb(getNumber(operands.get(0)),
+                            getNumber(operands.get(1)), getNumber(operands.get(2)));
+                }
+                break;
+            case "g":
+                if (operands.size() >= 1) {
+                    currentFillColor = Color.fromGray(getNumber(operands.get(0)));
+                }
+                break;
+            case "k":
+                if (operands.size() >= 4) {
+                    currentFillColor = Color.fromCmyk(getNumber(operands.get(0)),
+                            getNumber(operands.get(1)), getNumber(operands.get(2)),
+                            getNumber(operands.get(3)));
                 }
                 break;
             case "cm":
@@ -549,6 +581,13 @@ public class TextExtractor {
         state.setWordSpacing(wordSpacing);
         state.setHorizontalScaling(horizontalScaling);
         state.setRenderingMode(renderMode);
+        // Derive the font style (bold/italic) from the resolved BaseFont name
+        // so a styled run survives a save→reload round trip (PDFNEWNET_48777).
+        state.setFontStyle(detectFontStyle(currentFontName));
+        // Record the fill color active at flush time as the foreground color.
+        if (currentFillColor != null) {
+            state.setForegroundColor(currentFillColor);
+        }
 
         // Set segment position and rectangle
         if (!fragment.getSegments().isEmpty()) {
@@ -583,6 +622,23 @@ public class TextExtractor {
             fragment.setRectangle(rect);
         }
 
+        // Determine the text baseline rotation in device space (BUG-EXT-WSPC):
+        // map the text-space x-axis unit vector through Tm×CTM and quantize the
+        // resulting angle to 0/90/180/270. Rotated text advances along Y and
+        // stacks lines along X, which the absorber needs to group lines along
+        // the correct axis instead of inserting a newline between every glyph.
+        double[] rotTm = fragmentStartTextMatrix != null ? fragmentStartTextMatrix : textMatrix;
+        double[] rotCtm = fragmentStartCtm != null ? fragmentStartCtm : ctm;
+        if (rotTm != null) {
+            double[] origin = transformPoint(rotTm, rotCtm, 0, 0);
+            double[] axis = transformPoint(rotTm, rotCtm, 1, 0);
+            double dx = axis[0] - origin[0];
+            double dy = axis[1] - origin[1];
+            if (dx != 0 || dy != 0) {
+                fragment.setRotation(quantizeRotation(Math.toDegrees(Math.atan2(dy, dx))));
+            }
+        }
+
         // Record source operator range for content stream modification
         fragment.setSourceOperatorIndex(firstTextOpIndex);
         fragment.setLastSourceOperatorIndex(lastTextOpIndex);
@@ -591,6 +647,17 @@ public class TextExtractor {
         fragment.setSourceTextLength(text.length());
         fragment.setSourceOperators(currentSourceOperators);
         fragment.setSourceContentStream(currentSourceStream);
+        // Sprint 36: also record the source operators by identity so a
+        // sibling fragment's later mutation can shift indices without
+        // corrupting this fragment's reference (see TextFragment).
+        if (currentSourceOperators != null) {
+            if (firstTextOpIndex >= 0 && firstTextOpIndex < currentSourceOperators.size()) {
+                fragment.setSourceOperator(currentSourceOperators.getAt(firstTextOpIndex));
+            }
+            if (lastTextOpIndex >= 0 && lastTextOpIndex < currentSourceOperators.size()) {
+                fragment.setLastSourceOperator(currentSourceOperators.getAt(lastTextOpIndex));
+            }
+        }
 
         fragments.add(fragment);
         currentText = new StringBuilder();
@@ -600,6 +667,14 @@ public class TextExtractor {
         fragmentStartCtm = null;
         fragmentEndTextMatrix = null;
         fragmentEndCtm = null;
+    }
+
+    /** Quantizes a device-space baseline angle (degrees) to {0,90,180,270}. */
+    private static int quantizeRotation(double deg) {
+        double d = deg % 360.0;
+        if (d < 0) d += 360.0;
+        int q = (int) Math.round(d / 90.0) * 90;
+        return q % 360;
     }
 
     private double estimateTextWidth(String text) {
@@ -711,7 +786,34 @@ public class TextExtractor {
         fragmentStartCtm = null;
         fragmentEndTextMatrix = null;
         fragmentEndCtm = null;
+        currentFillColor = null;
+        fillColorStack.clear();
         fontRepo.clear();
+    }
+
+    /**
+     * Derives a {@link org.aspose.pdf.text.FontStyles} bitmask from a font
+     * name. PDF standard-14 and most embedded fonts encode weight/slant in
+     * the name ("Helvetica-Bold", "Arial,BoldItalic", "Times-Oblique"), which
+     * is the only style signal preserved through a save→reload cycle for
+     * non-embedded fonts.
+     *
+     * @param fontName the resolved BaseFont name (may be null)
+     * @return Bold|Italic bitmask, or 0 (Regular) when no marker is present
+     */
+    private static int detectFontStyle(String fontName) {
+        if (fontName == null) {
+            return 0;
+        }
+        String n = fontName.toLowerCase();
+        int style = 0;
+        if (n.contains("bold")) {
+            style |= org.aspose.pdf.text.FontStyles.Bold;
+        }
+        if (n.contains("italic") || n.contains("oblique")) {
+            style |= org.aspose.pdf.text.FontStyles.Italic;
+        }
+        return style;
     }
 
     /**
