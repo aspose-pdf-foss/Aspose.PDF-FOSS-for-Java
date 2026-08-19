@@ -44,7 +44,9 @@ public final class XfdfImporter {
         ELEMENT_TO_SUBTYPE.put("square", "Square");
         ELEMENT_TO_SUBTYPE.put("polygon", "Polygon");
         ELEMENT_TO_SUBTYPE.put("polyline", "PolyLine");
-        ELEMENT_TO_SUBTYPE.put("link", "Link");
+        // NOTE: <link> is intentionally NOT imported. Aspose's XFDF import skips
+        // link annotations (they are not markup annotations); importing them adds
+        // an extra /Link the reference outputs don't have (PDFNET_48661).
         ELEMENT_TO_SUBTYPE.put("stamp", "Stamp");
         ELEMENT_TO_SUBTYPE.put("caret", "Caret");
         ELEMENT_TO_SUBTYPE.put("ink", "Ink");
@@ -225,13 +227,36 @@ public final class XfdfImporter {
             }
         }
 
+        // Two passes are needed to restore reply chains: an /IRT (in-reply-to)
+        // reference names a sibling annotation by its /NM, which may be imported
+        // after the replying annotation. Record each imported annotation by name
+        // and defer the link resolution until every annotation exists.
+        java.util.Map<String, Annotation> byName = new java.util.HashMap<>();
+        java.util.List<Object[]> pendingIrt = new java.util.ArrayList<>();
         for (Element elem : ordered) {
             String elementName = elem.getNodeName().toLowerCase();
             String subtype = ELEMENT_TO_SUBTYPE.get(elementName);
             try {
-                importAnnotation(elem, subtype, pages);
+                Annotation annot = importAnnotation(elem, subtype, pages);
+                if (annot == null) continue;
+                String name = elem.getAttribute("name");
+                if (name != null && !name.isEmpty()) {
+                    byName.put(name, annot);
+                }
+                String irt = elem.getAttribute("inreplyto");
+                if (irt != null && !irt.isEmpty()) {
+                    pendingIrt.add(new Object[]{annot, irt});
+                }
             } catch (Exception e) {
                 LOG.fine(() -> "Failed to import annotation '" + elementName + "': " + e.getMessage());
+            }
+        }
+
+        for (Object[] link : pendingIrt) {
+            Annotation replier = (Annotation) link[0];
+            Annotation target = byName.get((String) link[1]);
+            if (target != null && replier instanceof MarkupAnnotation) {
+                ((MarkupAnnotation) replier).setInReplyTo(target);
             }
         }
     }
@@ -239,13 +264,13 @@ public final class XfdfImporter {
     /**
      * Imports a single annotation element with all its attributes and child elements.
      */
-    private static void importAnnotation(Element elem, String subtype, PageCollection pages) {
+    private static Annotation importAnnotation(Element elem, String subtype, PageCollection pages) {
         // Page index (0-based in XFDF)
         int pageIndex = getIntAttr(elem, "page", 0);
         int pageNum = pageIndex + 1;
         if (pageNum < 1 || pageNum > pages.getCount()) {
             LOG.fine(() -> "Page " + pageNum + " out of range, skipping annotation");
-            return;
+            return null;
         }
 
         Page page = pages.get(pageNum);
@@ -258,7 +283,7 @@ public final class XfdfImporter {
 
         // Create the typed annotation
         Annotation annot = createAnnotation(subtype, page, rect);
-        if (annot == null) return;
+        if (annot == null) return null;
 
         // Common attributes
         String colorStr = elem.getAttribute("color");
@@ -342,6 +367,13 @@ public final class XfdfImporter {
             if (!stateModel.isEmpty()) text.setStateModel(stateModel);
         }
 
+        // Stamp annotation specifics: icon (/Name entry). Mirrors the exporter,
+        // which stores the stamp name in the "icon" attribute (BUG-XFDF-STAMP-ICON).
+        if (annot instanceof StampAnnotation) {
+            String icon = elem.getAttribute("icon");
+            if (!icon.isEmpty()) ((StampAnnotation) annot).setIcon(icon);
+        }
+
         // QuadPoints for text markup annotations
         String coords = elem.getAttribute("coords");
         if (!coords.isEmpty()) {
@@ -421,17 +453,34 @@ public final class XfdfImporter {
         // margin to the right of the page, top-aligned with the parent.
         if (annot instanceof MarkupAnnotation && !(annot instanceof FreeTextAnnotation)) {
             try {
-                double pageW = page.getRect().getURX();
-                Rectangle popupRect = new Rectangle(
-                        pageW, rect.getURY() - 114, pageW + 204, rect.getURY());
+                // Prefer the exported <popup> child (rect/flags/open) when present;
+                // otherwise fall back to the Acrobat-convention placeholder box.
+                Element popupElem = getDirectChild(elem, "popup");
+                Rectangle popupRect = null;
+                if (popupElem != null) {
+                    popupRect = parseRect(popupElem.getAttribute("rect"));
+                }
+                if (popupRect == null) {
+                    double pageW = page.getRect().getURX();
+                    popupRect = new Rectangle(
+                            pageW, rect.getURY() - 114, pageW + 204, rect.getURY());
+                }
                 PopupAnnotation popup = new PopupAnnotation(page, popupRect);
                 popup.getPdfDictionary().set(PdfName.of("Parent"), annot.getPdfDictionary());
+                if (popupElem != null) {
+                    String pflags = popupElem.getAttribute("flags");
+                    if (!pflags.isEmpty()) popup.setFlags(parseFlagsString(pflags));
+                    String popen = popupElem.getAttribute("open");
+                    if (!popen.isEmpty()) popup.setOpen("yes".equalsIgnoreCase(popen));
+                }
                 ((MarkupAnnotation) annot).setPopup(popup);
                 page.getAnnotations().add(popup);
             } catch (RuntimeException e) {
                 LOG.fine(() -> "Could not create popup for imported annotation: " + e.getMessage());
             }
         }
+
+        return annot;
     }
 
     /**
@@ -528,6 +577,23 @@ public final class XfdfImporter {
                 return Color.fromRgb(r / 65535.0, g / 65535.0, b / 65535.0);
             } catch (NumberFormatException e) {
                 return null;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Returns the first direct child element with the given tag name, or null.
+     * Unlike {@code getElementsByTagName}, this does not descend into nested
+     * elements (so a parent's {@code <popup>} is not confused with a deeper one).
+     */
+    private static Element getDirectChild(Element parent, String tagName) {
+        NodeList children = parent.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (child.getNodeType() == Node.ELEMENT_NODE
+                    && tagName.equalsIgnoreCase(child.getNodeName())) {
+                return (Element) child;
             }
         }
         return null;

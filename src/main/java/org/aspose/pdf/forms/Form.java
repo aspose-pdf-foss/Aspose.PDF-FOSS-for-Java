@@ -106,14 +106,30 @@ public class Form implements Iterable<Field> {
     }
 
     /**
-     * Sets the form type. When set to {@link FormType#Standard}, the /XFA entry
-     * is removed from the AcroForm dictionary, converting the form to pure AcroForm.
-     * The existing /Fields array with AcroForm fields remains intact.
+     * Sets the form type. When set to {@link FormType#Standard} on an XFA form,
+     * the XFA template is converted into ordinary AcroForm fields at their laid-out
+     * positions (static content painted, dynamic forms paginated) and the /XFA
+     * entry is removed — matching Aspose {@code Form.Type = FormType.Standard}
+     * semantics. If the conversion cannot run (no document bound, or the XFA data
+     * is unusable) the /XFA entry is still removed so the form degrades to the
+     * existing /Fields AcroForm content.
      *
      * @param type the desired form type
      */
     public void setType(FormType type) {
         if (type == FormType.Standard) {
+            XfaForm xfa = getXFA();
+            if (xfa != null && document != null) {
+                try {
+                    // Convert XFA → AcroForm (DROP policy removes /XFA itself);
+                    // invalidate the field cache so converted fields are visible.
+                    xfa.convertToAcroForm(document);
+                    fields = null;
+                    fieldsByName = null;
+                } catch (Exception e) {
+                    LOG.warning("XFA to AcroForm conversion failed; stripping /XFA only: " + e.getMessage());
+                }
+            }
             acroFormDict.remove(PdfName.of("XFA"));
             this.xfaForm = null;
         }
@@ -644,15 +660,51 @@ public class Form implements Iterable<Field> {
 
     private Page findPage(PdfDictionary fieldDict) {
         if (document == null) return null;
-        PdfBase p = resolveRef(fieldDict.get("P"));
-        if (p instanceof PdfDictionary) {
-            try {
-                PageCollection pages = document.getPages();
-                for (int i = 1; i <= pages.getCount(); i++) {
-                    if (pages.get(i).getPdfDictionary() == p) return pages.get(i);
+        Page byP = pageForDict(resolveRef(fieldDict.get("P")));
+        if (byP != null) return byP;
+        // A parent field (e.g. a radio group) carries no /P of its own — its
+        // widget kids do. Fall back to the first kid's page; failing that, scan
+        // the pages' /Annots arrays for one of the kids (PDFNET_46293).
+        PdfBase kids = resolveRef(fieldDict.get("Kids"));
+        if (kids instanceof PdfArray) {
+            for (PdfBase kid : (PdfArray) kids) {
+                PdfBase kd = resolveRef(kid);
+                if (kd instanceof PdfDictionary) {
+                    Page kidPage = pageForDict(resolveRef(((PdfDictionary) kd).get("P")));
+                    if (kidPage != null) return kidPage;
                 }
-            } catch (IOException e) { /* ignore */ }
+            }
         }
+        // Merged field+widget without /P, or kids without /P: find the page whose
+        // /Annots array contains the field dict itself or one of its kids.
+        try {
+            PageCollection pages = document.getPages();
+            for (int i = 1; i <= pages.getCount(); i++) {
+                PdfBase annots = resolveRef(pages.get(i).getPdfDictionary().get("Annots"));
+                if (!(annots instanceof PdfArray)) continue;
+                for (PdfBase a : (PdfArray) annots) {
+                    PdfBase ad = resolveRef(a);
+                    if (ad == fieldDict) return pages.get(i);
+                    if (kids instanceof PdfArray) {
+                        for (PdfBase kid : (PdfArray) kids) {
+                            if (ad != null && ad == resolveRef(kid)) return pages.get(i);
+                        }
+                    }
+                }
+            }
+        } catch (IOException e) { /* ignore */ }
+        return null;
+    }
+
+    /** Resolves a page dictionary to its Page, or null. */
+    private Page pageForDict(PdfBase p) {
+        if (!(p instanceof PdfDictionary) || document == null) return null;
+        try {
+            PageCollection pages = document.getPages();
+            for (int i = 1; i <= pages.getCount(); i++) {
+                if (pages.get(i).getPdfDictionary() == p) return pages.get(i);
+            }
+        } catch (IOException e) { /* ignore */ }
         return null;
     }
 
@@ -672,31 +724,49 @@ public class Form implements Iterable<Field> {
     }
 
     private static PdfDictionary cloneDictionary(PdfDictionary source) {
-        PdfDictionary copy = new PdfDictionary();
-        for (Map.Entry<PdfName, PdfBase> entry : source) {
-            copy.set(entry.getKey(), deepClone(entry.getValue()));
-        }
-        return copy;
+        return (PdfDictionary) deepClone(source, new java.util.IdentityHashMap<>());
     }
 
-    private static PdfBase deepClone(PdfBase value) {
+    /**
+     * Deep-clones a direct object graph. Field dictionaries can contain direct
+     * back-pointers (a widget kid's /Parent, a /P page dict), so the clone maps
+     * every visited node to its copy and reuses it on revisit — cycles terminate
+     * and shared substructure stays shared instead of exploding the recursion
+     * (StackOverflow on XFA-converted forms during concatenate).
+     */
+    private static PdfBase deepClone(PdfBase value, java.util.IdentityHashMap<PdfBase, PdfBase> seen) {
         if (value == null) {
             return null;
         }
-        if (value instanceof PdfDictionary && !(value instanceof PdfStream)) {
-            return cloneDictionary((PdfDictionary) value);
+        PdfBase already = seen.get(value);
+        if (already != null) {
+            return already;
         }
         if (value instanceof PdfStream) {
             PdfStream stream = (PdfStream) value;
-            PdfStream copy = new PdfStream(cloneDictionary(stream), stream.getEncodedData());
+            PdfDictionary dictCopy = new PdfDictionary();
+            PdfStream copy = new PdfStream(dictCopy, stream.getEncodedData());
             copy.setObjectKey(null);
+            seen.put(value, copy);
+            for (Map.Entry<PdfName, PdfBase> entry : stream) {
+                copy.set(entry.getKey(), deepClone(entry.getValue(), seen));
+            }
+            return copy;
+        }
+        if (value instanceof PdfDictionary) {
+            PdfDictionary copy = new PdfDictionary();
+            seen.put(value, copy);
+            for (Map.Entry<PdfName, PdfBase> entry : (PdfDictionary) value) {
+                copy.set(entry.getKey(), deepClone(entry.getValue(), seen));
+            }
             return copy;
         }
         if (value instanceof PdfArray) {
             PdfArray sourceArray = (PdfArray) value;
             PdfArray copy = new PdfArray(sourceArray.size());
+            seen.put(value, copy);
             for (PdfBase item : sourceArray) {
-                copy.add(deepClone(item));
+                copy.add(deepClone(item, seen));
             }
             return copy;
         }

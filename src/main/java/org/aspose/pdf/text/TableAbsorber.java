@@ -4,9 +4,16 @@ import org.aspose.pdf.Operator;
 import org.aspose.pdf.OperatorCollection;
 import org.aspose.pdf.Page;
 import org.aspose.pdf.Rectangle;
+import org.aspose.pdf.Resources;
+import org.aspose.pdf.engine.parser.ContentStreamParser;
 import org.aspose.pdf.engine.pdfobjects.PdfBase;
+import org.aspose.pdf.engine.pdfobjects.PdfDictionary;
 import org.aspose.pdf.engine.pdfobjects.PdfFloat;
 import org.aspose.pdf.engine.pdfobjects.PdfInteger;
+import org.aspose.pdf.engine.pdfobjects.PdfObjectReference;
+import org.aspose.pdf.engine.pdfobjects.PdfStream;
+import java.util.IdentityHashMap;
+import java.util.Set;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
@@ -43,6 +50,76 @@ public class TableAbsorber {
     private final List<AbsorbedTable> tables = new ArrayList<>();
 
     /**
+     * Page rotation transform (default→rotated/visual space) for the page
+     * currently being visited. On a {@code /Rotate}d page the rows a reader
+     * sees run along a swapped axis, so the heuristic clusters and the cell
+     * rectangles it emits must be computed in this visual space — matching
+     * Aspose, whose {@code AbsorbedCell.Rectangle} is in rotated page space
+     * (callers un-rotate it via {@code Page.getRotationMatrix().reverse()}).
+     * Identity for unrotated pages, so their behaviour is unchanged.
+     */
+    private org.aspose.pdf.Matrix pageRotation = org.aspose.pdf.Matrix.IDENTITY;
+
+    /**
+     * Normalised page rotation in degrees (0/90/180/270). {@link
+     * #getRotationMatrix() pageRotation} space and the reader's on-screen frame
+     * differ by a both-axes flip for the quarter-turn rotations (90/270), so
+     * row/column reading order is reversed for those — see {@link
+     * #buildRuledTable}.
+     */
+    private int pageRotateDeg = 0;
+
+    /** {@code true} when reading order runs opposite to pageRotation-space axes. */
+    private boolean readingOrderFlipped() {
+        return pageRotateDeg == 90 || pageRotateDeg == 270;
+    }
+
+    /** Visual (rotation-applied) coordinates of a fragment's position point. */
+    private double[] visualPos(TextFragment f) {
+        return pageRotation.transformPoint(
+                f.getPosition().getXIndent(), f.getPosition().getYIndent());
+    }
+
+    /** Visual (rotation-applied) bounding rectangle of a fragment. */
+    private org.aspose.pdf.Rectangle visualRect(TextFragment f) {
+        return f.getRectangle() == null ? null : pageRotation.transform(f.getRectangle());
+    }
+
+    /**
+     * A fragment's anchor in the reader's on-screen frame ({@code +x} right,
+     * {@code +y} up after the page {@code /Rotate} is applied). Used only to
+     * order fragments within a cell in natural reading order (top→bottom,
+     * left→right), independent of the pageRotation-space geometry.
+     */
+    private double[] readerAnchor(TextFragment f) {
+        Rectangle r = f.getRectangle();
+        double x;
+        double y;
+        if (r != null && r.getWidth() > 0) {
+            x = (r.getLLX() + r.getURX()) / 2;
+            y = (r.getLLY() + r.getURY()) / 2;
+        } else if (f.getPosition() != null) {
+            x = f.getPosition().getXIndent();
+            y = f.getPosition().getYIndent();
+        } else {
+            return new double[]{0, 0};
+        }
+        switch (pageRotateDeg) {
+            case 90:  return new double[]{y, -x};
+            case 180: return new double[]{-x, -y};
+            case 270: return new double[]{-y, x};
+            default:  return new double[]{x, y};
+        }
+    }
+
+    /** Reading-order comparator: top→bottom (desc reader Y), then left→right. */
+    private Comparator<TextFragment> readingOrder() {
+        return Comparator
+                .comparingDouble((TextFragment f) -> -readerAnchor(f)[1])
+                .thenComparingDouble(f -> readerAnchor(f)[0]);
+    }
+
+    /**
      * Visits a page and extracts table structures.
      *
      * @param page the page to analyze
@@ -50,6 +127,8 @@ public class TableAbsorber {
      */
     public void visit(Page page) throws IOException {
         tables.clear();
+        pageRotation = page.getRotationMatrix();
+        pageRotateDeg = ((page.getRotate() % 360) + 360) % 360;
 
         // 1. Extract all text fragments using TextFragmentAbsorber
         TextFragmentAbsorber tfa = new TextFragmentAbsorber();
@@ -70,10 +149,12 @@ public class TableAbsorber {
             return;
         }
 
-        // Sort by Y descending (top to bottom), then X ascending (left to right)
+        // Sort by visual Y descending (top to bottom), then visual X ascending
+        // (left to right). On a rotated page these axes are swapped relative to
+        // the raw content coordinates — visualPos() applies the page rotation.
         positioned.sort(Comparator
-                .comparingDouble((TextFragment f) -> -f.getPosition().getYIndent())
-                .thenComparingDouble(f -> f.getPosition().getXIndent()));
+                .comparingDouble((TextFragment f) -> -visualPos(f)[1])
+                .thenComparingDouble(f -> visualPos(f)[0]));
 
         // 3. Primary detection: ruling-line grids (PDFNEWNET-39178). Tables
         // drawn with explicit border/grid strokes are segmented exactly from
@@ -139,6 +220,7 @@ public class TableAbsorber {
         for (List<double[]> cluster : clusters) {
             AbsorbedTable table = buildRuledTable(cluster, fragments);
             if (table != null) {
+                table.setBorderColorRgb(pageRuleColorRgb);
                 result.add(table);
             }
         }
@@ -154,21 +236,79 @@ public class TableAbsorber {
      * {@code re} rectangle edges). Curves and clipping-only paths are
      * ignored. Each segment is {x1, y1, x2, y2} in device space.
      */
+    /** Rule-colour histogram (packed 0xRRGGBB -&gt; painted segment count) for the page. */
+    private java.util.Map<Integer, Integer> ruleColorCounts;
+    /** Dominant ruling-line colour of the last page, or -1 when unknown. */
+    private int pageRuleColorRgb = -1;
+
+    /**
+     * Collects the page's painted axis-aligned rule segments (recursing into
+     * Form XObjects on {@code Do}), each as {@code {x1, y1, x2, y2}} in page
+     * user space. Internal engine hook for the SDM enrichment pipeline
+     * (standalone-rule detection); not part of the public Aspose surface.
+     *
+     * @param page the page to scan; must not be null
+     * @return the painted segments; empty when the page has none
+     * @throws IOException if the content stream cannot be parsed
+     */
+    public List<double[]> collectPageRuleSegments(Page page) throws IOException {
+        return collectRuleSegments(page);
+    }
+
     private List<double[]> collectRuleSegments(Page page) throws IOException {
-        OperatorCollection ops = page.getContents();
         List<double[]> segments = new ArrayList<>();
+        ruleColorCounts = new java.util.HashMap<>();
+        Set<PdfStream> activeForms = Collections.newSetFromMap(new IdentityHashMap<>());
+        collectFromOps(page.getContents(), new double[]{1, 0, 0, 1, 0, 0},
+                page.getResources(), segments, activeForms, 0, 0x000000, 0x000000);
+        pageRuleColorRgb = -1;
+        int best = -1;
+        for (java.util.Map.Entry<Integer, Integer> e : ruleColorCounts.entrySet()) {
+            if (e.getValue() > best) {
+                best = e.getValue();
+                pageRuleColorRgb = e.getKey();
+            }
+        }
+        return segments;
+    }
+
+    /** Max Form XObject nesting for rule collection (guards pathological files). */
+    private static final int MAX_FORM_DEPTH = 12;
+
+    /**
+     * Collects axis-aligned path segments from one content stream, recursing into
+     * Form XObjects on {@code Do} so tables drawn inside a form (common in tagged
+     * PDFs where the whole page is one XObject) are seen. {@code baseCtm} is the CTM
+     * in effect where this stream is invoked.
+     */
+    private void collectFromOps(OperatorCollection ops, double[] baseCtm, Resources resources,
+                                List<double[]> segments, Set<PdfStream> activeForms, int depth,
+                                int baseStroke, int baseFill) {
+        if (ops == null || segments.size() > MAX_RULE_SEGMENTS) {
+            return;
+        }
         List<double[]> path = new ArrayList<>();
-        double[] ctm = {1, 0, 0, 1, 0, 0};
+        double[] ctm = baseCtm.clone();
         Deque<double[]> gsStack = new ArrayDeque<>();
         double curX = 0;
         double curY = 0;
         double startX = 0;
         double startY = 0;
+        int strokeColor = baseStroke;   // inherit the colour at the Do point
+        int fillColor = baseFill;
 
         for (int i = 0; i < ops.size(); i++) {
+            if (segments.size() > MAX_RULE_SEGMENTS) {
+                return;
+            }
             Operator op = ops.getAt(i);
             String name = op.getName();
             List<PdfBase> operands = op.getOperands();
+            if ("Do".equals(name) && depth < MAX_FORM_DEPTH && operands != null && !operands.isEmpty()) {
+                collectFromForm(operands.get(0), ctm, resources, segments, activeForms, depth,
+                        strokeColor, fillColor);
+                continue;
+            }
             switch (name) {
                 case "q":
                     gsStack.push(ctm.clone());
@@ -224,8 +364,50 @@ public class TableAbsorber {
                     startY = y;
                     break;
                 }
-                case "S": case "s": case "f": case "F":
-                case "f*": case "B": case "B*": case "b": case "b*":
+                case "RG":
+                    strokeColor = rgbOp(operands);
+                    break;
+                case "rg":
+                    fillColor = rgbOp(operands);
+                    break;
+                case "G":
+                    strokeColor = grayOp(operands);
+                    break;
+                case "g":
+                    fillColor = grayOp(operands);
+                    break;
+                case "K":
+                    strokeColor = cmykOp(operands);
+                    break;
+                case "k":
+                    fillColor = cmykOp(operands);
+                    break;
+                case "SC": case "SCN": {           // colour in current space (stroke)
+                    int c = scnColor(operands);
+                    if (c >= 0) {
+                        strokeColor = c;
+                    }
+                    break;
+                }
+                case "sc": case "scn": {           // colour in current space (fill)
+                    int c = scnColor(operands);
+                    if (c >= 0) {
+                        fillColor = c;
+                    }
+                    break;
+                }
+                case "S": case "s":                       // stroked → stroke colour
+                    recordRuleColor(strokeColor, path.size());
+                    segments.addAll(path);
+                    path.clear();
+                    break;
+                case "f": case "F": case "f*":            // filled rule → fill colour
+                    recordRuleColor(fillColor, path.size());
+                    segments.addAll(path);
+                    path.clear();
+                    break;
+                case "B": case "B*": case "b": case "b*": // stroke wins for a border
+                    recordRuleColor(strokeColor, path.size());
                     segments.addAll(path);
                     path.clear();
                     break;
@@ -237,7 +419,76 @@ public class TableAbsorber {
                     break;
             }
         }
-        return segments;
+    }
+
+    /**
+     * Resolves a Form XObject by name from {@code resources}, applies its
+     * {@code /Matrix} to {@code ctmAtDo}, and recurses into its content stream.
+     * Cycles and non-Form XObjects are skipped.
+     */
+    private void collectFromForm(PdfBase nameOperand, double[] ctmAtDo, Resources resources,
+                                 List<double[]> segments, Set<PdfStream> activeForms, int depth,
+                                 int strokeAtDo, int fillAtDo) {
+        try {
+            if (resources == null) {
+                return;
+            }
+            String xobjName = nameOperand.toString();
+            if (xobjName.startsWith("/")) {
+                xobjName = xobjName.substring(1);
+            }
+            PdfDictionary resDict = resources.getPdfDictionary();
+            if (resDict == null) {
+                return;
+            }
+            PdfBase xobjBase = deref(resDict.get("XObject"));
+            if (!(xobjBase instanceof PdfDictionary)) {
+                return;
+            }
+            PdfBase formBase = deref(((PdfDictionary) xobjBase).get(xobjName));
+            if (!(formBase instanceof PdfStream)) {
+                return;
+            }
+            PdfStream form = (PdfStream) formBase;
+            if (!"Form".equals(form.getNameAsString("Subtype")) || !activeForms.add(form)) {
+                return;
+            }
+            try {
+                double[] ctm = ctmAtDo;
+                PdfBase matrixBase = deref(form.get("Matrix"));
+                if (matrixBase instanceof org.aspose.pdf.engine.pdfobjects.PdfArray) {
+                    org.aspose.pdf.engine.pdfobjects.PdfArray ma =
+                            (org.aspose.pdf.engine.pdfobjects.PdfArray) matrixBase;
+                    if (ma.size() >= 6) {
+                        double[] m = new double[6];
+                        for (int k = 0; k < 6; k++) {
+                            m[k] = toDouble(deref(ma.get(k)));
+                        }
+                        ctm = multiply(m, ctmAtDo);
+                    }
+                }
+                Resources formRes = resources;
+                PdfBase frb = deref(form.get("Resources"));
+                if (frb instanceof PdfDictionary) {
+                    formRes = new Resources((PdfDictionary) frb);
+                }
+                byte[] data = form.getDecodedData();
+                if (data == null || data.length == 0) {
+                    return;
+                }
+                OperatorCollection formOps = ContentStreamParser.parseToCollection(data);
+                collectFromOps(formOps, ctm, formRes, segments, activeForms, depth + 1,
+                        strokeAtDo, fillAtDo);
+            } finally {
+                activeForms.remove(form);
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "rule collection skipped a Form XObject: " + e.getMessage());
+        }
+    }
+
+    private static PdfBase deref(PdfBase b) throws IOException {
+        return b instanceof PdfObjectReference ? ((PdfObjectReference) b).dereference() : b;
     }
 
     /** Adds the (transformed) segment to {@code path} if it is axis-aligned. */
@@ -269,6 +520,68 @@ public class TableAbsorber {
                 m[4] * ctm[0] + m[5] * ctm[2] + ctm[4],
                 m[4] * ctm[1] + m[5] * ctm[3] + ctm[5]
         };
+    }
+
+    /** Accumulates {@code n} painted rule segments under the given colour. */
+    private void recordRuleColor(int rgb, int n) {
+        if (n > 0 && ruleColorCounts != null) {
+            ruleColorCounts.merge(rgb, n, Integer::sum);
+        }
+    }
+
+    private static int clamp255(double v) {
+        int i = (int) Math.round(v * 255);
+        return Math.max(0, Math.min(255, i));
+    }
+
+    private static int rgbOp(List<PdfBase> ops) {
+        if (ops == null || ops.size() < 3) {
+            return 0x000000;
+        }
+        return (clamp255(toDouble(ops.get(0))) << 16)
+                | (clamp255(toDouble(ops.get(1))) << 8) | clamp255(toDouble(ops.get(2)));
+    }
+
+    private static int grayOp(List<PdfBase> ops) {
+        if (ops == null || ops.isEmpty()) {
+            return 0x000000;
+        }
+        int g = clamp255(toDouble(ops.get(0)));
+        return (g << 16) | (g << 8) | g;
+    }
+
+    /**
+     * Colour from an {@code sc/scn} operator by arity: 1 numeric = gray, 3 = RGB,
+     * 4 = CMYK. Returns -1 when the operands are not all numeric (e.g. a trailing
+     * pattern name) — the colour is then left unchanged.
+     */
+    private static int scnColor(List<PdfBase> ops) {
+        if (ops == null || ops.isEmpty()) {
+            return -1;
+        }
+        for (PdfBase o : ops) {
+            if (!(o instanceof PdfInteger) && !(o instanceof PdfFloat)) {
+                return -1;
+            }
+        }
+        switch (ops.size()) {
+            case 1: return grayOp(ops);
+            case 3: return rgbOp(ops);
+            case 4: return cmykOp(ops);
+            default: return -1;
+        }
+    }
+
+    private static int cmykOp(List<PdfBase> ops) {
+        if (ops == null || ops.size() < 4) {
+            return 0x000000;
+        }
+        double c = toDouble(ops.get(0));
+        double m = toDouble(ops.get(1));
+        double y = toDouble(ops.get(2));
+        double k = toDouble(ops.get(3));
+        return (clamp255((1 - c) * (1 - k)) << 16)
+                | (clamp255((1 - m) * (1 - k)) << 8) | clamp255((1 - y) * (1 - k));
     }
 
     private static double toDouble(PdfBase value) {
@@ -327,10 +640,21 @@ public class TableAbsorber {
      * when the cluster has fewer than two horizontal or vertical rule levels
      * (a lone underline is not a table).
      */
-    private AbsorbedTable buildRuledTable(List<double[]> cluster, List<TextFragment> fragments) {
+    private AbsorbedTable buildRuledTable(List<double[]> cluster, List<TextFragment> rawFragments) {
+        // Fill cells in reading order so each cell's TextFragments[1] is the
+        // first line the reader sees (matches Aspose's cell fragment order).
+        List<TextFragment> fragments = new ArrayList<>(rawFragments);
+        fragments.sort(readingOrder());
         List<Double> hLevels = new ArrayList<>();
         List<Double> vLevels = new ArrayList<>();
-        for (double[] s : cluster) {
+        for (double[] raw : cluster) {
+            // Work in visual (rotated) page space: on a /Rotate 90|270 page a
+            // content-horizontal rule is visually vertical (and vice versa), so
+            // the row/column axes must be assigned after rotation — otherwise
+            // the grid comes out transposed (PDFNEWNET_36802_1: 3x27 vs 27x3).
+            double[] p0 = pageRotation.transformPoint(raw[0], raw[1]);
+            double[] p1 = pageRotation.transformPoint(raw[2], raw[3]);
+            double[] s = {p0[0], p0[1], p1[0], p1[1]};
             if (Math.abs(s[1] - s[3]) <= AXIS_DRIFT) {
                 addLevel(hLevels, (s[1] + s[3]) / 2);
             } else if (Math.abs(s[0] - s[2]) <= AXIS_DRIFT) {
@@ -340,17 +664,29 @@ public class TableAbsorber {
         if (hLevels.size() < 2 || vLevels.size() < 2) {
             return null;
         }
-        hLevels.sort(Comparator.reverseOrder());   // top → bottom
-        vLevels.sort(Comparator.naturalOrder());   // left → right
+        // Reader-order row/column iteration. In pageRotation space rows run
+        // top→bottom (descending Y) and columns left→right (ascending X); for a
+        // 90/270 quarter-turn the reader's frame is flipped in both axes, so
+        // both orderings reverse to keep row 0 / column 0 at the reader's
+        // top-left (PDFNEWNET_36802_1).
+        if (readingOrderFlipped()) {
+            hLevels.sort(Comparator.naturalOrder());   // reader top → bottom
+            vLevels.sort(Comparator.reverseOrder());   // reader left → right
+        } else {
+            hLevels.sort(Comparator.reverseOrder());   // top → bottom
+            vLevels.sort(Comparator.naturalOrder());   // left → right
+        }
 
         AbsorbedTable table = new AbsorbedTable();
         for (int r = 0; r + 1 < hLevels.size(); r++) {
-            double top = hLevels.get(r);
-            double bottom = hLevels.get(r + 1);
+            // Levels may be sorted either way (see reading-order flip above);
+            // derive geometric top/bottom so the cell rectangle stays valid.
+            double top = Math.max(hLevels.get(r), hLevels.get(r + 1));
+            double bottom = Math.min(hLevels.get(r), hLevels.get(r + 1));
             AbsorbedRow row = new AbsorbedRow();
             for (int c = 0; c + 1 < vLevels.size(); c++) {
-                double left = vLevels.get(c);
-                double right = vLevels.get(c + 1);
+                double left = Math.min(vLevels.get(c), vLevels.get(c + 1));
+                double right = Math.max(vLevels.get(c), vLevels.get(c + 1));
                 AbsorbedCell cell = new AbsorbedCell();
                 cell.setRectangle(new Rectangle(left, bottom, right, top));
                 for (TextFragment f : fragments) {
@@ -365,9 +701,11 @@ public class TableAbsorber {
             }
             table.addRow(row);
         }
-        table.setRectangle(new Rectangle(
-                vLevels.get(0), hLevels.get(hLevels.size() - 1),
-                vLevels.get(vLevels.size() - 1), hLevels.get(0)));
+        double tblMinX = Math.min(vLevels.get(0), vLevels.get(vLevels.size() - 1));
+        double tblMaxX = Math.max(vLevels.get(0), vLevels.get(vLevels.size() - 1));
+        double tblMinY = Math.min(hLevels.get(0), hLevels.get(hLevels.size() - 1));
+        double tblMaxY = Math.max(hLevels.get(0), hLevels.get(hLevels.size() - 1));
+        table.setRectangle(new Rectangle(tblMinX, tblMinY, tblMaxX, tblMaxY));
         return table;
     }
 
@@ -381,14 +719,19 @@ public class TableAbsorber {
         levels.add(value);
     }
 
-    /** The point used to place a fragment into a cell: rect centre, else position. */
-    private static double[] anchorOf(TextFragment f) {
+    /**
+     * The point used to place a fragment into a cell: rect centre, else
+     * position — expressed in visual (rotated) page space so it matches the
+     * rotated grid levels built by {@link #buildRuledTable}.
+     */
+    private double[] anchorOf(TextFragment f) {
         Rectangle r = f.getRectangle();
         if (r != null && r.getWidth() > 0) {
-            return new double[]{(r.getLLX() + r.getURX()) / 2, (r.getLLY() + r.getURY()) / 2};
+            return pageRotation.transformPoint(
+                    (r.getLLX() + r.getURX()) / 2, (r.getLLY() + r.getURY()) / 2);
         }
         Position p = f.getPosition();
-        return p != null ? new double[]{p.getXIndent(), p.getYIndent()} : null;
+        return p != null ? pageRotation.transformPoint(p.getXIndent(), p.getYIndent()) : null;
     }
 
     /**
@@ -409,7 +752,7 @@ public class TableAbsorber {
         double currentY = Double.NaN;
 
         for (TextFragment f : fragments) {
-            double y = f.getPosition().getYIndent();
+            double y = visualPos(f)[1];
             if (Double.isNaN(currentY) || Math.abs(y - currentY) <= ROW_TOLERANCE) {
                 currentRow.add(f);
                 if (Double.isNaN(currentY)) {
@@ -417,9 +760,8 @@ public class TableAbsorber {
                 }
             } else {
                 if (!currentRow.isEmpty()) {
-                    // Sort row by X coordinate
-                    currentRow.sort(Comparator.comparingDouble(
-                            fr -> fr.getPosition().getXIndent()));
+                    // Sort row by visual X coordinate
+                    currentRow.sort(Comparator.comparingDouble(fr -> visualPos(fr)[0]));
                     rows.add(currentRow);
                 }
                 currentRow = new ArrayList<>();
@@ -428,8 +770,7 @@ public class TableAbsorber {
             }
         }
         if (!currentRow.isEmpty()) {
-            currentRow.sort(Comparator.comparingDouble(
-                    fr -> fr.getPosition().getXIndent()));
+            currentRow.sort(Comparator.comparingDouble(fr -> visualPos(fr)[0]));
             rows.add(currentRow);
         }
         return rows;
@@ -472,9 +813,11 @@ public class TableAbsorber {
             for (TextFragment f : rowFrags) {
                 AbsorbedCell cell = new AbsorbedCell();
                 cell.addTextFragment(f);
-                if (f.getRectangle() != null) {
-                    cell.setRectangle(f.getRectangle());
-                    Rectangle r = f.getRectangle();
+                // Emit the cell rectangle in visual (rotated) page space — Aspose
+                // callers un-rotate it via Page.getRotationMatrix().reverse().
+                Rectangle r = visualRect(f);
+                if (r != null) {
+                    cell.setRectangle(r);
                     minX = Math.min(minX, r.getLLX());
                     minY = Math.min(minY, r.getLLY());
                     maxX = Math.max(maxX, r.getURX());

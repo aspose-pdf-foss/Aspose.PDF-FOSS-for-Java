@@ -40,8 +40,76 @@ public final class ShadingRenderer {
         if (shading instanceof AxialShading || shading instanceof RadialShading
                 || shading instanceof FunctionBasedShading) {
             renderPixelBased(g2d, shading, ctm, clipBounds);
+        } else if (shading instanceof FreeFormGouraudShading) {
+            renderGouraudMesh(g2d, (FreeFormGouraudShading) shading, ctm);
         } else {
             renderFallback(g2d, shading, clipBounds);
+        }
+    }
+
+    /**
+     * Rasterizes a free-form Gouraud triangle mesh (ShadingType 4) in device
+     * space: each triangle's vertices are mapped through the shading CTM and
+     * filled with barycentric-interpolated colours. A mesh with no valid
+     * triangles (malformed vertex stream) paints nothing — Acrobat drops such
+     * shadings silently instead of substituting a fallback colour.
+     */
+    private static void renderGouraudMesh(Graphics2D g2d, FreeFormGouraudShading mesh,
+                                          AffineTransform ctm) {
+        java.util.List<FreeFormGouraudShading.Vertex[]> tris = mesh.getTriangles();
+        if (tris.isEmpty()) return;
+
+        AffineTransform base = g2d.getTransform();
+        java.awt.Shape clipShape = g2d.getClip();
+        if (clipShape == null) return;
+        java.awt.Rectangle clip = base.createTransformedShape(clipShape).getBounds();
+        if (clip.width <= 0 || clip.height <= 0
+                || (long) clip.width * clip.height > MAX_SHADING_PIXELS) {
+            return;
+        }
+        BufferedImage img = new BufferedImage(clip.width, clip.height,
+                BufferedImage.TYPE_INT_ARGB);
+
+        double[] pts = new double[6];
+        for (FreeFormGouraudShading.Vertex[] t : tris) {
+            if (Thread.currentThread().isInterrupted()) return;
+            pts[0] = t[0].x; pts[1] = t[0].y;
+            pts[2] = t[1].x; pts[3] = t[1].y;
+            pts[4] = t[2].x; pts[5] = t[2].y;
+            ctm.transform(pts, 0, pts, 0, 3);
+            FreeFormGouraudShading.Vertex[] dev = new FreeFormGouraudShading.Vertex[]{
+                    new FreeFormGouraudShading.Vertex(pts[0], pts[1], t[0].comps),
+                    new FreeFormGouraudShading.Vertex(pts[2], pts[3], t[1].comps),
+                    new FreeFormGouraudShading.Vertex(pts[4], pts[5], t[2].comps)};
+            int minX = (int) Math.max(clip.x,
+                    Math.floor(Math.min(pts[0], Math.min(pts[2], pts[4]))));
+            int maxX = (int) Math.min(clip.x + clip.width - 1,
+                    Math.ceil(Math.max(pts[0], Math.max(pts[2], pts[4]))));
+            int minY = (int) Math.max(clip.y,
+                    Math.floor(Math.min(pts[1], Math.min(pts[3], pts[5]))));
+            int maxY = (int) Math.min(clip.y + clip.height - 1,
+                    Math.ceil(Math.max(pts[1], Math.max(pts[3], pts[5]))));
+            int n = t[0].comps.length;
+            double[] c = new double[n];
+            for (int py = minY; py <= maxY; py++) {
+                for (int px = minX; px <= maxX; px++) {
+                    double[] bary = FreeFormGouraudShading.barycentric(dev, px + 0.5, py + 0.5);
+                    if (bary == null) continue;
+                    for (int i = 0; i < n; i++) {
+                        c[i] = bary[0] * t[0].comps[i] + bary[1] * t[1].comps[i]
+                                + bary[2] * t[2].comps[i];
+                    }
+                    img.setRGB(px - clip.x, py - clip.y,
+                            colorToARGB(c, mesh.getColorSpace()));
+                }
+            }
+        }
+
+        g2d.setTransform(new AffineTransform());
+        try {
+            g2d.drawImage(img, clip.x, clip.y, null);
+        } finally {
+            g2d.setTransform(base);
         }
     }
 

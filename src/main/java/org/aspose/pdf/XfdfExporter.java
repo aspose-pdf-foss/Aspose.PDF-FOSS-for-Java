@@ -307,8 +307,11 @@ public final class XfdfExporter {
             String richText = markup.getRichText();
             if (richText != null && !richText.isEmpty()) {
                 org.w3c.dom.Element rtElem = xmlDoc.createElement("contents-richtext");
-                // Rich text is XHTML; store as text content (will be escaped by DOM)
-                rtElem.setTextContent(richText);
+                // Rich text is XHTML; store as text content (will be escaped by DOM).
+                // Re-serialise through a DOM first so the emitted markup is canonical
+                // (e.g. the stray "attr >" space in a source /RC collapses to "attr>"),
+                // matching how Acrobat/Aspose normalise richtext on XFDF round-trip.
+                rtElem.setTextContent(normalizeRichText(richText));
                 elem.appendChild(rtElem);
             }
 
@@ -355,6 +358,16 @@ public final class XfdfExporter {
             String stateModel = text.getStateModel();
             if (stateModel != null && !stateModel.isEmpty()) {
                 elem.setAttribute("statemodel", stateModel);
+            }
+        }
+
+        // Stamp icon (/Name entry) — XFDF carries it in the same "icon" attribute
+        // used for text-note icons (XFDF 3.0 §6.5). Without this the re-imported
+        // stamp falls back to the default "Draft" (BUG-XFDF-STAMP-ICON).
+        if (annot instanceof StampAnnotation) {
+            String icon = ((StampAnnotation) annot).getIcon();
+            if (icon != null && !icon.isEmpty()) {
+                elem.setAttribute("icon", icon);
             }
         }
 
@@ -484,6 +497,48 @@ public final class XfdfExporter {
             return Long.toString((long) v);
         }
         return String.valueOf(v);
+    }
+
+    /**
+     * Canonicalises a richtext (XHTML) string by parsing it into a DOM and
+     * re-serialising the root element. This collapses source-specific formatting
+     * artefacts — most notably a stray space before a tag's closing {@code >}
+     * (e.g. {@code <body ... spec="2.0.2" >} becomes {@code <body ... spec="2.0.2">}) —
+     * so that an XFDF round-trip yields the same normalised markup Acrobat/Aspose
+     * produce. On any parse/serialise error the original string is returned
+     * unchanged (richtext is best-effort, never a hard failure).
+     *
+     * @param richText the raw richtext string (may include an XML declaration)
+     * @return the canonicalised richtext, or the input unchanged on error
+     */
+    static String normalizeRichText(String richText) {
+        try {
+            DocumentBuilder builder = org.aspose.pdf.engine.xml.SecureXml.newBuilder(false);
+            org.w3c.dom.Document parsed = builder.parse(
+                    new org.xml.sax.InputSource(new java.io.StringReader(richText)));
+            org.w3c.dom.Element root = parsed.getDocumentElement();
+            if (root == null) return richText;
+
+            Transformer transformer = TransformerFactory.newInstance().newTransformer();
+            transformer.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+            transformer.setOutputProperty(OutputKeys.INDENT, "no");
+            java.io.StringWriter sw = new java.io.StringWriter();
+            transformer.transform(new DOMSource(root), new StreamResult(sw));
+            String body = sw.toString();
+
+            // Preserve the leading declaration form the source used (Acrobat emits
+            // the encodingless "<?xml version="1.0"?>"); default to that.
+            String decl = "<?xml version=\"1.0\"?>";
+            String trimmed = richText.trim();
+            if (trimmed.startsWith("<?xml")) {
+                int end = trimmed.indexOf("?>");
+                if (end > 0) decl = trimmed.substring(0, end + 2);
+            }
+            return decl + body;
+        } catch (Exception e) {
+            LOG.fine(() -> "Could not normalise richtext, keeping verbatim: " + e.getMessage());
+            return richText;
+        }
     }
 
     /**

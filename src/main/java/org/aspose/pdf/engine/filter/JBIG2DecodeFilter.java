@@ -317,6 +317,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         ArithmeticDecoder arith = new ArithmeticDecoder(data, dataOffset, numContexts);
         boolean[] bitmap = new boolean[regionW * regionH];
         boolean ltp = false; // line is typical prediction
+        int[][] tplOffsets = templateOffsets(gbTemplate, gbatX, gbatY);
 
         for (int row = 0; row < regionH; row++) {
             // Typical prediction (§6.2.5.5)
@@ -342,8 +343,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
             }
 
             for (int col = 0; col < regionW; col++) {
-                int context = buildContext(bitmap, regionW, regionH, row, col,
-                                           gbTemplate, gbatX, gbatY);
+                int context = contextAt(bitmap, regionW, regionH, row, col, tplOffsets);
                 int bit = arith.decode(context);
                 if (bit == 1) {
                     bitmap[row * regionW + col] = true;
@@ -354,90 +354,64 @@ public final class JBIG2DecodeFilter implements PdfFilter {
     }
 
     /**
-     * Builds the context value for pixel (row, col) using the specified template.
-     * ISO/IEC 11544 §6.2.5.3, Figures 3–6.
+     * Builds the sorted template-pixel offset list for a generic-region
+     * template with its adaptive (AT) pixels (T.88 §6.2.5.3, Figures 4–7).
+     * The context value is formed MSB-first over the pixels ordered by
+     * (y, x) — the same ordering the TPGDON pseudo-pixel contexts assume.
      *
-     * <p>Template 0: 16 pixels, Template 1: 13 pixels,
-     * Template 2: 10 pixels, Template 3: 10 pixels.</p>
+     * @return array of {dx, dy} offsets, context bit i = offset[bits-1-i]
+     */
+    private static int[][] templateOffsets(int template, int[] atX, int[] atY) {
+        int[][] fixed;
+        switch (template) {
+            case 0:
+                fixed = new int[][]{{-1,-2},{0,-2},{1,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},{2,-1},{-4,0},{-3,0},{-2,0},{-1,0}};
+                break;
+            case 1:
+                fixed = new int[][]{{-1,-2},{0,-2},{1,-2},{2,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},{2,-1},{-3,0},{-2,0},{-1,0}};
+                break;
+            case 2:
+                fixed = new int[][]{{-1,-2},{0,-2},{1,-2},{-2,-1},{-1,-1},{0,-1},{1,-1},{-2,0},{-1,0}};
+                break;
+            default:
+                fixed = new int[][]{{-3,-1},{-2,-1},{-1,-1},{0,-1},{1,-1},{-4,0},{-3,0},{-2,0},{-1,0}};
+                break;
+        }
+        int atCount = (template == 0) ? 4 : 1;
+        int[][] all = new int[fixed.length + atCount][];
+        System.arraycopy(fixed, 0, all, 0, fixed.length);
+        // Nominal AT positions (used when the segment supplies none).
+        int[][] nominalAt = (template == 0)
+                ? new int[][]{{3,-1},{-3,-1},{2,-2},{-2,-2}}
+                : new int[][]{{template == 1 ? 3 : 2, -1}};
+        for (int i = 0; i < atCount; i++) {
+            int ax = (atX != null && i < atX.length) ? atX[i] : nominalAt[i][0];
+            int ay = (atY != null && i < atY.length) ? atY[i] : nominalAt[i][1];
+            all[fixed.length + i] = new int[]{ax, ay};
+        }
+        java.util.Arrays.sort(all, (a, b) -> a[1] != b[1] ? a[1] - b[1] : a[0] - b[0]);
+        return all;
+    }
+
+    /** Computes the arithmetic context for (row, col) over sorted offsets. */
+    private static int contextAt(boolean[] bitmap, int w, int h, int row, int col,
+                                 int[][] offsets) {
+        int cx = 0;
+        for (int[] o : offsets) {
+            cx = (cx << 1) | px(bitmap, w, h, row + o[1], col + o[0]);
+        }
+        return cx;
+    }
+
+    /**
+     * Convenience wrapper: builds the context for one pixel, resolving the
+     * template each call. Hot loops should precompute {@link #templateOffsets}
+     * and use {@link #contextAt} directly.
      */
     private static int buildContext(boolean[] bitmap, int w, int h,
                                      int row, int col, int template,
                                      int[] atX, int[] atY) {
-        int cx = 0;
-        switch (template) {
-            case 0:
-                // 16-bit context: 5 from row-2, 7 from row-1, 4 from current row
-                // Bit 15 (MSB) to bit 0 (LSB)
-                cx = (px(bitmap, w, h, row - 2, col - 2) << 15)
-                   | (px(bitmap, w, h, row - 2, col - 1) << 14)
-                   | (px(bitmap, w, h, row - 2, col)     << 13)
-                   | (px(bitmap, w, h, row - 2, col + 1) << 12)
-                   | (px(bitmap, w, h, row - 2, col + 2) << 11)
-                   | (px(bitmap, w, h, row - 1, col - 3) << 10)
-                   | (px(bitmap, w, h, row - 1, col - 2) << 9)
-                   | (px(bitmap, w, h, row - 1, col - 1) << 8)
-                   | (px(bitmap, w, h, row - 1, col)     << 7)
-                   | (px(bitmap, w, h, row - 1, col + 1) << 6)
-                   | (px(bitmap, w, h, row - 1, col + 2) << 5)
-                   | (px(bitmap, w, h, row - 1, col + 3) << 4)
-                   | (px(bitmap, w, h, row, col - 4)     << 3)
-                   | (px(bitmap, w, h, row, col - 3)     << 2)
-                   | (px(bitmap, w, h, row, col - 2)     << 1)
-                   | (px(bitmap, w, h, row, col - 1));
-                // Replace bit 3 with adaptive template pixel A1
-                if (atX != null && atY != null && atX.length > 0) {
-                    cx = (cx & ~(1 << 3)) | (px(bitmap, w, h, row + atY[0], col + atX[0]) << 3);
-                }
-                break;
-            case 1:
-                // 13-bit context
-                cx = (px(bitmap, w, h, row - 2, col - 1) << 12)
-                   | (px(bitmap, w, h, row - 2, col)     << 11)
-                   | (px(bitmap, w, h, row - 2, col + 1) << 10)
-                   | (px(bitmap, w, h, row - 1, col - 2) << 9)
-                   | (px(bitmap, w, h, row - 1, col - 1) << 8)
-                   | (px(bitmap, w, h, row - 1, col)     << 7)
-                   | (px(bitmap, w, h, row - 1, col + 1) << 6)
-                   | (px(bitmap, w, h, row - 1, col + 2) << 5)
-                   | (px(bitmap, w, h, row, col - 3)     << 4)
-                   | (px(bitmap, w, h, row, col - 2)     << 3)
-                   | (px(bitmap, w, h, row, col - 1)     << 2);
-                // Bit 1: adaptive template pixel
-                if (atX != null && atY != null && atX.length > 0) {
-                    cx |= (px(bitmap, w, h, row + atY[0], col + atX[0]) << 1);
-                }
-                break;
-            case 2:
-                // 10-bit context
-                cx = (px(bitmap, w, h, row - 2, col)     << 9)
-                   | (px(bitmap, w, h, row - 2, col + 1) << 8)
-                   | (px(bitmap, w, h, row - 1, col - 1) << 7)
-                   | (px(bitmap, w, h, row - 1, col)     << 6)
-                   | (px(bitmap, w, h, row - 1, col + 1) << 5)
-                   | (px(bitmap, w, h, row, col - 2)     << 4)
-                   | (px(bitmap, w, h, row, col - 1)     << 3);
-                // Bit 2: adaptive template pixel
-                if (atX != null && atY != null && atX.length > 0) {
-                    cx |= (px(bitmap, w, h, row + atY[0], col + atX[0]) << 2);
-                }
-                break;
-            case 3:
-                // 10-bit context (narrow)
-                cx = (px(bitmap, w, h, row - 1, col - 3) << 9)
-                   | (px(bitmap, w, h, row - 1, col - 2) << 8)
-                   | (px(bitmap, w, h, row - 1, col - 1) << 7)
-                   | (px(bitmap, w, h, row - 1, col)     << 6)
-                   | (px(bitmap, w, h, row - 1, col + 1) << 5)
-                   | (px(bitmap, w, h, row - 1, col + 2) << 4)
-                   | (px(bitmap, w, h, row, col - 2)     << 3)
-                   | (px(bitmap, w, h, row, col - 1)     << 2);
-                // Bit 1: adaptive template pixel
-                if (atX != null && atY != null && atX.length > 0) {
-                    cx |= (px(bitmap, w, h, row + atY[0], col + atX[0]) << 1);
-                }
-                break;
-        }
-        return cx;
+        return contextAt(bitmap, w, h, row, col, templateOffsets(template, atX, atY));
     }
 
     /**
@@ -504,10 +478,12 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         int sdFlags = readU16(segData, off);
         boolean sdHuff = (sdFlags & 0x01) != 0;
         boolean sdRefAgg = (sdFlags & 0x02) != 0;
-        int sdTemplate = (sdFlags >> 2) & 0x03;
-        int sdrTemplate = (sdFlags >> 4) & 0x01;
-        // bits 5-9: Huffman table selections (skip if not Huffman)
-        // bit 10: SDREFAGG uses refinement AT
+        // §7.4.3.1.1 (T.88): bits 2–9 are the Huffman table selectors;
+        // SDTEMPLATE lives in bits 10–11 and SDRTEMPLATE in bit 12. Reading
+        // them from bits 2–4 mis-sized the AT-pixel block for any dictionary
+        // with a non-zero template and derailed the whole decode (33314).
+        int sdTemplate = (sdFlags >> 10) & 0x03;
+        int sdrTemplate = (sdFlags >> 12) & 0x01;
         off += 2;
 
         // §7.4.2.1.2: AT pixels (only if arithmetic coding)
@@ -569,6 +545,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         boolean[][] newBitmaps = new boolean[sdNumNewSyms][];
         int[] newWidths = new int[sdNumNewSyms];
         int[] newHeights = new int[sdNumNewSyms];
+        boolean[] exportFlags = null;
 
         if (sdHuff) {
             // Huffman-coded symbol dictionaries are rare in PDF JBIG2.
@@ -609,7 +586,8 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                         + " in segment " + seg.number + "; skipping segment");
                 return null;
             }
-            int iaidContexts = 1 << symCodeLen;
+            // §A.3: the IAID context tree holds 2^(SBSYMCODELEN+1) nodes.
+            int iaidContexts = 1 << (symCodeLen + 1);
             int totalContexts = safeContextCount(genContexts, iaContexts, iaidContexts);
             if (totalContexts <= 0) {
                 LOG.warning("JBIG2: unreasonable arithmetic context count in segment "
@@ -618,6 +596,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
             }
 
             ArithmeticDecoder arith = new ArithmeticDecoder(segData, dataOffset, totalContexts);
+            int[][] sdTplOffsets = templateOffsets(sdTemplate, sdatX, sdatY);
 
             // Context base offsets
             int cxGB = 0;                          // generic bitmap contexts
@@ -682,8 +661,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                         boolean[] symBitmap = new boolean[symPixels];
                         for (int row = 0; row < symH; row++) {
                             for (int col = 0; col < symW; col++) {
-                                int cx = buildContext(symBitmap, symW, symH, row, col,
-                                                       sdTemplate, sdatX, sdatY);
+                                int cx = contextAt(symBitmap, symW, symH, row, col, sdTplOffsets);
                                 int bit = arith.decode(cxGB + cx);
                                 if (bit == 1) {
                                     symBitmap[row * symW + col] = true;
@@ -738,27 +716,58 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                 newWidths[i] = 0;
                 newHeights[i] = 0;
             }
+
+            // §6.5.10: export flags are run-length coded with IAEX over the
+            // concatenated input+new symbol list, alternating skip/export runs
+            // starting with skip. A dictionary may export a SUBSET — indexing
+            // by position without this shifts every symbol ID in text regions.
+            int totalSyms = numInputSyms + sdNumNewSyms;
+            exportFlags = new boolean[totalSyms];
+            int exIdx = 0;
+            boolean exCur = false;
+            while (exIdx < totalSyms) {
+                int runLen = arith.decodeInteger(cxIAEX);
+                if (runLen == Integer.MIN_VALUE || runLen < 0) { exportFlags = null; break; }
+                if (exCur) {
+                    for (int i = 0; i < runLen && exIdx < totalSyms; i++) exportFlags[exIdx++] = true;
+                } else {
+                    exIdx += runLen;
+                }
+                exCur = !exCur;
+            }
         }
 
-        // Build export symbol list (§6.5.10)
-        // SDNUMEXSYMS tells how many symbols to export from the combined list.
-        // Use it as the cap; fall back to all symbols if we can't decode export flags.
-        int totalExported = Math.min(sdNumExSyms, numInputSyms + sdNumNewSyms);
+        // Build the export symbol list (§6.5.10): the flagged symbols, or —
+        // when flags were unavailable — the first SDNUMEXSYMS positionally.
+        java.util.List<boolean[]> allBitmaps = new java.util.ArrayList<>(inputSymbols);
+        java.util.List<Integer> allWidths = new java.util.ArrayList<>(inputWidths);
+        java.util.List<Integer> allHeights = new java.util.ArrayList<>(inputHeights);
+        for (int i = 0; i < sdNumNewSyms; i++) {
+            allBitmaps.add(newBitmaps[i]);
+            allWidths.add(newWidths[i]);
+            allHeights.add(newHeights[i]);
+        }
+        java.util.List<Integer> exported = new java.util.ArrayList<>();
+        if (exportFlags != null) {
+            for (int i = 0; i < exportFlags.length; i++) {
+                if (exportFlags[i]) exported.add(i);
+            }
+        }
+        if (exported.isEmpty()) {
+            int cap = Math.min(sdNumExSyms, allBitmaps.size());
+            for (int i = 0; i < cap; i++) exported.add(i);
+        }
         SymbolDictionary dict = new SymbolDictionary();
+        int totalExported = exported.size();
         dict.numSymbols = totalExported;
         dict.bitmaps = new boolean[totalExported][];
         dict.widths = new int[totalExported];
         dict.heights = new int[totalExported];
-
-        for (int i = 0; i < numInputSyms; i++) {
-            dict.bitmaps[i] = inputSymbols.get(i);
-            dict.widths[i] = inputWidths.get(i);
-            dict.heights[i] = inputHeights.get(i);
-        }
-        for (int i = 0; i < sdNumNewSyms; i++) {
-            dict.bitmaps[numInputSyms + i] = newBitmaps[i];
-            dict.widths[numInputSyms + i] = newWidths[i];
-            dict.heights[numInputSyms + i] = newHeights[i];
+        for (int i = 0; i < totalExported; i++) {
+            int src = exported.get(i);
+            dict.bitmaps[i] = allBitmaps.get(src);
+            dict.widths[i] = allWidths.get(src);
+            dict.heights[i] = allHeights.get(src);
         }
 
         LOG.fine(() -> "JBIG2: decoded symbol dictionary segment " + seg.number
@@ -932,7 +941,8 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         // IARI (refinement I): 512
         // IARDW, IARDH, IARDX, IARDY: 512 each (refinement dims)
         int iaContexts = 512;
-        int iaidContexts = 1 << symCodeLen;
+        // §A.3: the IAID context tree holds 2^(SBSYMCODELEN+1) nodes.
+        int iaidContexts = 1 << (symCodeLen + 1);
         int totalContexts = safeContextCount(5 * iaContexts, iaContexts, iaidContexts);
         if (totalContexts <= 0) {
             LOG.warning("JBIG2: unreasonable text-region context count in segment "
@@ -954,17 +964,23 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         int cxIARDY = cxIARDX + iaContexts;
 
         // Decode symbol instances (§6.4.5)
-        int stripT = -sbStrips; // STRIPT
         int instancesDecoded = 0;
         int firstS = 0;
 
-        // Decode initial STRIPT
-        int deltaT = arith.decodeInteger(cxIADT);
-        if (deltaT != Integer.MIN_VALUE) {
-            stripT += deltaT;
+        // §6.4.5 step 1: STRIPT = −(IADT decode) × SBSTRIPS.
+        int stripT = 0;
+        int initDT = arith.decodeInteger(cxIADT);
+        if (initDT != Integer.MIN_VALUE) {
+            stripT = -initDT * sbStrips;
         }
 
         while (instancesDecoded < sbNumInstances) {
+            // §6.4.5 step 3b: every strip (including the first) begins with a
+            // delta-T decode: STRIPT += IADT × SBSTRIPS.
+            int strDT = arith.decodeInteger(cxIADT);
+            if (strDT == Integer.MIN_VALUE) break;
+            stripT += strDT * sbStrips;
+
             // Decode first S in strip (FIRSTS)
             int deltaFS = arith.decodeInteger(cxIAFS);
             if (deltaFS == Integer.MIN_VALUE) break; // OOB
@@ -985,7 +1001,9 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                 // Decode symbol ID
                 int symbolID = arith.decodeIAID(cxIAID, symCodeLen);
                 if (symbolID < 0 || symbolID >= numSyms) {
-                    LOG.fine(() -> "JBIG2: invalid symbol ID in text region");
+                    final int badId = symbolID;
+                    LOG.fine(() -> "JBIG2: invalid symbol ID " + badId + " (of " + numSyms
+                            + ", codeLen " + symCodeLen + ") in text region");
                     break;
                 }
 
@@ -1003,64 +1021,20 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                     }
                 }
 
-                // Place symbol on region bitmap (§6.4.5 steps 3c-vi..viii)
-                int placeX, placeY;
+                // §6.4.5 steps 3c-vi..xi. T.88 Table 34: REFCORNER 0=BOTTOMLEFT,
+                // 1=TOPLEFT, 2=BOTTOMRIGHT, 3=TOPRIGHT. Whichever corner is
+                // referenced, the glyph occupies [CURS, CURS+len−1] along S —
+                // only the T coordinate shifts for bottom/right corners.
+                int placeX;
+                int placeY;
                 if (!transposed) {
-                    // §6.4.5 step 3c-vi: advance CURS only for RIGHT corners
-                    if (refCorner == 1 || refCorner == 3) {
-                        curS += symW - 1;
-                    }
-                    // Step 3c-vii: SI = CURS; step 3c-viii: place at [SI, TI]
-                    switch (refCorner) {
-                        case 0: // TOPLEFT
-                            placeX = curS;
-                            placeY = currentT;
-                            break;
-                        case 1: // TOPRIGHT
-                            placeX = curS - symW + 1;
-                            placeY = currentT;
-                            break;
-                        case 2: // BOTTOMLEFT
-                            placeX = curS;
-                            placeY = currentT - symH + 1;
-                            break;
-                        case 3: // BOTTOMRIGHT
-                            placeX = curS - symW + 1;
-                            placeY = currentT - symH + 1;
-                            break;
-                        default:
-                            placeX = curS;
-                            placeY = currentT;
-                            break;
-                    }
+                    placeX = curS;
+                    placeY = (refCorner == 0 || refCorner == 2)
+                            ? currentT - symH + 1 : currentT;   // bottom corners
                 } else {
-                    // §6.4.5 step 3c-vi: advance CURS only for BOTTOM corners
-                    if (refCorner == 2 || refCorner == 3) {
-                        curS += symH - 1;
-                    }
-                    // Step 3c-vii: SI = CURS; step 3c-viii: place at [TI, SI]
-                    switch (refCorner) {
-                        case 0:
-                            placeX = currentT;
-                            placeY = curS;
-                            break;
-                        case 1:
-                            placeX = currentT - symW + 1;
-                            placeY = curS;
-                            break;
-                        case 2:
-                            placeX = currentT;
-                            placeY = curS - symH + 1;
-                            break;
-                        case 3:
-                            placeX = currentT - symW + 1;
-                            placeY = curS - symH + 1;
-                            break;
-                        default:
-                            placeX = currentT;
-                            placeY = curS;
-                            break;
-                    }
+                    placeY = curS;
+                    placeX = (refCorner == 2 || refCorner == 3)
+                            ? currentT - symW + 1 : currentT;   // right corners
                 }
 
                 // Compose symbol onto region
@@ -1068,6 +1042,7 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                     composeBitmap(regionBitmap, regionW, regionH,
                             symBitmap, symW, symH, placeX, placeY, sbCombOp);
                 }
+                curS += transposed ? symH - 1 : symW - 1;
 
                 instancesDecoded++;
                 if (instancesDecoded >= sbNumInstances) break;
@@ -1077,11 +1052,6 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                 if (deltaS == Integer.MIN_VALUE) break; // OOB = end of strip
                 curS += deltaS + sbdsOffset;
             }
-
-            // Decode delta T for next strip
-            deltaT = arith.decodeInteger(cxIADT);
-            if (deltaT == Integer.MIN_VALUE) break;
-            stripT += deltaT;
         }
 
         // Compose region onto page
@@ -1321,9 +1291,13 @@ public final class JBIG2DecodeFilter implements PdfFilter {
     private static byte[] packBitmap(boolean[] bitmap, int width, int height) {
         int rowBytes = (width + 7) / 8;
         byte[] result = new byte[rowBytes * height];
+        // JBIG2 uses 1 = black, but a 1-bpc DeviceGray PDF image sample of 0
+        // is black — the filter must deliver INVERTED bits (white = 1), or
+        // every decoded page comes out negative (blank scans rendered as
+        // solid black, corpus 33314).
         for (int y = 0; y < height; y++) {
             for (int x = 0; x < width; x++) {
-                if (bitmap[y * width + x]) {
+                if (!bitmap[y * width + x]) {
                     result[y * rowBytes + (x >> 3)] |= (byte) (0x80 >> (x & 7));
                 }
             }

@@ -62,183 +62,6 @@ public final class JPXDecodeFilter implements PdfFilter {
     private static final Logger LOG = Logger.getLogger(JPXDecodeFilter.class.getName());
 
     // ═══════════════════════════════════════════════════════════════
-    //  MQ Arithmetic Decoder (Annex C, ISO/IEC 15444-1)
-    // ═══════════════════════════════════════════════════════════════
-
-    /**
-     * MQ arithmetic decoder used by the EBCOT Tier-1 engine.
-     * 47-state probability estimation with conditional exchange.
-     */
-    static final class MQDecoder {
-        // State table: {Qe, NMPS, NLPS, SWITCH} — verbatim from ISO 15444-1
-        // Annex C, Table C.2. The previous transcription had wrong Qe values
-        // from index 16 onwards (off-by-one shift, plus a spurious 0x5101 entry
-        // that doesn't exist in the standard) which silently corrupted the MQ
-        // probability estimates for every context that transitioned past state
-        // 15 — i.e., the majority of any non-trivial code-block.
-        private static final int[][] TABLE = {
-            {0x5601, 1, 1, 1}, {0x3401, 2, 6, 0}, {0x1801, 3, 9, 0}, {0x0AC1, 4, 12, 0},
-            {0x0521, 5, 29, 0},{0x0221,38,33, 0}, {0x5601, 7, 6, 1}, {0x5401, 8, 14, 0},
-            {0x4801, 9,14, 0}, {0x3801,10,14, 0}, {0x3001,11,17, 0}, {0x2401,12,18, 0},
-            {0x1C01,13,20, 0}, {0x1601,29,21, 0}, {0x5601,15,14, 1}, {0x5401,16,14, 0},
-            {0x4801,17,15, 0}, {0x3801,18,16, 0}, {0x3001,19,17, 0}, {0x2401,20,18, 0},
-            {0x2201,21,19, 0}, {0x1C01,22,19, 0}, {0x1801,23,20, 0}, {0x1601,24,21, 0},
-            {0x1401,25,22, 0}, {0x1201,26,23, 0}, {0x1101,27,24, 0}, {0x0AC1,28,25, 0},
-            {0x09C1,29,26, 0}, {0x08A1,30,27, 0}, {0x0521,31,28, 0}, {0x0441,32,29, 0},
-            {0x02A1,33,30, 0}, {0x0221,34,31, 0}, {0x0141,35,32, 0}, {0x0111,36,33, 0},
-            {0x0085,37,34, 0}, {0x0049,38,35, 0}, {0x0025,39,36, 0}, {0x0015,40,37, 0},
-            {0x0009,41,38, 0}, {0x0005,42,39, 0}, {0x0001,43,40, 0}, {0x0001,43,41, 0},
-            {0x5601,45,45, 0}, {0x5601,45,45, 0}, {0x5601,46,46, 0},
-        };
-
-        private final byte[] data;
-        private int pos;
-        private final int endPos;
-        private int cReg;   // C register (28-bit active region)
-        private int aReg;   // A register (interval, 16-bit)
-        private int ct;     // bit counter
-        private int lastByte;
-        // Diagnostic-only trace label; non-null enables per-decision logging.
-        String traceLabel;
-        int traceCount;
-
-        private final int[] states;   // context index per CX
-        private final int[] mps;      // MPS symbol per CX
-
-        MQDecoder(byte[] data, int offset, int length, int numContexts) {
-            this.data = data;
-            this.pos = offset;
-            this.endPos = offset + length;
-            this.states = new int[numContexts];
-            this.mps = new int[numContexts];
-
-            // INITDEC (C.3.5)
-            lastByte = 0;
-            if (pos < endPos) lastByte = data[pos++] & 0xFF;
-            cReg = (lastByte << 16);
-            byteIn();
-            cReg <<= 7;
-            ct -= 7;
-            aReg = 0x8000;
-        }
-
-        /** Sets context CX to state index and MPS value. */
-        void setContext(int cx, int stateIdx, int mpsVal) {
-            states[cx] = stateIdx;
-            mps[cx] = mpsVal;
-        }
-
-        /**
-         * Decodes one binary decision for context CX.
-         *
-         * <p>Follows ISO/IEC 15444-1 Annex C, §C.3.2 (DECODE):
-         * <pre>
-         *   A := A − Qe
-         *   if C_high < Qe          // C fell into the LPS sub-interval [0, Qe)
-         *     LPS-EXCHANGE; renormalise
-         *   else                    // C fell into the MPS sub-interval [Qe, A)
-         *     C := C − (Qe << 16)
-         *     if A < 0x8000
-         *       MPS-EXCHANGE; renormalise
-         *     else
-         *       return MPS
-         * </pre>
-         */
-        int decode(int cx) {
-            int si = states[cx];
-            int qe = TABLE[si][0];
-            int aBefore = aReg;
-            int cBefore = cReg;
-            aReg -= qe;
-            int d;
-            if ((cReg >>> 16) < qe) {
-                // LPS sub-interval — C stays in [0, Qe).
-                if (aReg < qe) {
-                    // Conditional exchange: LPS region is larger than MPS
-                    // region, so output the symbol associated with the bigger
-                    // half (= MPS), advance via NMPS.
-                    d = mps[cx];
-                    states[cx] = TABLE[si][1];
-                } else {
-                    d = 1 - mps[cx];
-                    if (TABLE[si][3] != 0) mps[cx] = 1 - mps[cx];
-                    states[cx] = TABLE[si][2];
-                }
-                aReg = qe;
-            } else {
-                // MPS sub-interval — normalise C by subtracting Qe.
-                cReg -= qe << 16;
-                if (aReg >= 0x8000) {
-                    int rd = mps[cx];
-                    if (traceLabel != null && traceCount < 200) {
-                        System.out.println(String.format(
-                                "[jpx.t1] %s [%d] cx=%d si=%d qe=%04X aBefore=%04X cBefore=%08X → d=%d aAfter=%04X cAfter=%08X (MPS-no-renorm)",
-                                traceLabel, traceCount++, cx, si, qe, aBefore & 0xFFFF, cBefore,
-                                rd, aReg & 0xFFFF, cReg));
-                    }
-                    return rd; // no renormalisation required
-                }
-                if (aReg < qe) {
-                    d = 1 - mps[cx];
-                    if (TABLE[si][3] != 0) mps[cx] = 1 - mps[cx];
-                    states[cx] = TABLE[si][2];
-                } else {
-                    d = mps[cx];
-                    states[cx] = TABLE[si][1];
-                }
-            }
-            // Renormalise. With aReg already at the OLD Qe (set in LPS path)
-            // or at A_new = A_old − Qe (MPS path), shift left until ≥ 0x8000.
-            do {
-                if (ct == 0) byteIn();
-                aReg <<= 1;
-                cReg <<= 1;
-                ct--;
-            } while (aReg < 0x8000);
-            if (traceLabel != null && traceCount < 200) {
-                System.out.println(String.format(
-                        "[jpx.t1] %s [%d] cx=%d si=%d qe=%04X aBefore=%04X cBefore=%08X → d=%d aAfter=%04X cAfter=%08X newState=%d newMps=%d",
-                        traceLabel, traceCount++, cx, si, qe, aBefore & 0xFFFF, cBefore,
-                        d, aReg & 0xFFFF, cReg, states[cx], mps[cx]));
-            }
-            return d;
-        }
-
-        private void byteIn() {
-            if (lastByte == 0xFF) {
-                int b = (pos < endPos) ? (data[pos] & 0xFF) : 0xFF;
-                if (b > 0x8F) {
-                    // Marker detected (or past end-of-data with implicit FF):
-                    // per ISO 15444-1 C.3.4, do not consume the byte, but
-                    // saturate the code register by adding 0xFF00 so that the
-                    // decoder continues to read 1-bits indefinitely. Previously
-                    // we left cReg untouched, which fed stale/zero bits into
-                    // the active region and biased late MQ decisions (in
-                    // particular sign-context decodes near codeblock tails).
-                    cReg += 0xFF00;
-                    ct = 8;
-                } else {
-                    pos++;
-                    lastByte = b;
-                    cReg += b << 9;
-                    ct = 7;
-                }
-            } else {
-                int b;
-                if (pos < endPos) {
-                    b = data[pos++] & 0xFF;
-                } else {
-                    // Past end-of-data: treat as implicit FF byte and saturate.
-                    b = 0xFF;
-                }
-                lastByte = b;
-                cReg += b << 8;
-                ct = 8;
-            }
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════
     //  Bit reader for packet headers (Annex B.10.1 — bit-stuffing)
     // ═══════════════════════════════════════════════════════════════
 
@@ -444,6 +267,8 @@ public final class JPXDecodeFilter implements PdfFilter {
         int cbW, cbH;           // code-block size
         int cbStyle;
         int wavelet;            // 0=9/7 irreversible, 1=5/3 reversible
+        boolean useSop;         // Scod bit 1: SOP marker before each packet
+        boolean useEph;         // Scod bit 2: EPH marker after each packet header
     }
 
     private static final class QCDData {
@@ -545,28 +370,42 @@ public final class JPXDecodeFilter implements PdfFilter {
      */
     static int[] decodeTier1(byte[] cbData, int cbW, int cbH,
                              int numPasses, int Mb, int zeroBP, int bandType) {
+        return decodeTier1(cbData, cbW, cbH, numPasses, Mb, zeroBP, bandType, false);
+    }
+
+    /**
+     * @param segSym cbStyle bit 5 — the encoder appended a four-symbol
+     *               segmentation marker (1010, UNIFORM context) after every
+     *               Cleanup pass; it must be consumed or the MQ stream desyncs
+     *               on the next pass (ISO 15444-1 §D.5).
+     */
+    static int[] decodeTier1(byte[] cbData, int cbW, int cbH,
+                             int numPasses, int Mb, int zeroBP, int bandType,
+                             boolean segSym) {
         int[] coeffs = new int[cbW * cbH];
         int[] sigma = new int[cbW * cbH];
         int[] eta = new int[cbW * cbH];
 
         if (numPasses == 0 || cbData.length == 0) return coeffs;
 
-        boolean trace = System.getProperty("jpx.t1trace") != null
-                && bandType == BAND_LL && cbW <= 30;  // trace first small LL codeblock only
-        MQDecoder mq = new MQDecoder(cbData, 0, cbData.length, NUM_CX);
-        if (trace) mq.traceLabel = "LL_" + cbW + "x" + cbH;
-        // Per Annex D, all contexts default to (state 0, MPS 0). UNI starts at
-        // state 46 ("unconditional"), RL starts at state 3.
+        // The MQ coder of ISO 15444-1 Annex C is the identical algorithm to
+        // ITU-T T.88 Annex E — reuse the corpus-proven JBIG2 decoder rather
+        // than maintaining a second transcription of the same state machine.
+        ArithmeticDecoder mq = new ArithmeticDecoder(cbData, 0, NUM_CX);
+        // Initial context states per ISO 15444-1 Table D.7: all contexts start
+        // at (state 0, MPS 0) EXCEPT the all-zero-neighbourhood ZC context 0
+        // (state 4), the run-length context (state 3) and the uniform context
+        // (state 46). Missing the ZC-0 preset desynchronised every code-block
+        // a few decisions in (first wrong bit as early as the second stripe
+        // column) — the root cause of the long-standing "JPX decodes to
+        // noise" family.
+        mq.setContext(0, 4, 0);
         mq.setContext(CX_UNI, 46, 0);
         mq.setContext(CX_RL, 3, 0);
 
         int passIdx = 0;
         // First coded bit-plane = M_b − 1 − K  (Annex D.1)
         int bitPlane = Mb - 1 - zeroBP;
-        if (trace) {
-            System.out.println(String.format("[jpx.t1] %s start: Mb=%d K=%d bp0=%d numPasses=%d cbData=%d bytes",
-                    mq.traceLabel, Mb, zeroBP, bitPlane, numPasses, cbData.length));
-        }
 
         while (passIdx < numPasses && bitPlane >= 0) {
             int passType;
@@ -585,6 +424,13 @@ public final class JPXDecodeFilter implements PdfFilter {
                     break;
                 case 2:
                     cleanupPass(mq, coeffs, sigma, eta, cbW, cbH, bitPlane, bandType);
+                    if (segSym) {
+                        // Consume the 1010 segmentation symbol (§D.5).
+                        mq.decode(CX_UNI);
+                        mq.decode(CX_UNI);
+                        mq.decode(CX_UNI);
+                        mq.decode(CX_UNI);
+                    }
                     break;
             }
 
@@ -595,7 +441,7 @@ public final class JPXDecodeFilter implements PdfFilter {
         return coeffs;
     }
 
-    private static void sigPropPass(MQDecoder mq, int[] c, int[] sig, int[] eta,
+    private static void sigPropPass(ArithmeticDecoder mq, int[] c, int[] sig, int[] eta,
                                     int w, int h, int bp, int band) {
         for (int j = 0; j < h; j += 4) {
             for (int i = 0; i < w; i++) {
@@ -617,7 +463,7 @@ public final class JPXDecodeFilter implements PdfFilter {
         }
     }
 
-    private static void magRefPass(MQDecoder mq, int[] c, int[] sig, int[] eta,
+    private static void magRefPass(ArithmeticDecoder mq, int[] c, int[] sig, int[] eta,
                                    int w, int h, int bp) {
         for (int j = 0; j < h; j += 4) {
             for (int i = 0; i < w; i++) {
@@ -626,12 +472,15 @@ public final class JPXDecodeFilter implements PdfFilter {
                     int idx = jj * w + i;
                     if (sig[idx] == 0) continue;
                     if (eta[idx] != 0) continue; // already coded in this bit-plane
-                    // Context selection (Table D.4):
-                    //   first refinement of this coefficient → 14 if no significant
-                    //   neighbors, 15 if any; subsequent refinements → 16.
+                    // Context selection (Table D.4), interop-verified against
+                    // OpenJPEG-encoded streams via pdf.js: first refinement of
+                    // this coefficient → 14 if ANY significant neighbour,
+                    // 15 if none; subsequent refinements → 16. (The earlier
+                    // 14/15 assignment was inverted, desynchronising the MQ
+                    // stream at the first magnitude-refinement pass.)
                     int cx;
                     if (sig[idx] == 1) {
-                        cx = (getNeighborSigCount(sig, i, jj, w, h) > 0) ? 15 : 14;
+                        cx = (getNeighborSigCount(sig, i, jj, w, h) > 0) ? 14 : 15;
                     } else {
                         cx = 16;
                     }
@@ -646,9 +495,8 @@ public final class JPXDecodeFilter implements PdfFilter {
         }
     }
 
-    private static void cleanupPass(MQDecoder mq, int[] c, int[] sig, int[] eta,
+    private static void cleanupPass(ArithmeticDecoder mq, int[] c, int[] sig, int[] eta,
                                     int w, int h, int bp, int band) {
-        boolean trace = mq.traceLabel != null;
         for (int j = 0; j < h; j += 4) {
             for (int i = 0; i < w; i++) {
                 int jEnd = Math.min(j + 4, h);
@@ -659,9 +507,6 @@ public final class JPXDecodeFilter implements PdfFilter {
                         eta[idx] = 0; // clear visit marker for next bit-plane
                         jj++;
                         continue;
-                    }
-                    if (trace && mq.traceCount < 200) {
-                        System.out.println(String.format("[jpx.t1] CU bp=%d at (i=%d,jj=%d) idx=%d", bp, i, jj, idx));
                     }
                     // Run-length mode: only when the entire 4-row stripe column is
                     // insignificant AND none of the four positions has a significant
@@ -731,10 +576,13 @@ public final class JPXDecodeFilter implements PdfFilter {
                + sigPresent(sig, x - 1, y + 1, w, h) + sigPresent(sig, x + 1, y + 1, w, h);
         switch (band) {
             case BAND_HL:
-                return ctxFromHVD(hc, vc, dc);
-            case BAND_LH:
-                // LH is the transpose of HL — swap horizontal/vertical contributions.
+                // Table D.1: the HL sub-band (horizontally high-pass) swaps the
+                // horizontal/vertical contributions; LL and LH share the
+                // unswapped mapping. (Was inverted — HL unswapped and LH
+                // swapped — corrupting every non-LL band.)
                 return ctxFromHVD(vc, hc, dc);
+            case BAND_LH:
+                return ctxFromHVD(hc, vc, dc);
             case BAND_HH: {
                 // Table D.2 — ZC context for HH sub-band: 9 contexts (0..8)
                 // arranged on the (h+v, d) grid:
@@ -798,7 +646,7 @@ public final class JPXDecodeFilter implements PdfFilter {
      *   (-1, -1) → (13, 1)   (X1 negative)
      * </pre>
      */
-    private static int decodeSign(MQDecoder mq, int[] sig, int[] c,
+    private static int decodeSign(ArithmeticDecoder mq, int[] sig, int[] c,
                                   int x, int y, int w, int h) {
         int hContrib = signContrib(sig, c, x - 1, y, w, h) + signContrib(sig, c, x + 1, y, w, h);
         int vContrib = signContrib(sig, c, x, y - 1, w, h) + signContrib(sig, c, x, y + 1, w, h);
@@ -818,17 +666,7 @@ public final class JPXDecodeFilter implements PdfFilter {
         } else {
             ctxIdx = 13; xorBit = (hSign < 0) ? 1 : 0;     // X1 (same)
         }
-        if (mq.traceLabel != null && mq.traceCount < 200) {
-            System.out.println(String.format("[jpx.t1] decodeSign-IN at (x=%d,y=%d) hSign=%d vSign=%d → ctx=%d xor=%d",
-                    x, y, hSign, vSign, ctxIdx, xorBit));
-        }
         int bit = mq.decode(ctxIdx);
-        if (mq.traceLabel != null && mq.traceCount < 200) {
-            System.out.println(String.format("[jpx.t1] decodeSign-OUT (x=%d,y=%d) bit=%d xor=%d → sign=%d",
-                    x, y, bit, xorBit, bit ^ xorBit));
-        }
-        if (System.getProperty("jpx.invertxor") != null) xorBit = 1 - xorBit;
-        if (System.getProperty("jpx.invertsign") != null) return 1 - (bit ^ xorBit);
         return bit ^ xorBit;
     }
 
@@ -873,29 +711,19 @@ public final class JPXDecodeFilter implements PdfFilter {
         for (int i = 0; i < halfLen; i++) x[lo + 2 * i] = temp[i];
         for (int i = 0; i < len - halfLen; i++) x[lo + 2 * i + 1] = temp[halfLen + i];
 
-        final double K = 1.230174105;
-        final double K2 = K * K;
-        final double D = 0.443506852;
-        final double G = 0.882911075;
-        final double B = -0.052980118;
-        final double A = -1.586134342;
+        final double K = 1.230174104914001;
+        final double D = 0.443506852043971;
+        final double G = 0.882911075530934;
+        final double B = -0.052980118572961;
+        final double A = -1.586134342059924;
 
-        // Undo analysis-side scaling. The DWT lifting alone has DC gain K on
-        // the low band (forward lifting maps c=1 → s=K). The forward analysis
-        // path used in this codebase further divides low by K, so the on-disk
-        // LL sub-band has DC gain 1/K relative to the original image (forward
-        // c=1 → LL=1/K). The inverse therefore needs scale K² on the low band
-        // (and 1/K² on the high band) so the lifting's 1/K loss-side gain
-        // brings DC back to K, which the inverse lifting then converts back
-        // to the original signal. Pinned by JPXDecodeFilterDWTTest
-        // dwt97_constantLow_zeroHigh_reconstructsConstant (LL=1/K → c=1).
-        if (System.getProperty("jpx.invertk") != null) {
-            for (int i = 0; i < len; i += 2) x[lo + i] /= K2;
-            for (int i = 1; i < len; i += 2) x[lo + i] *= K2;
-        } else {
-            for (int i = 0; i < len; i += 2) x[lo + i] *= K2;
-            for (int i = 1; i < len; i += 2) x[lo + i] /= K2;
-        }
+        // Scaling step of the inverse lifting (ISO 15444-1 F.4.6, STEP1/2):
+        // low band × K, high band × 1/K — the standard analysis gains, matching
+        // what real encoders (OpenJPEG, Kakadu) write. The previous K²/1/K²
+        // scaling was calibrated against this codebase's own forward transform
+        // and produced ~2× contrast error on every real 9/7 codestream.
+        for (int i = 0; i < len; i += 2) x[lo + i] *= K;
+        for (int i = 1; i < len; i += 2) x[lo + i] /= K;
 
         for (int i = 0; i < len; i += 2) {
             double left  = (i > 0) ? x[lo + i - 1] : x[lo + 1];
@@ -1020,60 +848,92 @@ public final class JPXDecodeFilter implements PdfFilter {
 
         final int imgW = siz.width - siz.xOff;
         final int imgH = siz.height - siz.yOff;
-
-        // Consume the SOT segment: 2 bytes Lsot, 2 bytes Isot, 4 bytes Psot,
-        // 1 byte TPsot, 1 byte TNsot. (Marker code FF90 already consumed.)
-        int lsot = r.u16();
-        int tileIdx = r.u16();
-        int tilePartLen = r.u32();
-        int tpIdx = r.u8();
-        int numTP = r.u8();
-        if (System.getProperty("jpx.diag") != null) {
-            System.out.println("[jpx.diag] SOT lsot=" + lsot + " tileIdx=" + tileIdx
-                    + " tilePartLen=" + tilePartLen + " tpIdx=" + tpIdx + " numTP=" + numTP);
-        }
-        if (tileIdx != 0) {
-            final int idx = tileIdx;
-            LOG.warning(() -> "JPXDecode: multi-tile codestreams not fully supported (first tile=" + idx + ")");
-        }
-
-        // Skip POC/PPT/COM/etc. between SOT and SOD.
         boolean diag = System.getProperty("jpx.diag") != null;
-        while (r.pos < data.length - 1) {
-            m = r.marker();
-            if (diag) System.out.println("[jpx.diag] post-SOT marker 0x" + Integer.toHexString(m) + " @" + (r.pos - 2));
-            if (m == SOD) break;
-            int len = r.u16();
-            r.skip(len - 2);
-        }
 
-        int bsStart = r.pos;
-        int bsEnd = data.length;
-        // Tile bitstream ends at EOC (FFD9) or end-of-data.
-        for (int i = bsStart; i < data.length - 1; i++) {
-            int b0 = data[i] & 0xFF;
-            int b1 = data[i + 1] & 0xFF;
-            if (b0 == 0xFF && b1 == 0xD9) {
-                bsEnd = i;
-                break;
+        // ── Collect tile-part bitstreams, keyed by tile index (§A.4.2) ──
+        // The reader sits just past the FF90 of the first SOT. Each tile-part:
+        // Lsot(2) Isot(2) Psot(4) TPsot(1) TNsot(1), optional markers, SOD,
+        // then Psot−(SOD end − SOT start) bytes of packet data. A tile split
+        // into several tile-parts concatenates in TPsot order, which is also
+        // codestream order.
+        java.util.Map<Integer, java.io.ByteArrayOutputStream> tileStreams = new java.util.TreeMap<>();
+        while (true) {
+            int sotStart = r.pos - 2;
+            r.u16(); // Lsot
+            int tileIdx = r.u16();
+            long psot = r.u32() & 0xFFFFFFFFL;
+            int tpIdx = r.u8();
+            int numTP = r.u8();
+            if (diag) {
+                System.out.println("[jpx.diag] SOT tileIdx=" + tileIdx + " psot=" + psot
+                        + " tpIdx=" + tpIdx + " numTP=" + numTP);
             }
-        }
-        if (diag) {
-            // Scan for ALL markers in the codestream (FFxx where xx > 8F, the
-            // delimiter range), so we can see if there are tile-parts, POC, etc.
-            System.out.println("[jpx.diag] codestream markers scan from " + bsStart + " to " + data.length + ":");
-            int markerCount = 0;
-            for (int i = bsStart; i < data.length - 1 && markerCount < 40; i++) {
-                int b0 = data[i] & 0xFF;
-                int b1 = data[i + 1] & 0xFF;
-                if (b0 == 0xFF && b1 >= 0x90 && b1 != 0xFF) {
-                    System.out.println(String.format("[jpx.diag]   marker @%d: FF%02X", i, b1));
-                    markerCount++;
+            // Skip POC/PPT/COM/etc. between SOT and SOD.
+            while (r.pos < data.length - 1) {
+                m = r.marker();
+                if (m == SOD) break;
+                int len = r.u16();
+                r.skip(len - 2);
+            }
+            int bodyStart = r.pos;
+            int bodyEnd;
+            if (psot > 0) {
+                bodyEnd = (int) Math.min(data.length, sotStart + psot);
+            } else {
+                // Psot=0 (last tile-part): runs to the next SOT or EOC.
+                bodyEnd = data.length;
+                for (int i = bodyStart; i < data.length - 1; i++) {
+                    int b0 = data[i] & 0xFF, b1 = data[i + 1] & 0xFF;
+                    if (b0 == 0xFF && (b1 == 0x90 || b1 == 0xD9)) {
+                        bodyEnd = i;
+                        break;
+                    }
                 }
             }
+            if (bodyEnd <= bodyStart) break;
+            tileStreams.computeIfAbsent(tileIdx, k1 -> new java.io.ByteArrayOutputStream())
+                       .write(data, bodyStart, bodyEnd - bodyStart);
+            r.pos = bodyEnd;
+            if (r.pos >= data.length - 1) break;
+            m = r.marker();
+            if (m != SOT) break; // EOC or truncated stream
         }
 
-        return decodeTile(data, bsStart, bsEnd, siz, cod, qcd, imgW, imgH);
+        // ── Tile grid (§B.3) ──
+        int numXT = Math.max(1, ceilDiv(siz.width - siz.txOff, siz.tileW));
+
+        // Full-image component planes; tiles composite into them.
+        int numComp = siz.numComp;
+        byte[][] planes = new byte[numComp][];
+        int[] compW = new int[numComp];
+        int[] compH = new int[numComp];
+        for (int c = 0; c < numComp; c++) {
+            compW[c] = (imgW + siz.xSub[c] - 1) / siz.xSub[c];
+            compH[c] = (imgH + siz.ySub[c] - 1) / siz.ySub[c];
+            planes[c] = new byte[compW[c] * compH[c]];
+        }
+
+        for (java.util.Map.Entry<Integer, java.io.ByteArrayOutputStream> e : tileStreams.entrySet()) {
+            int t = e.getKey();
+            int p = t % numXT, q = t / numXT;
+            int tx0 = Math.max(siz.txOff + p * siz.tileW, siz.xOff);
+            int ty0 = Math.max(siz.tyOff + q * siz.tileH, siz.yOff);
+            int tx1 = Math.min(siz.txOff + (p + 1) * siz.tileW, siz.width);
+            int ty1 = Math.min(siz.tyOff + (q + 1) * siz.tileH, siz.height);
+            if (tx1 <= tx0 || ty1 <= ty0) continue;
+            if (diag) {
+                System.out.println("[jpx.diag] tile " + t + " grid[" + p + "," + q + "] = ("
+                        + tx0 + "," + ty0 + ")..(" + tx1 + "," + ty1 + ")");
+            }
+            decodeTileInto(e.getValue().toByteArray(), siz, cod, qcd,
+                    tx0, ty0, tx1, ty1, planes, compW, compH);
+        }
+
+        return interleaveComponents(planes, imgW, imgH, numComp);
+    }
+
+    private static int ceilDiv(int a, int b) {
+        return (a + b - 1) / b;
     }
 
     /** Locates the {@code jp2c} codestream box inside a JP2-wrapped file. */
@@ -1128,6 +988,8 @@ public final class JPXDecodeFilter implements PdfFilter {
         }
         CODData c = new CODData();
         int scod = r.u8();
+        c.useSop = (scod & 2) != 0;
+        c.useEph = (scod & 4) != 0;
         c.progressionOrder = r.u8();
         c.numLayers = r.u16();
         c.mct = r.u8();
@@ -1187,12 +1049,27 @@ public final class JPXDecodeFilter implements PdfFilter {
 
     // ─── Tile decoding ───────────────────────────────────────────
 
-    private byte[] decodeTile(byte[] data, int bsStart, int bsEnd,
-                              SIZData siz, CODData cod, QCDData qcd,
-                              int imgW, int imgH) throws IOException {
+    /**
+     * Decodes one tile's bitstream and composites the result into the
+     * full-image component {@code planes}.
+     * <p>
+     * NOTE: the sub-band size/code-block partition arithmetic below halves the
+     * tile dimensions directly, which matches the coordinate-based formulas of
+     * §B.5 only when the tile origin is aligned to {@code 2^numDecomp} (true
+     * for the ubiquitous XTOsiz=0 + power-of-two tile sizes) — the same
+     * assumption the single-tile path has always made for the image origin.
+     * </p>
+     *
+     * @param tx0 tile bounds on the reference grid (§B.3)
+     */
+    private void decodeTileInto(byte[] data, SIZData siz, CODData cod, QCDData qcd,
+                                int tx0, int ty0, int tx1, int ty1,
+                                byte[][] planes, int[] compW, int[] compH) throws IOException {
         int numComp = siz.numComp;
         int numDecomp = cod.numDecomp;
         boolean reversible = (cod.wavelet == 1);
+        int bsStart = 0, bsEnd = data.length;
+        int imgW = tx1 - tx0, imgH = ty1 - ty0; // this tile's grid dimensions
 
         boolean diag = System.getProperty("jpx.diag") != null;
         if (diag) {
@@ -1231,8 +1108,11 @@ public final class JPXDecodeFilter implements PdfFilter {
 
         // Tier-1 + IDWT + dequantize — per component.
         byte[][] compData = new byte[numComp][];
+        int[][] intData = new int[numComp][];
+        double[][] dblData = new double[numComp][];
         for (int c = 0; c < numComp; c++) {
-            int[][] subBands = assembleSubBands(perComp[c], qcd, numDecomp);
+            int[][] subBands = assembleSubBands(perComp[c], qcd, numDecomp,
+                    (cod.cbStyle & 0x20) != 0);
             int bitDepth = (siz.bitDepths[c] & 0x7F) + 1;
             boolean isSigned = (siz.bitDepths[c] & 0x80) != 0;
             if (diag) {
@@ -1276,15 +1156,48 @@ public final class JPXDecodeFilter implements PdfFilter {
                 }
             }
             if (reversible) {
-                int[] reconstructed = inverseDWT53_Full(subBands, cWArr[c], cHArr[c], numDecomp);
-                if (diag) diagPrintSpatial("DWT53.out", c, reconstructed, cWArr[c], cHArr[c]);
-                compData[c] = coeffsToBytes(reconstructed, cWArr[c], cHArr[c], bitDepth, isSigned);
+                intData[c] = inverseDWT53_Full(subBands, cWArr[c], cHArr[c], numDecomp);
+                if (diag) diagPrintSpatial("DWT53.out", c, intData[c], cWArr[c], cHArr[c]);
             } else {
-                double[] reconstructed = inverseDWT97_Full(subBands, cWArr[c], cHArr[c],
+                dblData[c] = inverseDWT97_Full(subBands, cWArr[c], cHArr[c],
                         numDecomp, qcd, bitDepth);
-                if (diag) diagPrintSpatial97("DWT97.out", c, reconstructed, cWArr[c], cHArr[c]);
-                compData[c] = doubleCoeffsToBytes(reconstructed, cWArr[c], cHArr[c], bitDepth, isSigned);
+                if (diag) diagPrintSpatial97("DWT97.out", c, dblData[c], cWArr[c], cHArr[c]);
             }
+        }
+
+        // Inverse multiple-component transform — per tile, BEFORE the DC level
+        // shift and byte clamping (§G.2): RCT chroma spans ~9 bits signed, so
+        // clamping components to bytes first destroyed saturated colours.
+        if (cod.mct == 1 && numComp >= 3
+                && cWArr[0] == cWArr[1] && cWArr[0] == cWArr[2]
+                && cHArr[0] == cHArr[1] && cHArr[0] == cHArr[2]) {
+            int n = cWArr[0] * cHArr[0];
+            if (reversible) {
+                int[] y0 = intData[0], u0 = intData[1], v0 = intData[2];
+                for (int i = 0; i < n; i++) {
+                    int y = y0[i], u = u0[i], v = v0[i];
+                    int gg = y - ((u + v) >> 2);
+                    y0[i] = v + gg; // R
+                    u0[i] = gg;     // G
+                    v0[i] = u + gg; // B
+                }
+            } else {
+                double[] y0 = dblData[0], u0 = dblData[1], v0 = dblData[2];
+                for (int i = 0; i < n; i++) {
+                    double y = y0[i], u = u0[i], v = v0[i];
+                    y0[i] = y + 1.402 * v;
+                    u0[i] = y - 0.34413 * u - 0.71414 * v;
+                    v0[i] = y + 1.772 * u;
+                }
+            }
+        }
+
+        for (int c = 0; c < numComp; c++) {
+            int bitDepth = (siz.bitDepths[c] & 0x7F) + 1;
+            boolean isSigned = (siz.bitDepths[c] & 0x80) != 0;
+            compData[c] = reversible
+                    ? coeffsToBytes(intData[c], cWArr[c], cHArr[c], bitDepth, isSigned)
+                    : doubleCoeffsToBytes(dblData[c], cWArr[c], cHArr[c], bitDepth, isSigned);
         }
 
         if (diag && numComp >= 3) {
@@ -1303,21 +1216,26 @@ public final class JPXDecodeFilter implements PdfFilter {
                         }
                     }
                     javax.imageio.ImageIO.write(img, "PNG",
-                            out.resolve("jpxdiag_premct_" + names[cc] + ".png").toFile());
+                            out.resolve("jpxdiag_postmct_" + names[cc] + ".png").toFile());
                 }
-                System.out.println("[jpx.diag] wrote pre-MCT components to " + out);
+                System.out.println("[jpx.diag] wrote post-MCT components to " + out);
             } catch (Exception e) {
                 System.out.println("[jpx.diag] component dump failed: " + e.getMessage());
             }
         }
 
-        // Inverse multiple-component transform.
-        if (cod.mct == 1 && numComp >= 3) {
-            if (reversible) inverseRCT(compData, imgW, imgH);
-            else            inverseICT(compData, imgW, imgH);
+        // Composite the tile into the full-image component planes.
+        for (int c = 0; c < numComp; c++) {
+            int dstX = ceilDiv(tx0, siz.xSub[c]) - ceilDiv(siz.xOff, siz.xSub[c]);
+            int dstY = ceilDiv(ty0, siz.ySub[c]) - ceilDiv(siz.yOff, siz.ySub[c]);
+            int rowLen = Math.min(cWArr[c], compW[c] - dstX);
+            for (int y = 0; y < cHArr[c]; y++) {
+                int dy = dstY + y;
+                if (dy < 0 || dy >= compH[c] || rowLen <= 0) continue;
+                System.arraycopy(compData[c], y * cWArr[c],
+                        planes[c], dy * compW[c] + dstX, rowLen);
+            }
         }
-
-        return interleaveComponents(compData, imgW, imgH, numComp);
     }
 
     /**
@@ -1376,48 +1294,66 @@ public final class JPXDecodeFilter implements PdfFilter {
                     + " layers=" + cod.numLayers + " totalRes=" + totalRes);
         }
         int pktIdx = 0;
-        for (int layer = 0; layer < cod.numLayers; layer++) {
-            for (int r = 0; r < totalRes; r++) {
-                for (int c = 0; c < numComp; c++) {
-                    int hdrPos = br.pos;
-                    int hdrBitsLeft = br.bitsLeft;
-                    if (diag) {
-                        StringBuilder hex = new StringBuilder();
-                        for (int b = hdrPos; b < Math.min(hdrPos + 8, bsEnd); b++) {
-                            hex.append(String.format("%02X ", data[b] & 0xFF));
+        // §B.12: packet visit order. With the default single precinct per
+        // resolution (no explicit precincts, PPx=15 covers the tile) the
+        // position loop is trivial, so all five progression orders reduce to
+        // permutations of the (layer, resolution, component) loops.
+        for (int[] pk : packetSequence(cod.progressionOrder, cod.numLayers, totalRes, numComp)) {
+            int layer = pk[0];
+            int r = pk[1];
+            int c = pk[2];
+            // Scod bit 1: each packet is preceded by a 6-byte SOP marker
+            // segment (FF91 Lsop=0004 Nsop) — skip it or the header bit
+            // reader desyncs into noise (corpus 53308 invoice scans).
+            if (cod.useSop && br.pos + 1 < bsEnd
+                    && (data[br.pos] & 0xFF) == 0xFF && (data[br.pos + 1] & 0xFF) == 0x91) {
+                br.pos += 6;
+                br.bitsLeft = 0;
+                br.lastWasFF = false;
+            }
+            int hdrPos = br.pos;
+            int hdrBitsLeft = br.bitsLeft;
+            if (diag) {
+                StringBuilder hex = new StringBuilder();
+                for (int b = hdrPos; b < Math.min(hdrPos + 8, bsEnd); b++) {
+                    hex.append(String.format("%02X ", data[b] & 0xFF));
+                }
+                System.out.println(String.format("[jpx.diag]   hdr@%d bitsLeft=%d lastFF=%s bytes: %s",
+                        hdrPos, hdrBitsLeft, br.lastWasFF, hex));
+            }
+            List<SubBandInfo> bands = bandsAtResolution(perComp[c], r, cod.numDecomp);
+            decodePacketHeader(br, bands, layer);
+            int bodyPos = br.alignToByte();
+            // Scod bit 2: a 2-byte EPH marker (FF92) terminates the packet
+            // header, before the code-block bodies.
+            if (cod.useEph && bodyPos + 1 < bsEnd
+                    && (data[bodyPos] & 0xFF) == 0xFF && (data[bodyPos + 1] & 0xFF) == 0x92) {
+                bodyPos += 2;
+            }
+            int sumBytes = 0, sumPasses = 0, includedCb = 0, totalCb = 0;
+            if (diag) {
+                for (SubBandInfo band : bands) {
+                    for (int cby = 0; cby < band.cbRows; cby++) {
+                        for (int cbx = 0; cbx < band.cbCols; cbx++) {
+                            TileCodeBlock cb = band.cbs[cby][cbx];
+                            totalCb++;
+                            if (cb.pendingBytes > 0) { includedCb++; sumBytes += cb.pendingBytes; sumPasses += cb.pendingPasses; }
                         }
-                        System.out.println(String.format("[jpx.diag]   hdr@%d bitsLeft=%d lastFF=%s bytes: %s",
-                                hdrPos, hdrBitsLeft, br.lastWasFF, hex));
-                    }
-                    List<SubBandInfo> bands = bandsAtResolution(perComp[c], r, cod.numDecomp);
-                    decodePacketHeader(br, bands, layer);
-                    int bodyPos = br.alignToByte();
-                    int sumBytes = 0, sumPasses = 0, includedCb = 0, totalCb = 0;
-                    if (diag) {
-                        for (SubBandInfo band : bands) {
-                            for (int cby = 0; cby < band.cbRows; cby++) {
-                                for (int cbx = 0; cbx < band.cbCols; cbx++) {
-                                    TileCodeBlock cb = band.cbs[cby][cbx];
-                                    totalCb++;
-                                    if (cb.pendingBytes > 0) { includedCb++; sumBytes += cb.pendingBytes; sumPasses += cb.pendingPasses; }
-                                }
-                            }
-                        }
-                        System.out.println(String.format(
-                                "[jpx.diag] pkt#%d L=%d r=%d c=%d hdrPos=%d→bodyPos=%d hdrLen=%d cbInc=%d/%d bytes=%d passes=%d",
-                                pktIdx++, layer, r, c, hdrPos, bodyPos, bodyPos - hdrPos, includedCb, totalCb, sumBytes, sumPasses));
-                    }
-                    bodyPos = readPacketBody(data, bodyPos, bsEnd, bands);
-                    // Resync the bit reader to the new byte position.
-                    br.pos = bodyPos;
-                    br.bitsLeft = 0;
-                    br.lastWasFF = false;
-                    finalBodyPos = bodyPos;
-                    if (bodyPos >= bsEnd) {
-                        if (diag) System.out.println("[jpx.diag] LRCP done (bsEnd reached) at " + bodyPos);
-                        return;
                     }
                 }
+                System.out.println(String.format(
+                        "[jpx.diag] pkt#%d L=%d r=%d c=%d hdrPos=%d→bodyPos=%d hdrLen=%d cbInc=%d/%d bytes=%d passes=%d",
+                        pktIdx++, layer, r, c, hdrPos, bodyPos, bodyPos - hdrPos, includedCb, totalCb, sumBytes, sumPasses));
+            }
+            bodyPos = readPacketBody(data, bodyPos, bsEnd, bands);
+            // Resync the bit reader to the new byte position.
+            br.pos = bodyPos;
+            br.bitsLeft = 0;
+            br.lastWasFF = false;
+            finalBodyPos = bodyPos;
+            if (bodyPos >= bsEnd) {
+                if (diag) System.out.println("[jpx.diag] LRCP done (bsEnd reached) at " + bodyPos);
+                return;
             }
         }
         if (diag) {
@@ -1431,6 +1367,50 @@ public final class JPXDecodeFilter implements PdfFilter {
                 System.out.println("[jpx.diag] first unread bytes: " + hex);
             }
         }
+    }
+
+    /**
+     * Builds the packet visit sequence of {layer, resolution, component}
+     * triples for the given progression order (§B.12, Table A.16). Assumes a
+     * single precinct per resolution, which collapses the position loop:
+     * LRCP = L→R→C, RLCP = R→L→C, RPCL = R→C→L, PCRL/CPRL = C→R→L.
+     *
+     * @param order   COD progression order (0..4)
+     * @param layers  number of quality layers
+     * @param totalRes number of resolution levels (numDecomp + 1)
+     * @param numComp number of components
+     * @return packet coordinates in transmission order
+     */
+    static int[][] packetSequence(int order, int layers, int totalRes, int numComp) {
+        int[][] seq = new int[layers * totalRes * numComp][];
+        int i = 0;
+        switch (order) {
+            case 1: // RLCP: resolution, layer, component
+                for (int r = 0; r < totalRes; r++)
+                    for (int l = 0; l < layers; l++)
+                        for (int c = 0; c < numComp; c++)
+                            seq[i++] = new int[]{l, r, c};
+                break;
+            case 2: // RPCL: resolution, position, component, layer
+                for (int r = 0; r < totalRes; r++)
+                    for (int c = 0; c < numComp; c++)
+                        for (int l = 0; l < layers; l++)
+                            seq[i++] = new int[]{l, r, c};
+                break;
+            case 3: // PCRL: position, component, resolution, layer
+            case 4: // CPRL: component, position, resolution, layer
+                for (int c = 0; c < numComp; c++)
+                    for (int r = 0; r < totalRes; r++)
+                        for (int l = 0; l < layers; l++)
+                            seq[i++] = new int[]{l, r, c};
+                break;
+            default: // 0 = LRCP: layer, resolution, component
+                for (int l = 0; l < layers; l++)
+                    for (int r = 0; r < totalRes; r++)
+                        for (int c = 0; c < numComp; c++)
+                            seq[i++] = new int[]{l, r, c};
+        }
+        return seq;
     }
 
     /** Decodes one packet header into the per-codeblock {@code pendingBytes/pendingPasses}. */
@@ -1559,7 +1539,8 @@ public final class JPXDecodeFilter implements PdfFilter {
     }
 
     /** Runs Tier-1 on every code-block of every sub-band, returning per-sub-band coefficient grids. */
-    private int[][] assembleSubBands(SubBandInfo[] perComp, QCDData qcd, int numDecomp) {
+    private int[][] assembleSubBands(SubBandInfo[] perComp, QCDData qcd, int numDecomp,
+                                     boolean segSym) {
         int[][] out = new int[perComp.length][];
         for (SubBandInfo band : perComp) {
             int w = band.width, h = band.height;
@@ -1575,7 +1556,16 @@ public final class JPXDecodeFilter implements PdfFilter {
                     if (cb.totalPasses <= 0 || cb.data.size() == 0) continue;
                     int[] coeffs = decodeTier1(cb.data.toByteArray(),
                             cb.width, cb.height, cb.totalPasses,
-                            Mb, cb.zeroBitplanes, band.bandType);
+                            Mb, cb.zeroBitplanes, band.bandType, segSym);
+                    // Tier-1 emits sign-magnitude (sign in bit 31); the IDWT
+                    // and dequantizer work on ordinary two's-complement ints.
+                    // (This conversion was missing entirely on the reversible
+                    // 5/3 path — every negative coefficient reached the IDWT
+                    // as a huge positive value.)
+                    for (int k = 0; k < coeffs.length; k++) {
+                        int v = coeffs[k];
+                        if ((v & 0x80000000) != 0) coeffs[k] = -(v & 0x7FFFFFFF);
+                    }
                     int dx = cbx * band.cbW;
                     int dy = cby * band.cbH;
                     for (int yy = 0; yy < cb.height; yy++) {
@@ -1752,8 +1742,9 @@ public final class JPXDecodeFilter implements PdfFilter {
      */
     private double dequantize(int coeff, QCDData qcd, int internalIdx,
                               int numDecomp, int bandType, int decompLevel, int bitDepth) {
-        int sign = (coeff & 0x80000000) != 0 ? -1 : 1;
-        int mag = coeff & 0x7FFFFFFF;
+        // Coefficients are two's-complement after assembleSubBands.
+        int sign = coeff < 0 ? -1 : 1;
+        int mag = Math.abs(coeff);
         if (mag == 0) return 0;
         if (qcd.style == 0) return sign * mag;
 
@@ -1917,38 +1908,6 @@ public final class JPXDecodeFilter implements PdfFilter {
             result[i] = (byte) Math.max(0, Math.min(maxVal, val));
         }
         return result;
-    }
-
-    // ─── Color transforms (Annex G.2) ────────────────────────────
-
-    /** Inverse Reversible Color Transform (RCT) — used with 5/3 wavelet. */
-    private void inverseRCT(byte[][] comp, int w, int h) {
-        for (int i = 0; i < w * h; i++) {
-            int y = comp[0][i] & 0xFF;
-            int cb = (comp[1][i] & 0xFF) - 128;
-            int cr = (comp[2][i] & 0xFF) - 128;
-            int g = y - ((cb + cr) >> 2);
-            int r = cr + g;
-            int b = cb + g;
-            comp[0][i] = (byte) Math.max(0, Math.min(255, r));
-            comp[1][i] = (byte) Math.max(0, Math.min(255, g));
-            comp[2][i] = (byte) Math.max(0, Math.min(255, b));
-        }
-    }
-
-    /** Inverse Irreversible Color Transform (ICT) — used with 9/7 wavelet. */
-    private void inverseICT(byte[][] comp, int w, int h) {
-        for (int i = 0; i < w * h; i++) {
-            double y  = (comp[0][i] & 0xFF);
-            double cb = (comp[1][i] & 0xFF) - 128.0;
-            double cr = (comp[2][i] & 0xFF) - 128.0;
-            int r = (int) Math.round(y + 1.402 * cr);
-            int g = (int) Math.round(y - 0.34413 * cb - 0.71414 * cr);
-            int b = (int) Math.round(y + 1.772 * cb);
-            comp[0][i] = (byte) Math.max(0, Math.min(255, r));
-            comp[1][i] = (byte) Math.max(0, Math.min(255, g));
-            comp[2][i] = (byte) Math.max(0, Math.min(255, b));
-        }
     }
 
     /** Interleaves component planes into packed pixels: R0,G0,B0,R1,G1,B1,… */

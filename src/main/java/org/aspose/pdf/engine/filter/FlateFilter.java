@@ -164,24 +164,25 @@ public final class FlateFilter implements PdfFilter {
                     DecodeLimits.check((long) out.size() + n, limit, "FlateDecode");
                     out.write(buf, 0, n);
                 } catch (DataFormatException e) {
-                    // If we already decompressed some data, return what we have
-                    // (some PDFs have truncated or corrupt streams but partial data is usable)
+                    // Every byte produced INSIDE the failing inflate() call is
+                    // discarded by the JDK when it throws. With BUFFER_SIZE =
+                    // 8192 that loses up to ~8 KB of good output wherever the
+                    // corruption sits — including the common "bad Adler-32
+                    // checksum after a fully valid deflate body" case, which
+                    // silently truncated the tail (corpus 46075.pdf lost its
+                    // last 7.8 KB of content ops). Retry from scratch with a
+                    // tiny buffer so we surrender at most SMALL_BUFFER_SIZE
+                    // bytes, and return whichever attempt recovered more.
+                    byte[] prefix = inflateSmallBuf(data, nowrap);
+                    if (prefix != null && prefix.length >= out.size() && prefix.length > 0) {
+                        LOG.warning("FlateDecode: recovered " + prefix.length
+                                + " bytes before corruption: " + e.getMessage());
+                        return prefix;
+                    }
                     if (out.size() > 0) {
                         LOG.warning("FlateDecode: partial decompression (" + out.size()
                                 + " bytes recovered) due to: " + e.getMessage());
                         return out.toByteArray();
-                    }
-                    // out.size() == 0 only because every byte produced INSIDE the
-                    // failing inflate() call is discarded by the JDK when it throws.
-                    // With BUFFER_SIZE = 8192 that loses up to ~8 KB of perfectly
-                    // good output whenever the corruption sits in the first block.
-                    // Retry from scratch with a tiny buffer so we surrender at most
-                    // SMALL_BUFFER_SIZE bytes before the corruption point.
-                    byte[] prefix = inflateSmallBuf(data, nowrap);
-                    if (prefix != null && prefix.length > 0) {
-                        LOG.warning("FlateDecode: recovered " + prefix.length
-                                + " bytes before corruption: " + e.getMessage());
-                        return prefix;
                     }
                     throw new IOException("FlateDecode: invalid deflate data: " + e.getMessage(), e);
                 }

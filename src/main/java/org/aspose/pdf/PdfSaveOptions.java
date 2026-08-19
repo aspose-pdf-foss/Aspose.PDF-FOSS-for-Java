@@ -6,9 +6,19 @@ import org.aspose.pdf.tagged.AutoTaggingSettings;
  * Options for saving a PDF document.
  * Controls whether linearization (web optimization) is applied.
  */
-public class PdfSaveOptions {
+public class PdfSaveOptions extends SaveOptions {
 
     private boolean linearize;
+
+    /**
+     * {@inheritDoc}
+     *
+     * @return always {@link SaveFormat#Pdf}
+     */
+    @Override
+    public SaveFormat getSaveFormat() {
+        return SaveFormat.Pdf;
+    }
     private boolean useObjectStreams;
     private boolean useXRefStream;
     private int objectsPerStream = 200;

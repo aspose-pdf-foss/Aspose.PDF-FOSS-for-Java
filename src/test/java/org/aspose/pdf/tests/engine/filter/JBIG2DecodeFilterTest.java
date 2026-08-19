@@ -394,8 +394,9 @@ public class JBIG2DecodeFilterTest {
         byte[] result = filter.decode(baos.toByteArray(), null);
         assertNotNull(result);
         assertEquals(1, result.length);
-        // All bits should be 1 (black)
-        assertEquals((byte) 0xFF, result[0]);
+        // JBIG2 black (1) maps to DeviceGray black (0) — the filter delivers
+        // inverted bits, so an all-black page packs to all-zero samples.
+        assertEquals((byte) 0x00, result[0]);
     }
 
     // ═══════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@ This guide walks you from zero to a working Aspose.PDF FOSS setup, with a few mi
 
 ## Prerequisites
 
-- **JDK 17 or newer.** OpenJDK from [Adoptium](https://adoptium.net/) is recommended. Verify with `java -version` and `javac -version`.
+- **JDK 11 or newer.** OpenJDK from [Adoptium](https://adoptium.net/) is recommended. Verify with `java -version` and `javac -version`.
 - **Maven 3.8+** or **Gradle 7+**. Verify with `mvn -version` or `gradle --version`.
 - A text editor or IDE (IntelliJ IDEA, Eclipse, VS Code with Java extensions all work).
 
@@ -18,7 +18,7 @@ cd Aspose.PDF-FOSS-for-Java
 mvn clean install
 ```
 
-This compiles, tests, and installs `aspose-pdf-0.1.0-alpha.jar` into your local Maven repository (`~/.m2/repository/org/aspose/aspose-pdf/0.1.0-alpha/`). From that point any local Maven project can depend on it.
+This compiles, tests, and installs `aspose-pdf-26.8.jar` into your local Maven repository (`~/.m2/repository/org/aspose/aspose-pdf/26.8/`). From that point any local Maven project can depend on it.
 
 If you only need the jar without running tests:
 
@@ -36,20 +36,20 @@ Once `aspose-pdf` is in your local Maven repo (or, eventually, on Maven Central)
 <dependency>
     <groupId>org.aspose</groupId>
     <artifactId>aspose-pdf</artifactId>
-    <version>0.1.0-alpha</version>
+    <version>26.8</version>
 </dependency>
 ```
 
 **Gradle (Groovy DSL):**
 
 ```groovy
-implementation 'org.aspose:aspose-pdf:0.1.0-alpha'
+implementation 'org.aspose:aspose-pdf:26.8'
 ```
 
 **Gradle (Kotlin DSL):**
 
 ```kotlin
-implementation("org.aspose:aspose-pdf:0.1.0-alpha")
+implementation("org.aspose:aspose-pdf:26.8")
 ```
 
 No further dependencies are needed. The library uses only the standard Java platform (`java.*`, `javax.crypto`, `javax.imageio`, `javax.xml.*`).
@@ -151,7 +151,19 @@ Use `mvn install -DskipTests` to install regardless, then please report which te
 
 ## Next steps
 
-- [Working with text](text-extraction.md)
-- [Working with forms](forms.md)
-- [Page rasterization](rasterization.md)
-- [Security](security.md)
+Browse the full [documentation index](README.md), or jump to a topic:
+
+- [Working with text](text-extraction.md) — extraction, search, replacement
+- [Generating documents](document-generation.md) — pages, paragraphs, tables, stamps
+- [Document conversion](conversion.md) — HTML ↔ PDF, DOCX ↔ PDF, DOC → PDF
+- [Page operations](page-operations.md) — split, merge, rotate, resize
+- [Drawing API](drawing.md) — shapes and gradients
+- [Forms](forms.md) and [XFA forms](xfa.md)
+- [Annotations](annotations.md)
+- [Navigation](navigation.md) — bookmarks, destinations, links
+- [Attachments](attachments.md)
+- [Page rasterization](rasterization.md) — render to PNG/JPEG/TIFF
+- [Optimization](optimization.md) — shrink file size
+- [Security](security.md) and [Digital signatures](signatures.md)
+- [PDF/A](pdfa.md) · [Metadata](metadata.md) · [Facades](facades.md)
+- [Known limitations](limitations.md)

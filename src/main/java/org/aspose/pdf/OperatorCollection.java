@@ -20,6 +20,39 @@ public final class OperatorCollection implements Iterable<Operator> {
     private final List<Operator> operators;
 
     /**
+     * Optional callback fired when this collection is mutated through a
+     * <em>public, 1-based</em> editing method ({@link #add}, {@link #insert},
+     * {@link #delete}, {@link #set}). {@link Page#getContents()} wires this to
+     * {@code Page.markContentsDirty()} so user edits are flushed to
+     * {@code /Contents} on {@code Document.save()}.
+     * <p>
+     * Deliberately <b>not</b> fired by the engine-side 0-based helpers
+     * ({@link #setAt}/{@link #removeAt}/{@link #addAt}) or {@link #clear()}:
+     * those are used internally during serialization/normalization and by
+     * callers ({@code TextFragment}, {@code PdfPageEditor}) that already manage
+     * the dirty flag themselves — firing here would spuriously re-dirty a page
+     * mid-save and corrupt signature ByteRange computation.
+     * </p>
+     */
+    private Runnable mutationListener;
+
+    /**
+     * Registers a callback invoked after every public 1-based edit of this
+     * collection. Package-private: only the owning {@link Page} sets it.
+     *
+     * @param listener the callback, or {@code null} to detach
+     */
+    void setMutationListener(Runnable listener) {
+        this.mutationListener = listener;
+    }
+
+    private void fireMutation() {
+        if (mutationListener != null) {
+            mutationListener.run();
+        }
+    }
+
+    /**
      * Creates a collection from an existing list of operators.
      *
      * @param operators the initial operators
@@ -111,6 +144,7 @@ public final class OperatorCollection implements Iterable<Operator> {
             throw new IllegalArgumentException("Operator must not be null");
         }
         operators.add(op);
+        fireMutation();
     }
 
     /**
@@ -145,6 +179,7 @@ public final class OperatorCollection implements Iterable<Operator> {
                     "Operator index " + index + " out of range [1, " + operators.size() + "]");
         }
         operators.set(index - 1, op);
+        fireMutation();
     }
 
     /**
@@ -165,6 +200,7 @@ public final class OperatorCollection implements Iterable<Operator> {
                     "Operator insertion index " + index + " out of range [1, " + (operators.size() + 1) + "]");
         }
         operators.add(index - 1, op);
+        fireMutation();
     }
 
     /**
@@ -179,6 +215,7 @@ public final class OperatorCollection implements Iterable<Operator> {
                     "Operator index " + index + " out of range [1, " + operators.size() + "]");
         }
         operators.remove(index - 1);
+        fireMutation();
     }
 
     /**
@@ -203,6 +240,7 @@ public final class OperatorCollection implements Iterable<Operator> {
                 java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
         deleteSet.addAll(toDelete);
         operators.removeIf(deleteSet::contains);
+        fireMutation();
     }
 
     /**

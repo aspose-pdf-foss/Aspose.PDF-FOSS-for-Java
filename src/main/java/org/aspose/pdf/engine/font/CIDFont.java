@@ -30,6 +30,8 @@ public class CIDFont extends PdfFont {
 
     /** Embedded TrueType program (/FontFile2), used to recover Unicode for extraction. */
     private TrueTypeReader ttReader;
+    /** {@code Registry-Ordering} of /CIDSystemInfo (e.g. "Adobe-Korea1"), or null. */
+    private String registryOrdering;
     /**
      * /CIDToGIDMap when it is an explicit stream (two big-endian bytes per CID).
      * {@code null} means the default {@code Identity} mapping (CID == GID).
@@ -60,6 +62,21 @@ public class CIDFont extends PdfFont {
         initCidToGidMap();
         initEmbeddedFontProgram();
 
+        // /CIDSystemInfo — a STANDARD collection (Adobe-Korea1, ...) fixes the
+        // character meaning of every CID; the bundled ordering tables recover
+        // Unicode when the font has neither /ToUnicode nor usable glyph names
+        // (typical for CIDFontType0/CFF subsets).
+        PdfBase csi = resolve(fontDict.get("CIDSystemInfo"));
+        if (csi instanceof PdfDictionary) {
+            PdfBase reg = resolve(((PdfDictionary) csi).get("Registry"));
+            PdfBase ord = resolve(((PdfDictionary) csi).get("Ordering"));
+            if (reg instanceof org.aspose.pdf.engine.pdfobjects.PdfString
+                    && ord instanceof org.aspose.pdf.engine.pdfobjects.PdfString) {
+                registryOrdering = ((org.aspose.pdf.engine.pdfobjects.PdfString) reg).getString()
+                        + "-" + ((org.aspose.pdf.engine.pdfobjects.PdfString) ord).getString();
+            }
+        }
+
         LOG.fine(() -> "CIDFont created: " + baseFont + ", " + cidWidths.size() + " width entries");
     }
 
@@ -75,23 +92,29 @@ public class CIDFont extends PdfFont {
      * @return the Unicode code point, or 0 if it cannot be recovered
      */
     public int cidToUnicode(int cid) {
-        if (ttReader == null) {
-            return 0;
+        if (ttReader != null) {
+            int gid = cidToGid(cid);
+            // 1. Glyph name (post table) → Adobe Glyph List. Unambiguous when present.
+            int u = unicodeFromGlyphName(ttReader.getGlyphName(gid));
+            if (isReadable(u)) {
+                return u;
+            }
+            // 2. True-Unicode cmap subtables only (avoids Mac platform code-point
+            //    collisions such as Mac Roman 0xA4 vs Unicode U+00A7 section sign).
+            u = ttReader.getUnicodeForGlyphIdPreferUnicode(gid);
+            if (isReadable(u)) {
+                return u;
+            }
+            // 3. Last resort: any reverse cmap entry (may be a non-Unicode platform).
+            u = ttReader.getUnicodeForGlyphId(gid);
+            if (isReadable(u)) {
+                return u;
+            }
         }
-        int gid = cidToGid(cid);
-        // 1. Glyph name (post table) → Adobe Glyph List. Unambiguous when present.
-        int u = unicodeFromGlyphName(ttReader.getGlyphName(gid));
-        if (isReadable(u)) {
-            return u;
-        }
-        // 2. True-Unicode cmap subtables only (avoids Mac platform code-point
-        //    collisions such as Mac Roman 0xA4 vs Unicode U+00A7 section sign).
-        u = ttReader.getUnicodeForGlyphIdPreferUnicode(gid);
-        if (isReadable(u)) {
-            return u;
-        }
-        // 3. Last resort: any reverse cmap entry (may be a non-Unicode platform).
-        u = ttReader.getUnicodeForGlyphId(gid);
+        // 4. Standard character collection: the /CIDSystemInfo registry-ordering
+        //    defines the CID's meaning independently of the font program — the
+        //    only recovery for a CIDFontType0/CFF subset without /ToUnicode.
+        int u = org.aspose.pdf.engine.font.cmap.CidOrderingUnicode.lookup(registryOrdering, cid);
         if (isReadable(u)) {
             return u;
         }
@@ -138,6 +161,16 @@ public class CIDFont extends PdfFont {
      */
     public java.awt.geom.GeneralPath glyphOutline(int gid) {
         return ttReader != null ? ttReader.getGlyphPath(gid) : null;
+    }
+
+    /**
+     * Returns true when the embedded TrueType program is present and carries
+     * parsable outline tables, i.e. {@link #glyphOutline(int)} can serve glyphs.
+     *
+     * @return true when embedded glyph outlines are available
+     */
+    public boolean hasGlyphOutlines() {
+        return ttReader != null && ttReader.hasGlyphOutlines();
     }
 
     /**

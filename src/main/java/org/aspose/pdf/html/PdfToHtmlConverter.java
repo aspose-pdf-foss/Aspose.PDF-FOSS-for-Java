@@ -64,8 +64,19 @@ public class PdfToHtmlConverter {
         html.append("body { margin: 0; padding: 0; background: #e0e0e0; }\n");
         html.append(".page { position: relative; margin: 20px auto; background: white; ");
         html.append("overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }\n");
-        html.append(".t { position: absolute; white-space: pre; }\n");
-        html.append(".i { position: absolute; }\n");
+        // Text paints above images (watermarks, logos and photos sit behind the
+        // glyphs, exactly as the PDF paints them) — z-index, not DOM order, so a
+        // full-page watermark emitted last never covers the body copy.
+        html.append(".t { position: absolute; white-space: pre; z-index: 2; }\n");
+        html.append(".i { position: absolute; z-index: 1; }\n");
+        // Vector underlay: the page's path/fill/stroke/shading content rendered
+        // to a raster, behind both images and text.
+        html.append(".v { position: absolute; left: 0; top: 0; z-index: 0; }\n");
+        // Interactive form fields sit above everything; transparent chrome so
+        // the vector underlay (the printed field boxes) stays the visual frame.
+        html.append(".f { position: absolute; z-index: 3; box-sizing: border-box; ");
+        html.append("background: transparent; border: none; padding: 0; margin: 0; ");
+        html.append("font: inherit; }\n");
         html.append("</style>\n</head>\n<body>\n");
     }
 
@@ -80,13 +91,37 @@ public class PdfToHtmlConverter {
             "<div class=\"page\" id=\"p%d\" style=\"width:%.0fpx;height:%.0fpx;\">\n",
             pageNum, w, h));
 
-        // Ruled tables render as real <table> markup (PDFNET-39027); their
-        // text is excluded from the span/paragraph flow to avoid duplicates.
-        List<Rectangle> tableRects = appendTables(html, page, options, box);
-
         if (options.isFixedLayout()) {
-            appendFixedLayoutContent(html, page, options, box, tableRects);
+            // Vector graphics first (DOM order matters little — .v carries
+            // z-index 0): everything drawn with path/fill/stroke/shading ops
+            // would otherwise be lost entirely, blanking charts and shapes.
+            // Page-capped: each underlay is a full page render + embedded PNG,
+            // which on a thousands-page document means hours and an OOM-sized
+            // output string. -Dhtml.vectorUnderlayMaxPages overrides.
+            int underlayCap = Integer.getInteger("html.vectorUnderlayMaxPages", 200);
+            if (options.isRasterizeVectorGraphics() && options.isEmbedImages()) {
+                if (pageNum <= underlayCap) {
+                    appendVectorUnderlay(html, page, options, w, h);
+                } else if (pageNum == underlayCap + 1) {
+                    LOG.warning("Vector underlay capped at " + underlayCap
+                            + " pages — later pages omit vector graphics"
+                            + " (-Dhtml.vectorUnderlayMaxPages to raise)");
+                }
+            }
+            // Fixed layout is a pixel-faithful visual copy: every glyph run keeps
+            // its absolute PDF coordinate. Emitting detected tables as normal-flow
+            // <table> blocks would (a) pull their text out of the positioned flow
+            // and (b) stack the tables into a shrink-to-content column at the
+            // top-left, collapsing the whole page into a narrow left strip. So in
+            // this mode no <table> is emitted — the cell text positions itself.
+            appendFixedLayoutContent(html, page, options, box,
+                    java.util.Collections.<Rectangle>emptyList());
+            appendFormFields(html, page, options, box);
         } else {
+            // Reflowable layout: ruled tables render as real <table> markup
+            // (PDFNET-39027); their text is excluded from the paragraph flow to
+            // avoid duplicates.
+            List<Rectangle> tableRects = appendTables(html, page, options, box);
             appendReflowableContent(html, page, options, box, tableRects);
         }
 
@@ -341,6 +376,61 @@ public class PdfToHtmlConverter {
         return paragraphs;
     }
 
+    // ── Vector underlay ──
+
+    /**
+     * Renders the page's vector content (paths, fills, strokes, shadings —
+     * text and raster images suppressed) and, when it is not blank, emits it
+     * as an absolutely positioned full-page {@code <img class="v">} behind the
+     * text and image layers. This is what keeps charts, filled shapes, rules
+     * and gradients visible in fixed-layout HTML.
+     */
+    private void appendVectorUnderlay(StringBuilder html, Page page,
+                                      HtmlSaveOptions options, double wPx, double hPx) {
+        try {
+            org.aspose.pdf.engine.render.PdfPageRenderer renderer =
+                    new org.aspose.pdf.engine.render.PdfPageRenderer();
+            renderer.setSuppressText(true);
+            renderer.setSuppressRasterImages(true);
+            // 2x the CSS pixel density so the underlay stays crisp when the
+            // browser composites it under the text.
+            double dpi = 144.0 * options.getScale();
+            BufferedImage img = renderer.renderPage(page, dpi, dpi);
+            if (img == null || isBlank(img)) {
+                return;
+            }
+            html.append(String.format(Locale.US,
+                "  <img class=\"v\" style=\"width:%.0fpx;height:%.0fpx;\" " +
+                "src=\"data:image/png;base64,%s\"/>\n",
+                wPx, hPx, imageToBase64(img)));
+        } catch (Exception e) {
+            LOG.fine("Vector underlay render failed: " + e.getMessage());
+        }
+    }
+
+    /** True when every sampled pixel is white or fully transparent. */
+    private static boolean isBlank(BufferedImage img) {
+        int w = img.getWidth();
+        int h = img.getHeight();
+        int step = Math.max(1, Math.min(w, h) / 512); // sample, don't scan 4k²
+        for (int y = 0; y < h; y += step) {
+            for (int x = 0; x < w; x += step) {
+                int argb = img.getRGB(x, y);
+                int a = argb >>> 24;
+                if (a < 8) {
+                    continue;
+                }
+                int r = (argb >> 16) & 0xFF;
+                int g = (argb >> 8) & 0xFF;
+                int b = argb & 0xFF;
+                if (r < 248 || g < 248 || b < 248) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
     // ── Images ──
 
     private void appendImages(StringBuilder html, Page page,
@@ -370,11 +460,14 @@ public class PdfToHtmlConverter {
             try {
                 BufferedImage bimg = placement.getImage().toBufferedImage();
                 if (bimg == null) continue;
-                String base64 = imageToBase64(bimg);
+                // Cap the embedded raster at 2x its on-page CSS pixel size: the
+                // browser can never show more detail, and full-resolution scans
+                // (a 300-dpi A4 photo per page across hundreds of pages) blow
+                // the base64 output — and the heap — by an order of magnitude.
                 html.append(String.format(Locale.US,
                     "  <img class=\"i\" style=\"left:%.0fpx;top:%.0fpx;width:%.0fpx;height:%.0fpx;\" " +
-                    "src=\"data:image/png;base64,%s\"/>\n",
-                    x, y, w, h, base64));
+                    "src=\"%s\"/>\n",
+                    x, y, w, h, HtmlImageEncoder.dataUri(bimg, w, h)));
             } catch (Exception e) {
                 LOG.fine("Failed to convert image: " + e.getMessage());
             }
@@ -402,6 +495,105 @@ public class PdfToHtmlConverter {
     }
 
     /** Escapes special HTML characters in text. */
+    /**
+     * Emits every Widget annotation of the page as an absolutely positioned,
+     * transparent HTML control ({@code <input>}/{@code <select>}/
+     * {@code <textarea>}/{@code <button>}) so the exported page is fillable.
+     * The printed field frames come from the vector underlay; the controls add
+     * only the interaction. Field facts (type, name, value, options) are
+     * resolved through the shared IR helper
+     * {@link org.aspose.pdf.sdm.reader.WidgetFieldInfo}.
+     */
+    private void appendFormFields(StringBuilder html, Page page,
+                                  HtmlSaveOptions options, Rectangle box) {
+        org.aspose.pdf.annotations.AnnotationCollection annots = page.getAnnotations();
+        if (annots == null) {
+            return;
+        }
+        double scale = options.getScale();
+        double pageH = box.getHeight();
+        for (int i = 1; i <= annots.getCount(); i++) {
+            org.aspose.pdf.annotations.Annotation ann = annots.get(i);
+            if (ann == null || !"Widget".equals(ann.getSubtype())) {
+                continue;
+            }
+            Rectangle r = ann.getRect();
+            if (r == null || r.getWidth() <= 0 || r.getHeight() <= 0) {
+                continue;
+            }
+            org.aspose.pdf.sdm.reader.WidgetFieldInfo info =
+                    org.aspose.pdf.sdm.reader.WidgetFieldInfo.resolve(ann.getPdfDictionary());
+            if (info == null) {
+                continue;
+            }
+            double x = (r.getLLX() - box.getLLX()) * scale;
+            double y = (pageH - (r.getURY() - box.getLLY())) * scale;
+            double w = r.getWidth() * scale;
+            double h = r.getHeight() * scale;
+            String pos = String.format(Locale.US,
+                    "left:%.1fpx;top:%.1fpx;width:%.1fpx;height:%.1fpx;", x, y, w, h);
+            String name = info.getName() == null ? "" :
+                    " name=\"" + escapeHtml(info.getName()) + "\"";
+            String ro = info.isReadOnly() ? " readonly" : "";
+            switch (info.getKind()) {
+                case CHECKBOX:
+                case RADIO: {
+                    html.append("<input class=\"f\" type=\"")
+                        .append(info.getKind() == org.aspose.pdf.sdm.FormField.Kind.RADIO
+                                ? "radio" : "checkbox")
+                        .append('"').append(name);
+                    if (info.getExportValue() != null) {
+                        html.append(" value=\"").append(escapeHtml(info.getExportValue())).append('"');
+                    }
+                    if (info.isChecked()) {
+                        html.append(" checked");
+                    }
+                    html.append(" style=\"").append(pos).append("\"/>\n");
+                    break;
+                }
+                case COMBOBOX:
+                case LISTBOX: {
+                    html.append("<select class=\"f\"").append(name)
+                        .append(" style=\"").append(pos).append("\">\n");
+                    for (String opt : info.getOptions()) {
+                        String o = opt == null ? "" : opt;
+                        html.append("<option");
+                        if (o.equals(info.getValue())) {
+                            html.append(" selected");
+                        }
+                        html.append('>').append(escapeHtml(o)).append("</option>\n");
+                    }
+                    html.append("</select>\n");
+                    break;
+                }
+                case BUTTON: {
+                    html.append("<button class=\"f\" type=\"button\"").append(name)
+                        .append(" style=\"").append(pos).append("\">")
+                        .append(escapeHtml(info.getValue() == null ? "" : info.getValue()))
+                        .append("</button>\n");
+                    break;
+                }
+                default: { // TEXT / SIGNATURE
+                    if (info.isMultiline()) {
+                        html.append("<textarea class=\"f\"").append(name).append(ro)
+                            .append(" style=\"").append(pos).append("\">")
+                            .append(escapeHtml(info.getValue() == null ? "" : info.getValue()))
+                            .append("</textarea>\n");
+                    } else {
+                        html.append("<input class=\"f\" type=\"text\"").append(name).append(ro);
+                        if (info.getValue() != null) {
+                            html.append(" value=\"").append(escapeHtml(info.getValue())).append('"');
+                        }
+                        if (info.getMaxLen() != null) {
+                            html.append(" maxlength=\"").append(info.getMaxLen()).append('"');
+                        }
+                        html.append(" style=\"").append(pos).append("\"/>\n");
+                    }
+                }
+            }
+        }
+    }
+
     public static String escapeHtml(String text) {
         if (text == null) return "";
         return text.replace("&", "&amp;")

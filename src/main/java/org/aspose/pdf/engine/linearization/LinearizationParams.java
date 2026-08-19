@@ -138,7 +138,17 @@ public final class LinearizationParams {
             PDFLexer lexer = new PDFLexer(reader);
             // parseDictionary expects the lexer to be positioned at '<<'
             // We need a minimal parser — just read the dict manually
-            return parseLinDictFromReader(reader, dictStart, read);
+            LinearizationParams params = parseLinDictFromReader(reader, dictStart, read);
+            // A linearization dict is only VALID when /L equals the actual file
+            // length (ISO 32000-1 Annex F.3.1). An incremental update appended
+            // after the linearized generation leaves the dict in place but breaks
+            // the invariant — the file is no longer linearized (PDFNEWNET_35605).
+            if (params != null && params.fileLength != reader.getLength()) {
+                LOG.fine(() -> "Stale linearization dict: /L " + params.fileLength
+                        + " != file length " + reader.getLength());
+                return null;
+            }
+            return params;
         } catch (Exception e) {
             LOG.fine(() -> "Failed to parse linearization dict: " + e.getMessage());
             return null;

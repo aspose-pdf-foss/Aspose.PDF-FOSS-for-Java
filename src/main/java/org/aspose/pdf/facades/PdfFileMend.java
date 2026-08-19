@@ -242,8 +242,25 @@ public class PdfFileMend implements Closeable {
             }
             double drawX = llx + (rectW - drawW) / 2.0;
             double drawY = lly + (rectH - drawH) / 2.0;
-            // Emit q drawW 0 0 drawH drawX drawY cm /resName Do Q
-            String op = "\nq " + fmt(drawW) + " 0 0 " + fmt(drawH) + " " + fmt(drawX) + " " + fmt(drawY)
+            // The existing content may leak a naked (un-saved) cm past its end
+            // (§7.8.2 treats /Contents segments as one stream, so trailing
+            // state carries into appended ops — PDFNEWNET-31408: a 0.05/flip
+            // CTM shrank the added image into the wrong corner). Compensate by
+            // prepending the inverse of the trailing CTM so the image draws in
+            // pristine page space, as Aspose does.
+            String prefix = "";
+            org.aspose.pdf.Matrix trailing = computeTrailingCtm(page);
+            if (trailing != null && !isIdentity(trailing)) {
+                try {
+                    org.aspose.pdf.Matrix inv = trailing.reverse();
+                    prefix = fmt(inv.getA()) + " " + fmt(inv.getB()) + " " + fmt(inv.getC()) + " "
+                            + fmt(inv.getD()) + " " + fmt(inv.getE()) + " " + fmt(inv.getF()) + " cm ";
+                } catch (IllegalStateException singular) {
+                    LOG.fine("Trailing CTM is singular; skipping compensation");
+                }
+            }
+            // Emit q [inv cm] drawW 0 0 drawH drawX drawY cm /resName Do Q
+            String op = "\nq " + prefix + fmt(drawW) + " 0 0 " + fmt(drawH) + " " + fmt(drawX) + " " + fmt(drawY)
                     + " cm /" + resName + " Do Q\n";
             page.appendToContentStream(op.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
             return true;
@@ -280,6 +297,43 @@ public class PdfFileMend implements Closeable {
             i += 2 + segLen;
         }
         return null;
+    }
+
+    /**
+     * Simulates cm/q/Q over the page's content to obtain the CTM that will be
+     * in effect after its last operator (mirrors the renderer, including the
+     * Q-underflow reset to the initial state). Returns null when unknown.
+     */
+    private static org.aspose.pdf.Matrix computeTrailingCtm(Page page) {
+        try {
+            org.aspose.pdf.OperatorCollection ops = page.getContents();
+            if (ops == null) {
+                return null;
+            }
+            java.util.Deque<org.aspose.pdf.Matrix> stack = new java.util.ArrayDeque<>();
+            org.aspose.pdf.Matrix ctm = org.aspose.pdf.Matrix.IDENTITY;
+            for (int i = 0; i < ops.size(); i++) {
+                org.aspose.pdf.Operator op = ops.getAt(i);
+                String n = op.getName();
+                if ("q".equals(n)) {
+                    stack.push(ctm);
+                } else if ("Q".equals(n)) {
+                    ctm = stack.isEmpty() ? org.aspose.pdf.Matrix.IDENTITY : stack.pop();
+                } else if (op instanceof org.aspose.pdf.operators.ConcatenateMatrix) {
+                    ctm = ((org.aspose.pdf.operators.ConcatenateMatrix) op).getMatrix().multiply(ctm);
+                }
+            }
+            return ctm;
+        } catch (Exception e) {
+            LOG.fine(() -> "Could not compute trailing CTM: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static boolean isIdentity(org.aspose.pdf.Matrix m) {
+        return Math.abs(m.getA() - 1) < 1e-9 && Math.abs(m.getB()) < 1e-9
+                && Math.abs(m.getC()) < 1e-9 && Math.abs(m.getD() - 1) < 1e-9
+                && Math.abs(m.getE()) < 1e-9 && Math.abs(m.getF()) < 1e-9;
     }
 
     private static String fmt(double v) {

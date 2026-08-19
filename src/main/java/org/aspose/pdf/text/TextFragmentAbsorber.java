@@ -143,7 +143,7 @@ public class TextFragmentAbsorber extends TextAbsorber {
             // (which keys off Y) would split one visual line into many and a
             // multi-run phrase could never match. Tell buildSpans which axis
             // is the reading direction for this page.
-            spanPageRotation = page.getRotate();
+            spanPageRotation = ((page.getRotate() % 360) + 360) % 360;
             try {
                 if (isRegex) {
                     searchRegex(allFragments, page, areaFilter);
@@ -459,10 +459,14 @@ public class TextFragmentAbsorber extends TextAbsorber {
      * two non-adjacent runs (e.g. between punctuation-only watermarks drawn at
      * very different x positions). Such whitespace-only matches carry no
      * searchable content and are not surfaced by Aspose, so they are skipped
-     * (PDFNET_47103). A genuinely empty pattern match is also skipped.
+     * (PDFNET_47103). A genuinely EMPTY (zero-width) match is NOT skipped:
+     * .NET Regex.Matches surfaces zero-length matches (e.g. a lazy prefix with
+     * a lookahead, {@code (.{0,50}?)(?=Reviewed by)}) and Aspose returns them
+     * as empty fragments (PDFNET_42073) — only our synthetic separator space
+     * needs suppressing.
      */
     private static boolean isWhitespaceOnlyMatch(String matchedText) {
-        return matchedText == null || matchedText.trim().isEmpty();
+        return matchedText == null || (!matchedText.isEmpty() && matchedText.trim().isEmpty());
     }
 
     private boolean isSingleCharacterWordPattern() {
@@ -882,6 +886,7 @@ public class TextFragmentAbsorber extends TextAbsorber {
         match.setSourceTextLength(len);
         match.setSourceOperators(source.getSourceOperators());
         match.setSourceContentStream(source.getSourceContentStream());
+        match.setSourceResources(source.getSourceResources());
         match.setTextReplaceOptions(getTextReplaceOptions());
         copyUnderlineLinkage(source, match);
         if (!match.getSegments().isEmpty()) {
@@ -889,6 +894,11 @@ public class TextFragmentAbsorber extends TextAbsorber {
             int start = source.getSourceTextStart() + offsetInSource;
             seg.setStartCharIndex(start);
             seg.setEndCharIndex(start + Math.max(0, len) - 1);
+        }
+        // The match shares the source's TextState — route state mutations
+        // (setFontSize) into the match's source-op write-back (PDFNEWNET-30639).
+        if (source.getTextState() != null) {
+            source.getTextState().bindSourceFragment(match);
         }
         return match;
     }
@@ -936,6 +946,7 @@ public class TextFragmentAbsorber extends TextAbsorber {
         match.setSourceTextLength(len);
         match.setSourceOperators(firstSource.getSourceOperators());
         match.setSourceContentStream(firstSource.getSourceContentStream());
+        match.setSourceResources(firstSource.getSourceResources());
         match.setTextReplaceOptions(getTextReplaceOptions());
 
         for (FragmentSpan participatingSpan : participatingSpans) {
@@ -978,6 +989,11 @@ public class TextFragmentAbsorber extends TextAbsorber {
 
         if (match.getSegments().isEmpty()) {
             match.addSegment(new TextSegment(phrase));
+        }
+        // The match's primary state is the first source's — route setFontSize
+        // into the match's source-op write-back (PDFNEWNET-30639).
+        if (firstSource.getTextState() != null) {
+            firstSource.getTextState().bindSourceFragment(match);
         }
         if (firstPosition != null) {
             match.setPosition(firstPosition);
@@ -1120,8 +1136,13 @@ public class TextFragmentAbsorber extends TextAbsorber {
     private boolean isInArea(TextFragment frag, Rectangle area) {
         Rectangle rect = frag.getRectangle();
         if (rect != null) {
-            return rect.getLLX() >= area.getLLX() && rect.getLLY() >= area.getLLY()
-                    && rect.getURX() <= area.getURX() && rect.getURY() <= area.getURY();
+            // 1pt tolerance: our ascent estimate can exceed the producer's
+            // glyph box slightly (Aspose search rectangles are typically the
+            // fragment rectangle verbatim — PDFNET_51643 overshoots URY by
+            // 0.5pt), and a sub-point overshoot must not drop a real match.
+            final double tol = 1.0;
+            return rect.getLLX() >= area.getLLX() - tol && rect.getLLY() >= area.getLLY() - tol
+                    && rect.getURX() <= area.getURX() + tol && rect.getURY() <= area.getURY() + tol;
         }
         Position position = frag.getPosition();
         if (position == null) {

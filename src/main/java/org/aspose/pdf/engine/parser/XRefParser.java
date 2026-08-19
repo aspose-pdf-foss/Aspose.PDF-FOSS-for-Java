@@ -37,6 +37,8 @@ public final class XRefParser {
      * this delta added before falling back to a full object scan.
      */
     private long entryOffsetAdjustment;
+    /** Byte position of the %PDF- header; non-zero when the file carries leading junk. */
+    private long baseOffset;
     private final java.util.Set<Long> visitedOffsets = new java.util.HashSet<>();
     private PdfDictionary trailerDictionary;
 
@@ -94,6 +96,11 @@ public final class XRefParser {
      * @throws IOException if parsing fails
      */
     public void parse(long startxrefPosition) throws IOException {
+        // Leading-junk files: stored offsets (startxref, /Prev) are measured
+        // from the %PDF- header, not the physical file start — shift them.
+        if (baseOffset != 0 && startxrefPosition >= 0) {
+            startxrefPosition += baseOffset;
+        }
         LOGGER.log(Level.FINE, "Parsing xref at position {0}", startxrefPosition);
         if (!visitedOffsets.add(startxrefPosition)) {
             LOGGER.log(Level.WARNING, "Cycle detected in xref chain at offset {0}, stopping", startxrefPosition);
@@ -253,7 +260,7 @@ public final class XRefParser {
             // an additional xref stream with extra entries
             PdfBase xrefStmObj = trailerDictionary.get(PdfName.of("XRefStm"));
             if (xrefStmObj instanceof PdfInteger) {
-                long xrefStmOffset = ((PdfInteger) xrefStmObj).longValue();
+                long xrefStmOffset = ((PdfInteger) xrefStmObj).longValue() + baseOffset;
                 if (visitedOffsets.contains(xrefStmOffset)) {
                     LOGGER.log(Level.WARNING, "Cycle detected in /XRefStm at offset {0}, skipping", xrefStmOffset);
                 } else {
@@ -298,6 +305,24 @@ public final class XRefParser {
      */
     public long getEntryOffsetAdjustment() {
         return entryOffsetAdjustment;
+    }
+
+    /**
+     * Declares that the {@code %PDF-} header sits at {@code baseOffset} bytes
+     * into the file (leading junk, e.g. a stripped container wrapper). Per the
+     * ISO 32000-1 file-structure convention followed by Acrobat, every byte
+     * offset stored in such a file — the {@code startxref} value, xref entry
+     * offsets, {@code /Prev} and {@code /XRefStm} — is measured from the
+     * header, not from the physical start of the file, so they are all
+     * retried/shifted by this base.
+     *
+     * @param baseOffset the header position in bytes (0 = no adjustment)
+     */
+    public void setBaseOffset(long baseOffset) {
+        this.baseOffset = baseOffset;
+        if (baseOffset != 0 && entryOffsetAdjustment == 0) {
+            entryOffsetAdjustment = baseOffset;
+        }
     }
 
     /**

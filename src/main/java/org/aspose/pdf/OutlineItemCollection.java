@@ -230,8 +230,14 @@ public class OutlineItemCollection implements Iterable<OutlineItemCollection> {
      */
     public int getLevel() {
         int level = 1;
+        // Malformed outlines can contain /Parent cycles (an item whose parent
+        // chain never reaches the /Outlines root) — track visited dicts so a
+        // damaged file cannot hang the walk (PDFNET_58236).
+        java.util.Set<PdfBase> visited = java.util.Collections.newSetFromMap(
+                new java.util.IdentityHashMap<>());
+        visited.add(dict);
         PdfBase parent = resolve(dict.get("Parent"));
-        while (parent instanceof PdfDictionary) {
+        while (parent instanceof PdfDictionary && visited.add(parent)) {
             PdfDictionary parentDict = (PdfDictionary) parent;
             // If the parent has /Type /Outlines it is the root → stop
             PdfBase type = parentDict.get("Type");

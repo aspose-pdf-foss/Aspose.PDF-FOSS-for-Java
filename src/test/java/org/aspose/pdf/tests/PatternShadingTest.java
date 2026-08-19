@@ -244,7 +244,11 @@ public class PatternShadingTest {
 
     @Test
     public void meshShadingStubsReturnFallbackColor() throws IOException {
-        for (int type = 4; type <= 7; type++) {
+        // Types 5-7 are still stubs returning a fallback colour. Type 4 is a
+        // real mesh decoder now: with no vertex stream it has no triangles,
+        // so a point query returns null (nothing painted) — Acrobat drops
+        // malformed/empty meshes silently instead of painting a fallback.
+        for (int type = 5; type <= 7; type++) {
             PdfDictionary dict = new PdfDictionary();
             dict.set(PdfName.of("ShadingType"), PdfInteger.valueOf(type));
             dict.set(PdfName.of("ColorSpace"), PdfName.of("DeviceRGB"));
@@ -256,6 +260,49 @@ public class PatternShadingTest {
             assertNotNull(color);
             assertTrue(color.length >= 3, "Should return at least 3 components");
         }
+        PdfDictionary dict = new PdfDictionary();
+        dict.set(PdfName.of("ShadingType"), PdfInteger.valueOf(4));
+        dict.set(PdfName.of("ColorSpace"), PdfName.of("DeviceRGB"));
+        Shading s = Shading.parse(dict, null);
+        assertNotNull(s, "Shading type 4 should parse");
+        assertEquals(4, s.getShadingType());
+        assertNull(s.getColorAt(0, 0), "Empty mesh paints nothing");
+    }
+
+    @Test
+    public void gouraudMeshDecodesTrianglesAndInterpolates() throws IOException {
+        // One right triangle (0,0)-(4,0)-(0,4) with red/green/blue corners,
+        // 8-bit flags/coords/components, Decode mapping coords to 0..4.
+        PdfStream stream = new PdfStream();
+        stream.set(PdfName.of("ShadingType"), PdfInteger.valueOf(4));
+        stream.set(PdfName.of("ColorSpace"), PdfName.of("DeviceRGB"));
+        stream.set(PdfName.of("BitsPerFlag"), PdfInteger.valueOf(8));
+        stream.set(PdfName.of("BitsPerCoordinate"), PdfInteger.valueOf(8));
+        stream.set(PdfName.of("BitsPerComponent"), PdfInteger.valueOf(8));
+        PdfArray decode = new PdfArray();
+        for (double d : new double[]{0, 4, 0, 4, 0, 1, 0, 1, 0, 1}) {
+            decode.add(new PdfFloat((float) d));
+        }
+        stream.set(PdfName.of("Decode"), decode);
+        byte[] data = {
+                0, 0, 0, (byte) 255, 0, 0,            // v0 (0,0) red
+                0, (byte) 255, 0, 0, (byte) 255, 0,   // v1 (4,0) green
+                0, 0, (byte) 255, 0, 0, (byte) 255,   // v2 (0,4) blue
+        };
+        stream.setDecodedData(data);
+
+        Shading s = Shading.parse(stream, null);
+        assertNotNull(s);
+        double[] atRed = s.getColorAt(0.01, 0.01);
+        assertNotNull(atRed, "Point inside the triangle");
+        assertEquals(1.0, atRed[0], 0.02);
+        assertEquals(0.0, atRed[1], 0.02);
+        double[] centroid = s.getColorAt(4.0 / 3, 4.0 / 3);
+        assertNotNull(centroid);
+        assertEquals(1.0 / 3, centroid[0], 0.02);
+        assertEquals(1.0 / 3, centroid[1], 0.02);
+        assertEquals(1.0 / 3, centroid[2], 0.02);
+        assertNull(s.getColorAt(3.9, 3.9), "Point outside the triangle");
     }
 
     // ═══════════════════════════════════════════════════════════════

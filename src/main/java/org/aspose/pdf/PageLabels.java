@@ -175,6 +175,39 @@ public class PageLabels {
         return Collections.unmodifiableList(ranges);
     }
 
+    /**
+     * Returns the 0-based page indices at which label ranges start,
+     * in ascending order (ISO 32000-1:2008, §12.4.2 number-tree keys).
+     *
+     * @return array of range start page indices
+     */
+    public int[] getPages() {
+        int[] pages = new int[ranges.size()];
+        for (int i = 0; i < ranges.size(); i++) {
+            pages[i] = ranges.get(i).startPage;
+        }
+        return pages;
+    }
+
+    /**
+     * Removes the label range starting at the given 0-based page index.
+     * The change is written back to the {@code /PageLabels} number tree
+     * so a subsequent save persists it.
+     *
+     * @param pageIndex the 0-based page index of the range to remove
+     * @return {@code true} if a range starting at that index existed and was removed
+     */
+    public boolean removeLabel(int pageIndex) {
+        for (int i = 0; i < ranges.size(); i++) {
+            if (ranges.get(i).startPage == pageIndex) {
+                ranges.remove(i);
+                syncToCatalog();
+                return true;
+            }
+        }
+        return false;
+    }
+
     // ═══════════════════════════════════════════════════════════════
     //  Number formatting
     // ═══════════════════════════════════════════════════════════════

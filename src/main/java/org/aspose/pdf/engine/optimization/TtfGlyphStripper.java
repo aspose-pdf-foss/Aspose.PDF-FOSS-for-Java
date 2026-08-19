@@ -26,7 +26,7 @@ import java.util.logging.Logger;
  * original program.
  * </p>
  */
-final class TtfGlyphStripper {
+public final class TtfGlyphStripper {
 
     private static final Logger LOG = Logger.getLogger(TtfGlyphStripper.class.getName());
 
@@ -50,7 +50,7 @@ final class TtfGlyphStripper {
      * @return the stripped font, or {@code null} when the font cannot be
      *         safely rebuilt (caller keeps the original)
      */
-    static byte[] strip(byte[] ttf, Set<Integer> usedGids) {
+    public static byte[] strip(byte[] ttf, Set<Integer> usedGids) {
         try {
             TtfGlyphStripper stripper = new TtfGlyphStripper(ttf);
             return stripper.run(usedGids);

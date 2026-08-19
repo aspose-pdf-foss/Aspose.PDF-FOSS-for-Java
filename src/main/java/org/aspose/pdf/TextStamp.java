@@ -21,6 +21,30 @@ public class TextStamp extends Stamp {
 
     private static final Logger LOG = Logger.getLogger(TextStamp.class.getName());
 
+    /** The font a text stamp uses when its {@link TextState} specifies none. */
+    private static final String DEFAULT_FONT_NAME = "Helvetica";
+    /** The font size a text stamp uses when its {@link TextState} specifies none. */
+    private static final double DEFAULT_FONT_SIZE = 12.0;
+
+    /**
+     * Returns the default stamp font (Aspose {@code TextStamp.DefaultFont}) — the
+     * font applied when a {@link FormattedText}/{@link TextState} specifies none.
+     *
+     * @return the default font
+     */
+    public static org.aspose.pdf.text.Font getDefaultFont() {
+        return org.aspose.pdf.text.FontRepository.findFont(DEFAULT_FONT_NAME);
+    }
+
+    /**
+     * Returns the default stamp font size in points (Aspose {@code TextStamp.DefaultFontSize}).
+     *
+     * @return the default font size
+     */
+    public static double getDefaultFontSize() {
+        return DEFAULT_FONT_SIZE;
+    }
+
     private String value;
     private TextState textState;
     private TextFormattingOptions.WordWrapMode wordWrapMode = TextFormattingOptions.WordWrapMode.Undefined;

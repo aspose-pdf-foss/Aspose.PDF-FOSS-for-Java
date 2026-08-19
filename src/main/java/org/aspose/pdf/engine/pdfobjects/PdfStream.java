@@ -138,7 +138,24 @@ public class PdfStream extends PdfDictionary {
         }
 
         // Decode through filter chain
-        byte[] decoded = decodeWithFilters(raw, filters);
+        byte[] decoded;
+        try {
+            decoded = decodeWithFilters(raw, filters);
+        } catch (IOException decodeFailure) {
+            // Text-mode-transfer salvage: an FTP/text-mode copy inserts \r
+            // before every bare \n INSIDE the binary stream bytes. For an
+            // encrypted or Flate stream one inserted byte shifts everything
+            // after it, so decoding fails mid-way (corpus 34492: RC4 content
+            // streams decrypt clean ASCII85 for exactly the first 6 bytes —
+            // up to the first injected \r). Strip \r from every \r\n pair in
+            // the FILE bytes (before decryption) and retry; only adopt the
+            // result when the retry decodes.
+            byte[] salvaged = tryCrlfSalvage(filters);
+            if (salvaged == null) {
+                throw decodeFailure;
+            }
+            decoded = salvaged;
+        }
         if (decoded.length <= CACHE_AND_CLONE_LIMIT) {
             decodedData = new SoftReference<>(decoded);
             return decoded.clone();
@@ -157,6 +174,38 @@ public class PdfStream extends PdfDictionary {
      * {@link #getDecodedData()}.
      */
     private static final int CACHE_AND_CLONE_LIMIT = 16 << 20;
+
+    /**
+     * Retries decoding with {@code \r\n → \n} normalized FILE bytes (applied
+     * before decryption). Returns the decoded bytes, or null when the stream
+     * contains no {@code \r\n} pairs or the retry fails too.
+     */
+    private byte[] tryCrlfSalvage(List<PdfName> filters) {
+        byte[] file = encodedData != null ? encodedData : new byte[0];
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream(file.length);
+        for (int i = 0; i < file.length; i++) {
+            if (file[i] == 0x0D && i + 1 < file.length && file[i + 1] == 0x0A) {
+                continue;
+            }
+            out.write(file[i]);
+        }
+        if (out.size() == file.length) {
+            return null; // nothing to strip — not this damage pattern
+        }
+        try {
+            byte[] raw = out.toByteArray();
+            if (decryptor != null && decryptor.isActive()) {
+                raw = decryptor.decrypt(raw, decryptObjNum, decryptGenNum);
+            }
+            byte[] decoded = decodeWithFilters(raw, filters);
+            java.util.logging.Logger.getLogger(PdfStream.class.getName()).warning(
+                    "Stream decoded only after stripping " + (file.length - out.size())
+                    + " text-mode-injected CR bytes (damaged binary transfer)");
+            return decoded;
+        } catch (IOException e) {
+            return null;
+        }
+    }
 
     /**
      * Returns the decoded data as an InputStream.
@@ -351,6 +400,16 @@ public class PdfStream extends PdfDictionary {
     public byte[] prepareEncodedData() throws IOException {
         if (pendingDecodedData != null && encodedData == null) {
             List<PdfName> filters = getFilters();
+            // LZWDecode has no encoder (only the legacy decode path is implemented,
+            // and LZW brings no benefit over Flate). A stream that was DECODED and
+            // modified (pendingDecodedData set) therefore cannot be re-encoded with
+            // its original LZW filter. Re-emit it as FlateDecode instead and rewrite
+            // the /Filter entry to match — LZW and Flate share the same /DecodeParms
+            // (PNG/TIFF predictor) semantics, so the stream stays valid. This is what
+            // lets an edited LZW-compressed content stream save (§7.4.4).
+            if (filters.contains(PdfName.LZW_DECODE)) {
+                filters = substituteLzwWithFlate(filters);
+            }
             if (filters.isEmpty()) {
                 encodedData = pendingDecodedData;
             } else {
@@ -440,6 +499,22 @@ public class PdfStream extends PdfDictionary {
                     if (w != null) augmented.set("Columns", w);
                 }
                 result.add(augmented);
+            } else if (filterName != null && "DCTDecode".equals(filterName.getName())
+                    && get("Decode") != null) {
+                // DCTDecodeFilter pre-converts CMYK JPEGs to RGB, so the
+                // image-level /Decode array (§8.9.5.2) can no longer be applied
+                // downstream on the CMYK samples — hand it to the filter, which
+                // folds a [1 0 ×4] component inversion into its Adobe-APP14
+                // inversion decision (corpus 40971: inverted-CMYK JPEG whose
+                // /Decode un-inverts rendered as a black page).
+                PdfDictionary augmented = new PdfDictionary();
+                if (parms != null) {
+                    for (java.util.Map.Entry<PdfName, PdfBase> e : parms) {
+                        augmented.set(e.getKey(), e.getValue());
+                    }
+                }
+                augmented.set("Decode", get("Decode"));
+                result.add(augmented);
             } else {
                 result.add(parms);
             }
@@ -454,6 +529,40 @@ public class PdfStream extends PdfDictionary {
     private byte[] encodeWithFilters(byte[] data, List<PdfName> filters) throws IOException {
         LOG.fine(() -> "Encoding stream with " + filters.size() + " filter(s)");
         return FilterFactory.encodeChain(data, filters, getEncodeParams(filters));
+    }
+
+    /**
+     * Replaces every {@code LZWDecode} entry in the filter chain with
+     * {@code FlateDecode} — both in the returned list (used for encoding) and in
+     * this stream's {@code /Filter} dictionary entry (so the saved stream declares
+     * the filter it was actually encoded with). Called only when a modified stream
+     * must be re-encoded but its original filter is the unsupported-for-encoding
+     * LZW; Flate is a lossless, spec-compatible substitute with identical predictor
+     * parameters.
+     *
+     * @param filters the original filter chain (contains at least one LZWDecode)
+     * @return a new filter chain with LZWDecode replaced by FlateDecode
+     */
+    private List<PdfName> substituteLzwWithFlate(List<PdfName> filters) {
+        List<PdfName> rewritten = new ArrayList<>(filters.size());
+        for (PdfName f : filters) {
+            rewritten.add(PdfName.LZW_DECODE.equals(f) ? PdfName.FLATE_DECODE : f);
+        }
+        // Mirror the change into /Filter so the declared filter matches the bytes.
+        PdfBase filterObj = get(PdfName.FILTER);
+        if (filterObj instanceof PdfName) {
+            if (PdfName.LZW_DECODE.equals(filterObj)) {
+                set(PdfName.FILTER, PdfName.FLATE_DECODE);
+            }
+        } else if (filterObj instanceof PdfArray) {
+            PdfArray arr = (PdfArray) filterObj;
+            for (int i = 0; i < arr.size(); i++) {
+                if (PdfName.LZW_DECODE.equals(arr.get(i))) {
+                    arr.set(i, PdfName.FLATE_DECODE);
+                }
+            }
+        }
+        return rewritten;
     }
 
     /**

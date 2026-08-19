@@ -118,7 +118,29 @@ public class TextState {
      */
     public Font getFont() {
         if (font != null) return font;
-        return fontName != null ? new Font(fontName) : null;
+        if (fontName == null) return null;
+        Font f = new Font(fontName);
+        f.setEmbedded(fontEmbedded);
+        f.setSubset(fontSubset);
+        return f;
+    }
+
+    /** Embedding/subset status of the resolved font, surfaced through {@link #getFont()}. */
+    private boolean fontEmbedded;
+    private boolean fontSubset;
+
+    /**
+     * Records the embedding/subset status of the resolved font so a name-only
+     * {@link #getFont()} reports {@code isEmbedded()}/{@code isSubset()}
+     * correctly. Engine-internal; set by the extractor, does not affect the
+     * font object a caller may have assigned via {@link #setFont(Font)}.
+     *
+     * @param embedded whether the font program is embedded
+     * @param subset   whether the font is a subset (/BaseFont has a "+"-tag)
+     */
+    public void setFontEmbeddingInfo(boolean embedded, boolean subset) {
+        this.fontEmbedded = embedded;
+        this.fontSubset = subset;
     }
 
     /**
@@ -132,6 +154,15 @@ public class TextState {
     public void setFont(Font font) {
         this.font = font;
         this.fontName = font != null ? font.getName() : null;
+        // Aspose semantics: assigning a new (embeddable) font to an absorbed
+        // fragment re-draws that fragment's glyphs with the new font on save.
+        // Mirror the setFontSize write-back: only fires for a state bound to an
+        // extracted fragment and only for a font carrying real program bytes
+        // (Standard-14 replacements have no bytes and take the by-name path).
+        if (font != null && sourceWriteBackFragment != null
+                && font.getFontData() != null && font.getFontData().length > 0) {
+            sourceWriteBackFragment.applyFontToSource(font);
+        }
     }
 
     /**
@@ -150,6 +181,25 @@ public class TextState {
      */
     public void setFontSize(double fontSize) {
         this.fontSize = fontSize;
+        if (sourceWriteBackFragment != null) {
+            sourceWriteBackFragment.applyFontSizeToSource(fontSize);
+        }
+    }
+
+    /** Fragment whose source content stream mirrors font-size changes, or null. */
+    private TextFragment sourceWriteBackFragment;
+
+    /**
+     * Binds this state to an extracted fragment so that
+     * {@link #setFontSize(double)} writes the new size back into the
+     * fragment's source content stream (Aspose semantics: mutating an
+     * absorbed fragment's state edits the document — PDFNEWNET-30639).
+     * Engine-internal; called by the extractor/absorber, not by clients.
+     *
+     * @param fragment the owning extracted fragment
+     */
+    public void bindSourceFragment(TextFragment fragment) {
+        this.sourceWriteBackFragment = fragment;
     }
 
     /**
@@ -186,6 +236,13 @@ public class TextState {
      */
     public void setBackgroundColor(Color color) {
         this.backgroundColor = color;
+        // Aspose semantics: setting a background colour on an absorbed fragment's
+        // state paints a filled rectangle behind each of the fragment's segments
+        // in the source content stream, surviving save/reload (mirrors the
+        // setFont/setFontSize write-backs). Only fires for a bound state.
+        if (color != null && sourceWriteBackFragment != null) {
+            sourceWriteBackFragment.applyBackgroundToSource(color);
+        }
     }
 
     /**

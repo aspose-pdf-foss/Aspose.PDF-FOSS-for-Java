@@ -43,6 +43,15 @@ public class GraphicsState implements Cloneable {
     private float nonStrokingAlpha;
     /** Blend mode from /BM (§11.3.5); shallow-copied on clone (immutable String). */
     private String blendMode = "Normal";
+    /** Soft mask from /SMask in ExtGState (§11.6.5.1) — the mask dictionary,
+     *  or null for /None. Shared reference on clone (read-only use). */
+    private org.aspose.pdf.engine.pdfobjects.PdfDictionary softMask;
+    /**
+     * CTM snapshot taken when the /SMask was installed via gs. §11.6.5.2:
+     * the mask group's coordinates are fixed at ExtGState-set time — a cm
+     * issued between gs and the masked paint op must NOT move the mask.
+     */
+    private Matrix softMaskCtm;
 
     // ---- Font / text state ----
     private String fontName;
@@ -146,7 +155,19 @@ public class GraphicsState implements Cloneable {
 
     /** Sets the fill color from PDF RGB components (0..1). */
     public void setFillColorRGB(double r, double g, double b) {
-        this.fillColor = new java.awt.Color(clamp(r), clamp(g), clamp(b));
+        this.fillColor = deviceRgbColor(r, g, b);
+    }
+
+    /** Packs untagged DeviceRGB components, applying the Acrobat print-parity
+     *  transparency-page shift ({@link org.aspose.pdf.engine.colorspace.RgbPrintShift})
+     *  when active. */
+    private static java.awt.Color deviceRgbColor(double r, double g, double b) {
+        java.awt.Color c = new java.awt.Color(clamp(r), clamp(g), clamp(b));
+        if (org.aspose.pdf.engine.colorspace.RgbPrintShift.active()) {
+            c = new java.awt.Color(
+                    org.aspose.pdf.engine.colorspace.RgbPrintShift.shift(c.getRGB()), false);
+        }
+        return c;
     }
 
     /** Sets the fill color from a PDF gray value (0..1). */
@@ -187,7 +208,7 @@ public class GraphicsState implements Cloneable {
 
     /** Sets the stroke color from PDF RGB components (0..1). */
     public void setStrokeColorRGB(double r, double g, double b) {
-        this.strokeColor = new java.awt.Color(clamp(r), clamp(g), clamp(b));
+        this.strokeColor = deviceRgbColor(r, g, b);
     }
 
     /** Sets the stroke color from a PDF gray value (0..1). */
@@ -280,6 +301,19 @@ public class GraphicsState implements Cloneable {
         this.blendMode = (mode != null && !mode.isEmpty()) ? mode : "Normal";
     }
 
+    /** Returns the soft-mask dictionary (/SMask, §11.6.5.1), or null for /None. */
+    public org.aspose.pdf.engine.pdfobjects.PdfDictionary getSoftMask() { return softMask; }
+    /** Sets the soft-mask dictionary; null means /None. */
+    public void setSoftMask(org.aspose.pdf.engine.pdfobjects.PdfDictionary mask) {
+        this.softMask = mask;
+        if (mask == null) this.softMaskCtm = null;
+    }
+
+    /** Returns the CTM captured when the /SMask was installed, or null. */
+    public Matrix getSoftMaskCtm() { return softMaskCtm; }
+    /** Records the CTM in effect at ExtGState-set time (§11.6.5.2). */
+    public void setSoftMaskCtm(Matrix m) { this.softMaskCtm = m; }
+
     // ================ Font / Text state ================
 
     /** Returns the current font resource name (e.g., "F1"). */
@@ -371,11 +405,78 @@ public class GraphicsState implements Cloneable {
 
     // ================ Path operations ================
 
+    /**
+     * Acrobat-compatibility coordinate limit (ISO 32000 Annex C.2): Acrobat
+     * silently drops path segments whose CTM-mapped coordinates exceed
+     * ±32767. Real content stays far below this (max media box is 14400
+     * units); coordinates beyond it come from corrupt or hostile streams
+     * (corpus 46075.pdf carries a damaged Flate region whose fused number
+     * tokens yield coordinates in the millions — Acrobat renders the page
+     * clean, while keeping the segments painted page-covering "lens" blobs
+     * and drove Java2D/Marlin stroking into a multi-minute subdivision).
+     * Disable with {@code -Drender.coordLimit=false}.
+     */
+    private static final double COORD_LIMIT = 32767;
+    private static final boolean COORD_LIMIT_ON =
+            !"false".equalsIgnoreCase(System.getProperty("render.coordLimit"));
+
+    /**
+     * True while the current subpath has no valid anchor point (its moveTo
+     * was dropped by the coordinate limit); segments are skipped until the
+     * next in-range point re-anchors the subpath.
+     */
+    private boolean pathPoisoned;
+
+    /** Returns false when the coordinate limit rejects this user-space point. */
+    private boolean pathPointOk(double x, double y) {
+        if (!COORD_LIMIT_ON) return true;
+        if (!Double.isFinite(x) || !Double.isFinite(y)) return false;
+        double[] p = ctm.transformPoint(x, y);
+        return Math.abs(p[0]) <= COORD_LIMIT && Math.abs(p[1]) <= COORD_LIMIT;
+    }
+
+    /**
+     * Whether the point survives the coordinate limit after SATURATING
+     * clamping (Acrobat keeps well-formed out-of-range geometry by clamping
+     * it to the Annex-C range rather than dropping it: corpus 58919 clips
+     * with an even-odd donut whose outer rectangle spans ±2.7M units — the
+     * logo inside survives in Acrobat's print). Only non-finite points are
+     * rejected; {@code out} receives the clamped USER-space point.
+     */
+    private boolean pathPointClamped(double x, double y, double[] out) {
+        out[0] = x;
+        out[1] = y;
+        if (!COORD_LIMIT_ON) return true;
+        if (!Double.isFinite(x) || !Double.isFinite(y)) return false;
+        double[] p = ctm.transformPoint(x, y);
+        if (Math.abs(p[0]) <= COORD_LIMIT && Math.abs(p[1]) <= COORD_LIMIT) return true;
+        // Saturate in DEVICE space, then map back to user space so the
+        // clamped point lands exactly on the Annex-C boundary.
+        double cx = Math.max(-COORD_LIMIT, Math.min(COORD_LIMIT, p[0]));
+        double cy = Math.max(-COORD_LIMIT, Math.min(COORD_LIMIT, p[1]));
+        try {
+            java.awt.geom.AffineTransform inv = new java.awt.geom.AffineTransform(
+                    ctm.getA(), ctm.getB(), ctm.getC(), ctm.getD(),
+                    ctm.getE(), ctm.getF()).createInverse();
+            java.awt.geom.Point2D up = inv.transform(new java.awt.geom.Point2D.Double(cx, cy), null);
+            out[0] = up.getX();
+            out[1] = up.getY();
+            return true;
+        } catch (java.awt.geom.NoninvertibleTransformException e) {
+            return false; // degenerate CTM — treat as dropped (old behavior)
+        }
+    }
+
     /** Returns the current path. */
     public GeneralPath getCurrentPath() { return currentPath; }
 
     /** Begins a new subpath at (x, y). */
     public void moveTo(double x, double y) {
+        if (!pathPointOk(x, y)) {
+            pathPoisoned = true;
+            return;
+        }
+        pathPoisoned = false;
         currentPath.moveTo((float) x, (float) y);
         pathLastX = x;
         pathLastY = y;
@@ -383,6 +484,11 @@ public class GraphicsState implements Cloneable {
 
     /** Appends a line from the current point to (x, y). */
     public void lineTo(double x, double y) {
+        if (!pathPointOk(x, y)) return;
+        if (pathPoisoned) { // re-anchor a subpath whose moveTo was dropped
+            moveTo(x, y);
+            return;
+        }
         currentPath.lineTo((float) x, (float) y);
         pathLastX = x;
         pathLastY = y;
@@ -390,6 +496,11 @@ public class GraphicsState implements Cloneable {
 
     /** Appends a cubic Bézier curve (c operator). */
     public void curveTo(double x1, double y1, double x2, double y2, double x3, double y3) {
+        if (!pathPointOk(x1, y1) || !pathPointOk(x2, y2) || !pathPointOk(x3, y3)) return;
+        if (pathPoisoned) {
+            moveTo(x3, y3);
+            return;
+        }
         currentPath.curveTo((float) x1, (float) y1, (float) x2, (float) y2, (float) x3, (float) y3);
         pathLastX = x3;
         pathLastY = y3;
@@ -397,6 +508,11 @@ public class GraphicsState implements Cloneable {
 
     /** Appends a cubic Bézier curve with first control point = current point (v operator). */
     public void curveToV(double x2, double y2, double x3, double y3) {
+        if (!pathPointOk(x2, y2) || !pathPointOk(x3, y3)) return;
+        if (pathPoisoned) {
+            moveTo(x3, y3);
+            return;
+        }
         currentPath.curveTo((float) pathLastX, (float) pathLastY,
                 (float) x2, (float) y2, (float) x3, (float) y3);
         pathLastX = x3;
@@ -405,6 +521,11 @@ public class GraphicsState implements Cloneable {
 
     /** Appends a cubic Bézier curve with final control point = end point (y operator). */
     public void curveToY(double x1, double y1, double x3, double y3) {
+        if (!pathPointOk(x1, y1) || !pathPointOk(x3, y3)) return;
+        if (pathPoisoned) {
+            moveTo(x3, y3);
+            return;
+        }
         currentPath.curveTo((float) x1, (float) y1, (float) x3, (float) y3, (float) x3, (float) y3);
         pathLastX = x3;
         pathLastY = y3;
@@ -412,23 +533,36 @@ public class GraphicsState implements Cloneable {
 
     /** Appends a rectangle (re operator). */
     public void rect(double x, double y, double w, double h) {
-        currentPath.moveTo((float) x, (float) y);
-        currentPath.lineTo((float) (x + w), (float) y);
-        currentPath.lineTo((float) (x + w), (float) (y + h));
-        currentPath.lineTo((float) x, (float) (y + h));
+        // Out-of-range rectangles are CLAMPED, not dropped: a rectangle stays
+        // a rectangle after saturating both corners, and Acrobat keeps such
+        // well-formed geometry (corpus 58919's even-odd clip pairs a small
+        // hole with a ±2.7M-unit outer rect — dropping the outer rect turned
+        // the "everything except the hole" clip into "only the hole" and cut
+        // the page's logo away). Damaged-stream m/l/c segments (corpus 46075)
+        // keep the drop behavior in moveTo/lineTo/curveTo.
+        double[] p0 = new double[2];
+        double[] p1 = new double[2];
+        if (!pathPointClamped(x, y, p0) || !pathPointClamped(x + w, y + h, p1)) return;
+        pathPoisoned = false;
+        currentPath.moveTo((float) p0[0], (float) p0[1]);
+        currentPath.lineTo((float) p1[0], (float) p0[1]);
+        currentPath.lineTo((float) p1[0], (float) p1[1]);
+        currentPath.lineTo((float) p0[0], (float) p1[1]);
         currentPath.closePath();
-        pathLastX = x;
-        pathLastY = y;
+        pathLastX = p0[0];
+        pathLastY = p0[1];
     }
 
     /** Closes the current subpath (h operator). */
     public void closePath() {
+        if (pathPoisoned) return;
         currentPath.closePath();
     }
 
     /** Clears the current path after painting or no-op. */
     public void clearPath() {
         currentPath.reset();
+        pathPoisoned = false;
     }
 
     // ================ Clipping ================

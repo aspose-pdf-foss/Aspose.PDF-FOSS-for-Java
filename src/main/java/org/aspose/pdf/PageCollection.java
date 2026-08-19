@@ -349,6 +349,26 @@ public class PageCollection implements Iterable<Page> {
     }
 
     /**
+     * Removes the pages at the given 1-based indexes (Aspose.PDF
+     * {@code PageCollection.Delete(int[])}). Indexes may come in any order —
+     * they are deleted highest-first so earlier removals do not shift the
+     * remaining targets.
+     *
+     * @param pages the 1-based page indexes to remove; null/empty is a no-op
+     * @throws IndexOutOfBoundsException if any index is out of range
+     */
+    public void delete(int[] pages) {
+        if (pages == null || pages.length == 0) {
+            return;
+        }
+        int[] sorted = pages.clone();
+        java.util.Arrays.sort(sorted);
+        for (int i = sorted.length - 1; i >= 0; i--) {
+            delete(sorted[i]);
+        }
+    }
+
+    /**
      * Removes the page at the given 1-based index.
      *
      * @param index the 1-based index of the page to remove

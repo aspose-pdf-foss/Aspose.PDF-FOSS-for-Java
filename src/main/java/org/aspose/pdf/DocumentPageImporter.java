@@ -39,6 +39,9 @@ public final class DocumentPageImporter {
     /** Identity set of field dicts reachable from the source /AcroForm /Fields; lazily built. */
     private java.util.Set<PdfDictionary> sourceFormFields;
 
+    /** Set once the source /OCProperties has been merged into the target catalog. */
+    private boolean ocPropertiesMerged;
+
     /**
      * @param target target document, receives cloned pages
      * @param source source document, owns the original pages
@@ -88,6 +91,7 @@ public final class DocumentPageImporter {
         PdfObjectReference pageRef = target.registerImportedObject(clonedDict);
         remapAnnotations(srcDict, clonedDict, pageRef);
         promoteContentsToIndirect(clonedDict);
+        mergeOcProperties();
         Page newPage = new Page(clonedDict, target.getParser());
         newPage.setOwningDocument(target);
         return newPage;
@@ -211,6 +215,74 @@ public final class DocumentPageImporter {
                 if (kids instanceof PdfArray) {
                     collectFieldDicts((PdfArray) kids, depth + 1);
                 }
+            }
+        }
+    }
+
+    /**
+     * Merges the source catalog's {@code /OCProperties} into the target
+     * (ISO 32000-1:2008, §8.11.4.2) so concatenating layered documents keeps
+     * every input's Optional Content Groups with their ON/OFF states
+     * (PDFNEWNET-34925). Entries are cloned through the shared {@link #cloner},
+     * so the catalog's OCG references are identical to the clones referenced
+     * from the imported pages' {@code /Resources /Properties}. Runs once per
+     * importer (i.e. once per source document).
+     */
+    private void mergeOcProperties() throws IOException {
+        if (ocPropertiesMerged) return;
+        ocPropertiesMerged = true;
+        PdfDictionary srcCat = source.getCatalog();
+        PdfDictionary dstCat = target.getCatalog();
+        if (srcCat == null || dstCat == null) return;
+        PdfBase srcOcpVal = deref(srcCat.get(PdfName.of("OCProperties")));
+        if (!(srcOcpVal instanceof PdfDictionary)) return;
+        PdfDictionary srcOcp = (PdfDictionary) srcOcpVal;
+
+        PdfBase dstOcpVal = deref(dstCat.get(PdfName.of("OCProperties")));
+        PdfDictionary dstOcp;
+        if (dstOcpVal instanceof PdfDictionary) {
+            dstOcp = (PdfDictionary) dstOcpVal;
+        } else {
+            dstOcp = new PdfDictionary();
+            dstCat.set(PdfName.of("OCProperties"), dstOcp);
+        }
+
+        appendClonedArray(srcOcp, dstOcp, "OCGs");
+
+        PdfBase srcDVal = deref(srcOcp.get(PdfName.of("D")));
+        if (srcDVal instanceof PdfDictionary) {
+            PdfDictionary srcD = (PdfDictionary) srcDVal;
+            PdfBase dstDVal = deref(dstOcp.get(PdfName.of("D")));
+            PdfDictionary dstD;
+            if (dstDVal instanceof PdfDictionary) {
+                dstD = (PdfDictionary) dstDVal;
+            } else {
+                dstD = new PdfDictionary();
+                dstOcp.set(PdfName.of("D"), dstD);
+            }
+            appendClonedArray(srcD, dstD, "ON");
+            appendClonedArray(srcD, dstD, "OFF");
+            appendClonedArray(srcD, dstD, "Order");
+        }
+    }
+
+    /** Appends clones of the {@code src[key]} array entries onto {@code dst[key]} (created if absent). */
+    private void appendClonedArray(PdfDictionary src, PdfDictionary dst, String key) throws IOException {
+        PdfBase srcArrVal = deref(src.get(PdfName.of(key)));
+        if (!(srcArrVal instanceof PdfArray)) return;
+        PdfArray srcArr = (PdfArray) srcArrVal;
+        PdfBase dstArrVal = deref(dst.get(PdfName.of(key)));
+        PdfArray dstArr;
+        if (dstArrVal instanceof PdfArray) {
+            dstArr = (PdfArray) dstArrVal;
+        } else {
+            dstArr = new PdfArray();
+            dst.set(PdfName.of(key), dstArr);
+        }
+        for (int i = 0; i < srcArr.size(); i++) {
+            PdfBase cloned = cloner.cloneAny(srcArr.get(i));
+            if (cloned != null) {
+                dstArr.add(cloned);
             }
         }
     }

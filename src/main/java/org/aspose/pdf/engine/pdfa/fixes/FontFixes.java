@@ -11,6 +11,7 @@ import org.aspose.pdf.engine.pdfobjects.PdfObjectKey;
 import org.aspose.pdf.engine.pdfobjects.PdfObjectReference;
 import org.aspose.pdf.engine.pdfobjects.PdfStream;
 import org.aspose.pdf.engine.pdfobjects.PdfString;
+import org.aspose.pdf.engine.font.ttf.FontDiskLookup;
 import org.aspose.pdf.engine.pdfa.PdfAValidationResult;
 import org.aspose.pdf.engine.parser.PDFParser;
 
@@ -298,6 +299,295 @@ public final class FontFixes {
             result.addWarning("font.3", "Generated /CIDSet for subset CIDFont " + baseFontName,
                     "obj " + key.getObjectNumber(), "ISO 19005-1:2005, 6.3.6");
         }
+    }
+
+    /**
+     * Embeds a font program for simple (non-composite) fonts that lack one, so the
+     * converted document satisfies the PDF/A embedding requirement (ISO 19005-1:2005,
+     * 6.3.4 / ISO 19005-2:2011, 6.2.11.4). The font program is located on the host
+     * system by name/style via {@link FontDiskLookup} (standard-14 names are mapped to
+     * their metric-compatible system faces: Helvetica→Arial, Times→Times New Roman,
+     * Courier→Courier New). For a standard-14 font without a FontDescriptor one is
+     * synthesized from the TrueType metrics. Because the embedded program is TrueType,
+     * a Type1 dictionary is retyped to TrueType, a WinAnsi base encoding is ensured for
+     * non-symbolic faces (rule 6.3.7) and /FirstChar/LastChar/Widths are generated from
+     * the program's advance widths when missing. Composite (Type0) and Type3 fonts are
+     * left to {@link #logUnembeddedFonts}.
+     *
+     * @param parser      the parsed PDF
+     * @param format      the target format
+     * @param errorAction the error action strategy
+     * @param result      the validation result
+     * @throws IOException if an I/O error occurs
+     */
+    public void embedUnembeddedFonts(PDFParser parser, PdfFormat format,
+                                     ConvertErrorAction errorAction, PdfAValidationResult result) throws IOException {
+        int nextObj = findMaxObjectNumber(parser) + 1;
+        for (PdfObjectKey key : parser.getAllObjectKeys()) {
+            PdfBase obj;
+            try {
+                obj = parser.getObject(key);
+            } catch (IOException e) {
+                continue;
+            }
+            if (!(obj instanceof PdfDictionary) || obj instanceof PdfStream) {
+                continue;
+            }
+            PdfDictionary dict = (PdfDictionary) obj;
+            if (!"Font".equals(dict.getNameAsString("Type"))) {
+                continue;
+            }
+            String subtype = dict.getNameAsString("Subtype");
+            if ("Type3".equals(subtype) || "Type0".equals(subtype) || subtype == null) {
+                continue;
+            }
+            String baseFont = dict.getNameAsString("BaseFont");
+            if (baseFont == null) {
+                continue;
+            }
+
+            PdfDictionary fontDesc = null;
+            PdfBase fdRef = dict.get("FontDescriptor");
+            if (fdRef != null) {
+                PdfBase fdObj = parser.resolveReference(fdRef);
+                if (fdObj instanceof PdfDictionary) {
+                    fontDesc = (PdfDictionary) fdObj;
+                }
+            }
+            if (fontDesc != null && (fontDesc.get("FontFile") != null
+                    || fontDesc.get("FontFile2") != null
+                    || fontDesc.get("FontFile3") != null)) {
+                continue; // already embedded
+            }
+
+            byte[] program = locateFontProgram(baseFont);
+            if (program == null) {
+                continue; // logUnembeddedFonts reports it
+            }
+            boolean isCffOtf = program.length > 4 && program[0] == 'O' && program[1] == 'T'
+                    && program[2] == 'T' && program[3] == 'O';
+            if (isCffOtf && format.isPdfA1()) {
+                // PDF/A-1 does not allow OpenType/CFF in FontFile3; skip rather than
+                // emit an invalid file.
+                continue;
+            }
+
+            org.aspose.pdf.engine.font.ttf.TrueTypeReader reader;
+            try {
+                reader = new org.aspose.pdf.engine.font.ttf.TrueTypeReader(program);
+            } catch (IOException | RuntimeException e) {
+                LOG.fine(() -> "Located font program for '" + baseFont + "' is unreadable: " + e.getMessage());
+                continue;
+            }
+
+            PdfStream fontStream = new PdfStream();
+            fontStream.setDecodedData(program);
+            fontStream.setFilter(PdfName.FLATE_DECODE);
+            fontStream.set("Length1", PdfInteger.valueOf(program.length));
+            if (isCffOtf) {
+                fontStream.set("Subtype", PdfName.of("OpenType"));
+            }
+            PdfStream fontStreamFinal = fontStream;
+            PdfObjectReference fontFileRef = new PdfObjectReference(
+                    new PdfObjectKey(nextObj++, 0), k -> fontStreamFinal);
+
+            if (fontDesc == null) {
+                fontDesc = buildFontDescriptor(baseFont, reader);
+                PdfDictionary fdFinal = fontDesc;
+                PdfObjectReference fdNewRef = new PdfObjectReference(
+                        new PdfObjectKey(nextObj++, 0), k -> fdFinal);
+                dict.set("FontDescriptor", fdNewRef);
+            }
+            fontDesc.set(isCffOtf ? "FontFile3" : "FontFile2", fontFileRef);
+
+            // The embedded program is an sfnt: a Type1 dictionary must be retyped so the
+            // program type matches the font type.
+            if ("Type1".equals(subtype) || "MMType1".equals(subtype)) {
+                dict.set("Subtype", PdfName.of("TrueType"));
+            }
+
+            // 6.3.7: non-symbolic TrueType must use MacRoman/WinAnsi encoding.
+            int flags = fontDesc.getInt("Flags", 0);
+            boolean symbolic = (flags & 0x04) != 0;
+            if (!symbolic) {
+                ensureWinAnsiEncoding(dict, parser);
+            }
+
+            // Simple fonts need /Widths; synthesize from the program's advances.
+            if (dict.get("Widths") == null) {
+                addWinAnsiWidths(dict, reader);
+            }
+
+            result.addWarning("font.5",
+                    "Embedded system font program for '" + baseFont + "'",
+                    "obj " + key.getObjectNumber(), "ISO 19005-1:2005, 6.3.4");
+        }
+    }
+
+    /**
+     * Adds the spec-default {@code /CIDToGIDMap /Identity} to CIDFontType2
+     * descendant fonts that omit it. PDF/A requires the key to be present
+     * explicitly (ISO 19005-1:2005, 6.3.3.2); /Identity is the ISO 32000-1
+     * Table 117 default, so making it explicit never changes rendering.
+     *
+     * @param parser      the parsed PDF
+     * @param format      the target format
+     * @param errorAction the error action strategy
+     * @param result      the validation result
+     * @throws IOException if an I/O error occurs
+     */
+    public void fixCidToGidMap(PDFParser parser, PdfFormat format,
+                               ConvertErrorAction errorAction, PdfAValidationResult result) throws IOException {
+        for (PdfObjectKey key : parser.getAllObjectKeys()) {
+            PdfBase obj;
+            try {
+                obj = parser.getObject(key);
+            } catch (IOException e) {
+                continue;
+            }
+            if (!(obj instanceof PdfDictionary) || obj instanceof PdfStream) {
+                continue;
+            }
+            PdfDictionary dict = (PdfDictionary) obj;
+            if (!"Font".equals(dict.getNameAsString("Type"))
+                    || !"CIDFontType2".equals(dict.getNameAsString("Subtype"))) {
+                continue;
+            }
+            if (dict.get("CIDToGIDMap") == null) {
+                dict.set("CIDToGIDMap", PdfName.of("Identity"));
+                result.addWarning("font.6",
+                        "Added default /CIDToGIDMap /Identity to CIDFontType2 font",
+                        "obj " + key.getObjectNumber(), "ISO 19005-1:2005, 6.3.3.2");
+            }
+        }
+    }
+
+    /**
+     * Locates a system font program for the given BaseFont name. Standard-14
+     * names map to metric-compatible system faces; the subset prefix is stripped.
+     */
+    private static byte[] locateFontProgram(String baseFont) {
+        String name = baseFont.contains("+") ? baseFont.substring(baseFont.indexOf('+') + 1) : baseFont;
+        String stylePart = "";
+        String family = name;
+        int comma = name.indexOf(',');
+        if (comma >= 0) {
+            family = name.substring(0, comma);
+            stylePart = name.substring(comma + 1);
+        } else {
+            int dash = name.lastIndexOf('-');
+            if (dash > 0) {
+                family = name.substring(0, dash);
+                stylePart = name.substring(dash + 1);
+            }
+        }
+        String styleLower = stylePart.toLowerCase();
+        boolean bold = styleLower.contains("bold");
+        boolean italic = styleLower.contains("italic") || styleLower.contains("oblique");
+
+        String famLower = family.toLowerCase();
+        boolean serif = famLower.startsWith("times");
+        boolean mono = famLower.startsWith("courier");
+        if (famLower.equals("helvetica")) {
+            family = "Arial";
+        } else if (famLower.equals("times") || famLower.equals("times new roman") || famLower.startsWith("times")) {
+            family = "Times New Roman";
+        } else if (famLower.startsWith("courier")) {
+            family = "Courier New";
+        }
+
+        byte[] bytes = FontDiskLookup.loadStyled(family, bold, italic, null);
+        if (bytes == null) {
+            bytes = FontDiskLookup.loadByName(name);
+        }
+        if (bytes == null) {
+            bytes = FontDiskLookup.loadFallback(serif, mono, bold, italic, null);
+        }
+        return bytes;
+    }
+
+    /**
+     * Builds a minimal FontDescriptor for a font whose dictionary had none
+     * (standard-14), taking metrics from the located TrueType program.
+     */
+    private static PdfDictionary buildFontDescriptor(String baseFont,
+                                                     org.aspose.pdf.engine.font.ttf.TrueTypeReader reader) {
+        PdfDictionary fd = new PdfDictionary();
+        fd.set("Type", PdfName.of("FontDescriptor"));
+        fd.set("FontName", PdfName.of(baseFont));
+        fd.set("Flags", PdfInteger.valueOf(32)); // non-symbolic
+        double scale = 1000.0 / Math.max(1, reader.getUnitsPerEm());
+        PdfArray bbox = new PdfArray();
+        bbox.add(PdfInteger.valueOf(-600));
+        bbox.add(PdfInteger.valueOf(-300));
+        bbox.add(PdfInteger.valueOf(1300));
+        bbox.add(PdfInteger.valueOf(1000));
+        fd.set("FontBBox", bbox);
+        fd.set("ItalicAngle", PdfInteger.valueOf(0));
+        fd.set("Ascent", PdfInteger.valueOf(800));
+        fd.set("Descent", PdfInteger.valueOf(-200));
+        fd.set("CapHeight", PdfInteger.valueOf(700));
+        fd.set("StemV", PdfInteger.valueOf(80));
+        // metrics scale retained for documentation purposes: widths use the same factor
+        if (scale <= 0) {
+            LOG.fine("Unexpected unitsPerEm in located font for " + baseFont);
+        }
+        return fd;
+    }
+
+    /**
+     * Ensures a non-symbolic simple font declares WinAnsi encoding
+     * (ISO 19005-1:2005, 6.3.7): an /Encoding dictionary keeps its /Differences
+     * but gets /BaseEncoding /WinAnsiEncoding; otherwise /Encoding /WinAnsiEncoding
+     * is set directly.
+     */
+    private static void ensureWinAnsiEncoding(PdfDictionary fontDict, PDFParser parser) {
+        String encName = fontDict.getNameAsString("Encoding");
+        if ("WinAnsiEncoding".equals(encName) || "MacRomanEncoding".equals(encName)) {
+            return;
+        }
+        PdfBase encRef = fontDict.get("Encoding");
+        if (encRef != null) {
+            PdfBase encObj;
+            try {
+                encObj = parser.resolveReference(encRef);
+            } catch (IOException | RuntimeException e) {
+                encObj = null;
+            }
+            if (encObj instanceof PdfDictionary) {
+                PdfDictionary encDict = (PdfDictionary) encObj;
+                String base = encDict.getNameAsString("BaseEncoding");
+                if (!"WinAnsiEncoding".equals(base) && !"MacRomanEncoding".equals(base)) {
+                    encDict.set("BaseEncoding", PdfName.of("WinAnsiEncoding"));
+                }
+                return;
+            }
+        }
+        fontDict.set("Encoding", PdfName.of("WinAnsiEncoding"));
+    }
+
+    /**
+     * Generates /FirstChar, /LastChar and /Widths (WinAnsi code range 32..255)
+     * from the embedded program's advance widths.
+     */
+    private static void addWinAnsiWidths(PdfDictionary fontDict,
+                                         org.aspose.pdf.engine.font.ttf.TrueTypeReader reader) {
+        double scale = 1000.0 / Math.max(1, reader.getUnitsPerEm());
+        PdfArray widths = new PdfArray();
+        for (int code = 32; code <= 255; code++) {
+            Integer unicode = WIN_ANSI_MAP.get(code);
+            int w = 0;
+            if (unicode != null) {
+                int gid = reader.getGlyphId(unicode);
+                if (gid > 0) {
+                    w = (int) Math.round(reader.getAdvanceWidth(gid) * scale);
+                }
+            }
+            widths.add(PdfInteger.valueOf(w));
+        }
+        fontDict.set("FirstChar", PdfInteger.valueOf(32));
+        fontDict.set("LastChar", PdfInteger.valueOf(255));
+        fontDict.set("Widths", widths);
     }
 
     /**

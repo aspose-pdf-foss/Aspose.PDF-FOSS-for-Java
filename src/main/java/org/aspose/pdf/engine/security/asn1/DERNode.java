@@ -67,8 +67,32 @@ public class DERNode {
         int tag = data[pos[0]++] & 0xFF;
         boolean isConstructed = (tag & 0x20) != 0;
 
-        // Parse length
+        // Parse length (-1 = BER indefinite form, terminated by an end-of-contents octet pair)
         int length = parseLength(data, pos, limit);
+        if (length == -1) {
+            // BER indefinite length (CMS producers such as OpenSSL emit `30 80 …`
+            // SignedData). Only legal on constructed types: parse children until
+            // the 0x00 0x00 end-of-contents marker (ITU-T X.690 §8.1.3.6).
+            if (!isConstructed) {
+                throw new IOException("BER: indefinite length on a primitive type at " + pos[0]);
+            }
+            int start = pos[0];
+            List<DERNode> children = new ArrayList<>();
+            while (true) {
+                if (pos[0] + 1 >= limit) {
+                    throw new IOException("BER: missing end-of-contents for indefinite length");
+                }
+                if (data[pos[0]] == 0 && data[pos[0] + 1] == 0) {
+                    break;
+                }
+                children.add(parseNode(data, pos, limit));
+            }
+            int end = pos[0];
+            pos[0] += 2; // consume end-of-contents
+            byte[] value = new byte[end - start];
+            System.arraycopy(data, start, value, 0, end - start);
+            return new DERNode(tag, value, children, true);
+        }
         if (pos[0] + length > limit) {
             throw new IOException("DER: length " + length + " exceeds data at offset " + pos[0]);
         }
@@ -90,7 +114,8 @@ public class DERNode {
         int first = data[pos[0]++] & 0xFF;
         if (first < 0x80) return first;
         int numBytes = first & 0x7F;
-        if (numBytes == 0 || numBytes > 4) throw new IOException("DER: invalid length encoding: " + numBytes);
+        if (numBytes == 0) return -1; // BER indefinite length
+        if (numBytes > 4) throw new IOException("DER: invalid length encoding: " + numBytes);
         int length = 0;
         for (int i = 0; i < numBytes; i++) {
             if (pos[0] >= limit) throw new IOException("DER: truncated length");

@@ -175,6 +175,16 @@ public class XImageCollection implements Iterable<XImage> {
     }
 
     /**
+     * Deletes ALL images from the parent {@code /XObject} dictionary
+     * (Aspose.PDF {@code XImageCollection.Clear()}).
+     */
+    public void clear() {
+        for (int i = getCount(); i >= 1; i--) {
+            delete(i);
+        }
+    }
+
+    /**
      * Deletes the image with the given resource name.
      *
      * @param name the image resource name

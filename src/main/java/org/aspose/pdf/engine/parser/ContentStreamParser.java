@@ -35,6 +35,14 @@ public final class ContentStreamParser {
 
     private static final Logger LOGGER = Logger.getLogger(ContentStreamParser.class.getName());
 
+    /**
+     * When true (default), a lexically malformed numeric token aborts parsing
+     * of the remaining content stream, mirroring Acrobat's damaged-stream
+     * behaviour. Disable with {@code -Dparser.contentAbortOnLexError=false}.
+     */
+    private static final boolean ABORT_ON_LEX_ERROR =
+            !"false".equalsIgnoreCase(System.getProperty("parser.contentAbortOnLexError"));
+
     private ContentStreamParser() {
         // Utility class
     }
@@ -76,6 +84,21 @@ public final class ContentStreamParser {
             PDFLexer.TokenType type = token.getType();
 
             if (type == PDFLexer.TokenType.EOF) {
+                break;
+            }
+
+            // A lexically malformed number ("669.835.566", a digitless "." or
+            // "-") is the signature of a damaged stream region. Acrobat stops
+            // executing the rest of the content stream at this point and keeps
+            // what was already painted ("An error exists on this page");
+            // executing the tail instead painted page-covering garbage
+            // (corpus 46075.pdf carries 278 KB of corrupted ops after a valid
+            // page). Mirror Acrobat. Disable: -Dparser.contentAbortOnLexError=false.
+            if (token.isMalformed() && ABORT_ON_LEX_ERROR
+                    && (type == PDFLexer.TokenType.INTEGER || type == PDFLexer.TokenType.REAL)) {
+                LOGGER.log(Level.WARNING,
+                        "Malformed numeric token {0} — dropping the remainder of the content stream like Acrobat",
+                        token);
                 break;
             }
 
@@ -403,6 +426,12 @@ public final class ContentStreamParser {
             }
             if (type == PDFLexer.TokenType.ARRAY_CLOSE) {
                 break;
+            }
+            if (token.isMalformed() && ABORT_ON_LEX_ERROR
+                    && (type == PDFLexer.TokenType.INTEGER || type == PDFLexer.TokenType.REAL)) {
+                // Same damaged-stream signature as in parse(): surface it so the
+                // main loop stops executing the rest of the stream (Acrobat).
+                throw new IOException("Malformed numeric token in content-stream array: " + token);
             }
 
             switch (type) {

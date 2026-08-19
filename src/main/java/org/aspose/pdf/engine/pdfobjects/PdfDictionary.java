@@ -174,10 +174,31 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the int value or default
      */
     public int getInt(String key, int defaultValue) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         if (obj instanceof PdfInteger) return ((PdfInteger) obj).intValue();
         if (obj instanceof PdfFloat) return (int) ((PdfFloat) obj).doubleValue();
         return defaultValue;
+    }
+
+    /**
+     * Dereferences an indirect value. ISO 32000-1:2008 §7.3.10 allows
+     * ANY dictionary value to be an indirect reference — real-world scans
+     * (corpus 33319-1) put even /Height behind one, and returning the default
+     * instead broke the raster (a 0-height full-page image rendered as a
+     * solid black page); the same applies to container values (/PageLabels,
+     * /Pages held as references made typed getters return null). Non-references
+     * pass through untouched; a dangling reference resolves to null and falls
+     * back to the default.
+     */
+    private static PdfBase resolveScalar(PdfBase obj) {
+        if (obj instanceof PdfObjectReference) {
+            try {
+                return ((PdfObjectReference) obj).dereference();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return obj;
     }
 
     /**
@@ -188,7 +209,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the int value or default
      */
     public int getInt(PdfName key, int defaultValue) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         if (obj instanceof PdfInteger) return ((PdfInteger) obj).intValue();
         if (obj instanceof PdfFloat) return (int) ((PdfFloat) obj).doubleValue();
         return defaultValue;
@@ -202,7 +223,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the long value or default
      */
     public long getLong(String key, long defaultValue) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         if (obj instanceof PdfInteger) return ((PdfInteger) obj).longValue();
         if (obj instanceof PdfFloat) return (long) ((PdfFloat) obj).doubleValue();
         return defaultValue;
@@ -216,7 +237,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the float value or default
      */
     public float getFloat(String key, float defaultValue) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         if (obj instanceof PdfFloat) return ((PdfFloat) obj).floatValue();
         if (obj instanceof PdfInteger) return ((PdfInteger) obj).floatValue();
         return defaultValue;
@@ -230,7 +251,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the boolean value or default
      */
     public boolean getBoolean(String key, boolean defaultValue) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         if (obj instanceof PdfBoolean) return ((PdfBoolean) obj).getValue();
         return defaultValue;
     }
@@ -242,7 +263,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the name value or null
      */
     public String getNameAsString(String key) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         return (obj instanceof PdfName) ? ((PdfName) obj).getName() : null;
     }
 
@@ -253,7 +274,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the string value or null
      */
     public String getString(String key) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         return (obj instanceof PdfString) ? ((PdfString) obj).getString() : null;
     }
 
@@ -264,7 +285,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the dictionary or null
      */
     public PdfDictionary getDictionary(String key) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         return (obj instanceof PdfDictionary) ? (PdfDictionary) obj : null;
     }
 
@@ -275,7 +296,7 @@ public class PdfDictionary extends PdfBase implements Iterable<Map.Entry<PdfName
      * @return the array or null
      */
     public PdfArray getArray(String key) {
-        PdfBase obj = get(key);
+        PdfBase obj = resolveScalar(get(key));
         return (obj instanceof PdfArray) ? (PdfArray) obj : null;
     }
 

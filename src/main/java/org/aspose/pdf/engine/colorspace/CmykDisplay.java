@@ -68,6 +68,9 @@ public final class CmykDisplay {
      * @return packed ARGB int (alpha=0xFF)
      */
     public static int toRGBInt(double c, double m, double y, double k) {
+        // Acrobat print-parity harness mode: use the measured print-path
+        // lattice instead of the display model (see CmykPrintLut).
+        if (CmykPrintLut.active()) return CmykPrintLut.toRGBInt(c, m, y, k);
         double cc = clamp01(c), mm = clamp01(m), yy = clamp01(y), kk = clamp01(k);
         int rgb = 0xFF000000;
         for (int ch = 0; ch < 3; ch++) {

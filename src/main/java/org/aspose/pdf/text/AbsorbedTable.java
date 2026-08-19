@@ -16,6 +16,26 @@ public class AbsorbedTable {
 
     private final List<AbsorbedRow> rows = new ArrayList<>();
     private Rectangle rectangle;
+    private int borderColorRgb = -1;
+
+    /**
+     * Returns the packed 0xRRGGBB colour of this table's ruling lines, or -1 when
+     * the table was not detected from rulings (or the colour is unknown).
+     *
+     * @return the rule colour, or -1
+     */
+    public int getBorderColorRgb() {
+        return borderColorRgb;
+    }
+
+    /**
+     * Records the ruling-line colour (packed 0xRRGGBB) of this ruled table.
+     *
+     * @param rgb the colour, or -1 for unknown
+     */
+    public void setBorderColorRgb(int rgb) {
+        this.borderColorRgb = rgb;
+    }
 
     /**
      * Returns the list of rows in this table.

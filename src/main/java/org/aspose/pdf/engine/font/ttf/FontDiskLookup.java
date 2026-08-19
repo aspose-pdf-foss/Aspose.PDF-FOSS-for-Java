@@ -331,10 +331,55 @@ public final class FontDiskLookup {
             base = new String[]{"simsun", "simsunb"};
         } else if ("simhei".equals(lower)) {
             base = new String[]{"simhei"};
+        } else if ("microsoft yahei".equals(lower)) {
+            base = new String[]{"msyh", "msyhl"};
         } else {
-            base = new String[]{compact, lower};
+            // Common Windows core families whose file basename differs from the
+            // compacted family name (e.g. "Courier New" → cour.ttf, style suffixes
+            // bd/i/bi). Prepend the mapped basename(s) before the naive guesses.
+            String[] win = windowsCoreBasenames(lower);
+            if (win != null) {
+                base = new String[win.length + 2];
+                System.arraycopy(win, 0, base, 0, win.length);
+                base[win.length] = compact;
+                base[win.length + 1] = lower;
+            } else {
+                base = new String[]{compact, lower};
+            }
         }
         return base;
+    }
+
+    /**
+     * Maps a Windows core-font family name (with optional bold/italic words) to
+     * its actual on-disk file basename(s), most-specific first. Returns
+     * {@code null} for families not in the well-known set.
+     *
+     * @param lower the lowercased family name (e.g. {@code "times new roman bold"})
+     * @return candidate basenames (e.g. {@code {"timesbd"}}), or {@code null}
+     */
+    private static String[] windowsCoreBasenames(String lower) {
+        boolean bold = lower.contains("bold");
+        boolean italic = lower.contains("italic") || lower.contains("oblique");
+        String stem = lower.replace("bold", "").replace("italic", "")
+                .replace("oblique", "").replace("regular", "").trim();
+        String prefix;
+        switch (stem) {
+            case "courier new": case "courier": prefix = "cour"; break;
+            case "times new roman": case "times": prefix = "times"; break;
+            case "arial": prefix = "arial"; break;
+            case "calibri": prefix = "calibri"; break;
+            case "verdana": prefix = "verdana"; break;
+            case "tahoma": prefix = "tahoma"; break;
+            case "georgia": prefix = "georgia"; break;
+            case "comic sans ms": prefix = "comic"; break;
+            case "trebuchet ms": prefix = "trebuc"; break;
+            default: return null;
+        }
+        // Windows style suffix convention: bd (bold), i (italic), bi (bold+italic).
+        String suffix = (bold ? "bd" : "") + (italic ? (bold ? "" : "i") : "");
+        if (bold && italic) suffix = "bi";
+        return suffix.isEmpty() ? new String[]{prefix} : new String[]{prefix + suffix, prefix};
     }
 
     private static byte[] readAll(Path p) {

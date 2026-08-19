@@ -54,8 +54,20 @@ public class ContentStreamBuilder {
     private final Map<String, org.aspose.pdf.engine.pdfobjects.PdfStream> imageXObjectDicts
             = new LinkedHashMap<>();
 
+    /**
+     * Resource name (e.g. "GS1") → the {@code /ExtGState} dictionary registered via
+     * {@link #registerAlphaGState(double)}. The caller's resource-merge step attaches
+     * these onto the page's {@code /Resources/ExtGState} so soft alpha (watermark
+     * backdrops) actually applies.
+     */
+    private final Map<String, org.aspose.pdf.engine.pdfobjects.PdfDictionary> extGStateDicts
+            = new LinkedHashMap<>();
+    /** Alpha value → its already-registered ExtGState resource name (dedup). */
+    private final Map<Double, String> alphaGStates = new LinkedHashMap<>();
+
     private int fontCounter = 0;
     private int imageCounter = 0;
+    private int gsCounter = 0;
 
     /**
      * Resource names of fonts that use Identity-H 2-byte CID encoding
@@ -281,6 +293,25 @@ public class ContentStreamBuilder {
     }
 
     /**
+     * Emits the d (set dash pattern) operator. An empty {@code pattern} restores
+     * a solid line ({@code [] 0 d}).
+     *
+     * @param pattern the dash array (on/off segment lengths); empty for solid
+     * @param phase   the dash phase
+     */
+    public void setLineDash(double[] pattern, double phase) {
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < pattern.length; i++) {
+            if (i > 0) {
+                sb.append(' ');
+            }
+            sb.append(String.format(Locale.US, "%.2f", pattern[i]));
+        }
+        sb.append(']');
+        emit(String.format(Locale.US, "%s %.2f d\n", sb, phase));
+    }
+
+    /**
      * Emits the q (save graphics state) operator.
      */
     public void saveState() {
@@ -405,6 +436,15 @@ public class ContentStreamBuilder {
         emit(String.format(Locale.US, "/%s Do\n", name));
     }
 
+    /**
+     * Emits the gs (set parameters from an ExtGState) operator.
+     *
+     * @param name the /ExtGState resource name (e.g. "GS1")
+     */
+    public void setExtGState(String name) {
+        emit(String.format(Locale.US, "/%s gs\n", name));
+    }
+
     // ---- Resource registration ----
 
     /**
@@ -508,6 +548,41 @@ public class ContentStreamBuilder {
      */
     public Map<String, org.aspose.pdf.engine.pdfobjects.PdfStream> getImageXObjectDicts() {
         return Collections.unmodifiableMap(imageXObjectDicts);
+    }
+
+    /**
+     * Registers a constant-alpha {@code /ExtGState} ({@code /ca} fill alpha and
+     * {@code /CA} stroke alpha) and returns its resource name. Emit it with
+     * {@link #setExtGState(String)} to fade subsequent painting (e.g. a
+     * watermark backdrop). Re-registering the same alpha returns the same name.
+     *
+     * @param alpha opacity in [0,1]
+     * @return the ExtGState resource name (e.g. {@code "GS1"})
+     */
+    public String registerAlphaGState(double alpha) {
+        double a = Math.max(0.0, Math.min(1.0, alpha));
+        String existing = alphaGStates.get(a);
+        if (existing != null) {
+            return existing;
+        }
+        gsCounter++;
+        String name = "GS" + gsCounter;
+        org.aspose.pdf.engine.pdfobjects.PdfDictionary gs =
+                new org.aspose.pdf.engine.pdfobjects.PdfDictionary();
+        gs.set("Type", org.aspose.pdf.engine.pdfobjects.PdfName.of("ExtGState"));
+        gs.set("ca", new org.aspose.pdf.engine.pdfobjects.PdfFloat(a));
+        gs.set("CA", new org.aspose.pdf.engine.pdfobjects.PdfFloat(a));
+        extGStateDicts.put(name, gs);
+        alphaGStates.put(a, name);
+        return name;
+    }
+
+    /**
+     * @return resource name → {@code /ExtGState} dictionary, for the resource-merge
+     *         step (unmodifiable; empty when no soft-alpha state was registered)
+     */
+    public Map<String, org.aspose.pdf.engine.pdfobjects.PdfDictionary> getExtGStateDicts() {
+        return Collections.unmodifiableMap(extGStateDicts);
     }
 
     /**

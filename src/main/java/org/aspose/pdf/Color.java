@@ -79,13 +79,48 @@ public class Color {
     /** Returns the predefined transparent color. */
     public static Color getTransparent() { return TRANSPARENT; }
 
+    /**
+     * The empty color sentinel — Aspose {@code Color.Empty}. Represents "no color
+     * set" and is distinct from every real color (including RGB black). Two empty
+     * colors are equal to each other only.
+     */
+    private static final Color EMPTY = createEmpty();
+
+    /**
+     * Returns the empty color sentinel (Aspose {@code Color.Empty}). Not equal to
+     * any real color; {@code getEmpty().equals(getEmpty())} is {@code true}.
+     *
+     * @return the shared empty color instance
+     */
+    public static Color getEmpty() { return EMPTY; }
+
+    private static Color createEmpty() {
+        Color c = new Color(ColorSpace.RGB, new double[0]);
+        c.empty = true;
+        return c;
+    }
+
     private final ColorSpace colorSpace;
     private final double[] components;
     private double alpha = 1.0;
+    /** True only for the {@link #EMPTY} sentinel (Aspose {@code Color.Empty}). */
+    private boolean empty = false;
 
     private Color(ColorSpace colorSpace, double[] components) {
         this.colorSpace = colorSpace;
         this.components = components;
+    }
+
+    /**
+     * Subclass constructor for an RGB color from 0&ndash;1 components (used by
+     * {@link org.aspose.pdf.facades.FontColor}).
+     *
+     * @param r red (0&ndash;1)
+     * @param g green (0&ndash;1)
+     * @param b blue (0&ndash;1)
+     */
+    protected Color(double r, double g, double b) {
+        this(ColorSpace.RGB, new double[]{r, g, b});
     }
 
     /**
@@ -99,6 +134,35 @@ public class Color {
     public static Color fromRgb(double r, double g, double b) {
         LOG.fine(() -> "Color.fromRgb(" + r + ", " + g + ", " + b + ")");
         return new Color(ColorSpace.RGB, new double[]{r, g, b});
+    }
+
+    /**
+     * Creates an RGB color from 0&ndash;255 integer components (the form used
+     * when translating a {@code java.awt.Color} / {@code System.Drawing.Color}).
+     * Named distinctly from {@link #fromRgb(double, double, double)} to avoid the
+     * overload trap where {@code fromRgb(1, 0, 0)} (integer literals) would bind
+     * to the byte form instead of the 0&ndash;1 float form.
+     *
+     * @param r red component (0&ndash;255)
+     * @param g green component (0&ndash;255)
+     * @param b blue component (0&ndash;255)
+     * @return a new Color in the RGB color space
+     */
+    public static Color fromRgbBytes(int r, int g, int b) {
+        return new Color(ColorSpace.RGB, new double[]{r / 255.0, g / 255.0, b / 255.0});
+    }
+
+    /**
+     * Returns this color's RGB components as 0&ndash;255 integers (Aspose
+     * {@code Color.ToRgb()}). Non-RGB colors are first converted to RGB.
+     *
+     * @return an {@code int[]}{r, g, b} in 0&ndash;255
+     */
+    public int[] toRgb() {
+        return new int[]{
+                (int) Math.round(getR() * 255.0),
+                (int) Math.round(getG() * 255.0),
+                (int) Math.round(getB() * 255.0)};
     }
 
     /**
@@ -273,6 +337,9 @@ public class Color {
         if (this == o) return true;
         if (!(o instanceof Color)) return false;
         Color c = (Color) o;
+        // The empty sentinel (Aspose Color.Empty) equals only another empty and
+        // is distinct from every real color, including RGB black.
+        if (empty || c.empty) return empty == c.empty;
         return colorSpace == c.colorSpace && Arrays.equals(components, c.components);
     }
 

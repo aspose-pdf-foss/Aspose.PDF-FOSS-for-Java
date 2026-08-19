@@ -282,16 +282,7 @@ public class Document implements Closeable {
      */
     public Document(String filePath, HtmlLoadOptions options) throws IOException {
         this();
-        if (options == null) options = new HtmlLoadOptions();
-        try (InputStream is = new java.io.FileInputStream(filePath)) {
-            HtmlToPdfConverter converter = new HtmlToPdfConverter();
-            Document converted = converter.convert(is, options);
-            try {
-                adoptConvertedPages(converted);
-            } finally {
-                converted.close();
-            }
-        }
+        initFromHtmlFile(filePath, options, false);
     }
 
     /**
@@ -303,13 +294,365 @@ public class Document implements Closeable {
      */
     public Document(InputStream stream, HtmlLoadOptions options) throws IOException {
         this();
+        initFromHtmlStream(stream, options, false);
+    }
+
+    /**
+     * Loads a document from a file, converting it to PDF according to the runtime
+     * type of {@code options} — the uniform load entry point (Aspose.PDF
+     * {@code Document(String, LoadOptions)}). Passing an {@link HtmlLoadOptions}
+     * reads and converts the HTML file; the concrete options type selects the
+     * source format, mirroring how {@link SaveOptions} selects the format on save.
+     *
+     * @param filePath the input file path
+     * @param options  the load options; their concrete type selects the source
+     *                 format
+     * @throws IOException if reading or parsing fails
+     */
+    public Document(String filePath, LoadOptions options) throws IOException {
+        this();
+        if (options instanceof HtmlLoadOptions) {
+            // The uniform entry point uses the SDM pipeline so the document is
+            // laid out immediately (Aspose-like), rather than the legacy
+            // converter that defers content until save().
+            initFromHtmlFile(filePath, (HtmlLoadOptions) options, true);
+        } else if (options instanceof DocLoadOptions) {
+            initFromDocx(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
+                    (DocLoadOptions) options);
+        } else {
+            throw new IllegalArgumentException("Unsupported LoadOptions type: "
+                    + (options == null ? "null" : options.getClass().getName())
+                    + ". To open a PDF use new Document(String).");
+        }
+    }
+
+    /**
+     * Loads a document from a stream, converting it to PDF according to the
+     * runtime type of {@code options} — the stream counterpart of
+     * {@link #Document(String, LoadOptions)} (Aspose.PDF
+     * {@code Document(InputStream, LoadOptions)}).
+     *
+     * @param stream  the input stream
+     * @param options the load options; their concrete type selects the source
+     *                format
+     * @throws IOException if reading or parsing fails
+     */
+    public Document(InputStream stream, LoadOptions options) throws IOException {
+        this();
+        if (options instanceof HtmlLoadOptions) {
+            initFromHtmlStream(stream, (HtmlLoadOptions) options, true);
+        } else if (options instanceof DocLoadOptions) {
+            initFromDocx(readAllBytes(stream), (DocLoadOptions) options);
+        } else {
+            throw new IllegalArgumentException("Unsupported LoadOptions type: "
+                    + (options == null ? "null" : options.getClass().getName())
+                    + ". To open a PDF use new Document(InputStream).");
+        }
+    }
+
+    /**
+     * Loads (converts) a {@code .docx} package: DOCX &rarr; SDM via
+     * {@code DocxSdmReader}, then the shared {@code SdmPdfLayout} paginates the
+     * model — the same second half the HTML loader uses. An explicit
+     * {@link DocLoadOptions#getPageInfo()} fixes the page geometry; otherwise
+     * the document's own {@code sectPr} page size is honoured.
+     */
+    private void initFromDocx(byte[] docx, DocLoadOptions options) throws IOException {
+        // Format sniffing: a legacy binary .doc is an OLE2 compound file
+        // (D0 CF 11 E0), a .docx is a ZIP (PK). Both load through the same
+        // DocLoadOptions — the bytes decide the parser.
+        if (docx != null && docx.length > 4 && (docx[0] & 0xFF) == 0xD0
+                && (docx[1] & 0xFF) == 0xCF && (docx[2] & 0xFF) == 0x11
+                && (docx[3] & 0xFF) == 0xE0) {
+            initFromLegacyDoc(docx, options);
+            return;
+        }
+        org.aspose.pdf.sdm.docx.DocxSdmReader reader = new org.aspose.pdf.sdm.docx.DocxSdmReader();
+        org.aspose.pdf.sdm.SdmDocument sdm = reader.read(docx);
+        PageInfo pi = options != null ? options.getPageInfo() : null;
+        org.aspose.pdf.sdm.layout.PageSetup setup = pageSetupFrom(pi);
+        if (pi == null) {
+            applySdmPageSize(setup, sdm);
+        }
+        // Word documents state their page size explicitly (sectPr/PageInfo) —
+        // wide tables must wrap into it, not stretch the page.
+        setup.setFixedSize(true);
+        // Running header/footer parts become per-page furniture; the content
+        // margins must clear the furniture bands (Word pushes body text below
+        // the header the same way).
+        double headerH = furnitureInto(reader.getHeaderLines(), setup.getHeaderLines());
+        double footerH = furnitureInto(reader.getFooterLines(), setup.getFooterLines());
+        if (reader.getHeaderDistance() > 0) {
+            setup.setHeaderDistance(reader.getHeaderDistance());
+        }
+        setup.setFooterDistance(Math.max(14, reader.getFooterDistance()));
+        if (headerH > 0) {
+            setup.setMarginTop(Math.max(setup.getMarginTop(),
+                    setup.getHeaderDistance() + headerH + 6));
+        }
+        if (footerH > 0) {
+            setup.setMarginBottom(Math.max(setup.getMarginBottom(),
+                    setup.getFooterDistance() + footerH + 6));
+        }
+        org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
+                new org.aspose.pdf.sdm.layout.SdmPdfLayout().render(sdm, setup);
+        adoptSdmPages(result.getDocument());
+    }
+
+    /**
+     * Loads a legacy binary Word document ({@code .doc}, Word 97&ndash;2003):
+     * {@code DocSdmReader} parses the OLE2 container, piece table and FKP
+     * formatting into the SDM; the shared {@code SdmPdfLayout} paginates it —
+     * the same second half the HTML and DOCX loaders use.
+     */
+    private void initFromLegacyDoc(byte[] doc, DocLoadOptions options) throws IOException {
+        org.aspose.pdf.sdm.doc.DocSdmReader reader = new org.aspose.pdf.sdm.doc.DocSdmReader();
+        org.aspose.pdf.sdm.SdmDocument sdm = reader.read(doc);
+        PageInfo pi = options != null ? options.getPageInfo() : null;
+        org.aspose.pdf.sdm.layout.PageSetup setup = pageSetupFrom(pi);
+        if (pi == null) {
+            applySdmPageSize(setup, sdm);
+        } else {
+            // An explicit PageInfo overrides the page SIZE, but the document's
+            // own margins stay authoritative: a full-width form (0pt margins)
+            // must not inherit default 72pt margins, or every tab stop and
+            // anchored box slides off its text.
+            java.util.Map<String, String> c = sdm.getMetadata().getCustom();
+            setup.setMarginLeft(metaPt(c, "margin-left", setup.getMarginLeft()));
+            setup.setMarginRight(metaPt(c, "margin-right", setup.getMarginRight()));
+            setup.setMarginTop(metaPt(c, "margin-top", setup.getMarginTop()));
+            setup.setMarginBottom(metaPt(c, "margin-bottom", setup.getMarginBottom()));
+        }
+        // Word documents state their page size explicitly — a wide TOC/table
+        // must wrap into it, not stretch the page.
+        setup.setFixedSize(true);
+        org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
+                new org.aspose.pdf.sdm.layout.SdmPdfLayout().render(sdm, setup);
+        adoptSdmPages(result.getDocument());
+    }
+
+    /** Copies reader furniture tuples into the setup; returns the band height (pt). */
+    private static double furnitureInto(java.util.List<Object[]> lines,
+            java.util.List<org.aspose.pdf.sdm.layout.PageSetup.FurnitureLine> out) {
+        double h = 0;
+        for (Object[] l : lines) {
+            double size = ((Number) l[1]).doubleValue();
+            org.aspose.pdf.sdm.layout.PageSetup.FurnitureLine line =
+                    new org.aspose.pdf.sdm.layout.PageSetup.FurnitureLine(
+                            (String) l[0], size, Boolean.TRUE.equals(l[2]),
+                            Boolean.TRUE.equals(l[3]));
+            // Explicit w:tabs positions (5th tuple slot) refine the default
+            // edge/centre/edge spread of TAB-separated furniture parts.
+            if (l.length > 4 && l[4] instanceof java.util.List) {
+                for (Object stop : (java.util.List<?>) l[4]) {
+                    if (stop instanceof double[]) {
+                        line.getTabStops().add((double[]) stop);
+                    }
+                }
+            }
+            out.add(line);
+            h += (size > 0 ? size : 10) * 1.25;
+        }
+        return h;
+    }
+
+    /** Shared HTML-file loader for the {@code HtmlLoadOptions}/{@code LoadOptions} constructors. */
+    private void initFromHtmlFile(String filePath, HtmlLoadOptions options, boolean forceSdm)
+            throws IOException {
+        // A null options means the caller did not fix a page geometry, so a
+        // PDF->HTML->PDF round-trip should reproduce the source page size
+        // embedded in the HTML rather than the default. Explicit options win.
+        boolean callerGeometry = options != null;
         if (options == null) options = new HtmlLoadOptions();
+        if (forceSdm || options.isUseSdmPipeline()) {
+            java.nio.file.Path path = java.nio.file.Paths.get(filePath);
+            byte[] bytes = java.nio.file.Files.readAllBytes(path);
+            // Default the base path to the file's own directory so relative
+            // <img>/<link> references resolve without an explicit setBasePath.
+            if (options.getBasePath() == null || options.getBasePath().isEmpty()) {
+                java.nio.file.Path parent = path.toAbsolutePath().getParent();
+                if (parent != null) {
+                    options.setBasePath(parent.toString());
+                }
+            }
+            adoptSdmPages(renderHtmlViaSdm(decodeHtml(bytes, options), options, callerGeometry));
+            return;
+        }
+        try (InputStream is = new java.io.FileInputStream(filePath)) {
+            HtmlToPdfConverter converter = new HtmlToPdfConverter();
+            Document converted = converter.convert(is, options);
+            try {
+                adoptConvertedPages(converted);
+            } finally {
+                converted.close();
+            }
+        }
+    }
+
+    /** Shared HTML-stream loader for the {@code HtmlLoadOptions}/{@code LoadOptions} constructors. */
+    private void initFromHtmlStream(InputStream stream, HtmlLoadOptions options, boolean forceSdm)
+            throws IOException {
+        // Same geometry contract as the file form: null options = reproduce the
+        // page size embedded in the HTML; explicit options fix the geometry.
+        boolean callerGeometry = options != null;
+        if (options == null) options = new HtmlLoadOptions();
+        if (forceSdm || options.isUseSdmPipeline()) {
+            byte[] bytes = readAllBytes(stream);
+            adoptSdmPages(renderHtmlViaSdm(decodeHtml(bytes, options), options, callerGeometry));
+            return;
+        }
         HtmlToPdfConverter converter = new HtmlToPdfConverter();
         Document converted = converter.convert(stream, options);
         try {
             adoptConvertedPages(converted);
         } finally {
             converted.close();
+        }
+    }
+
+    /**
+     * Runs the SDM HTML pipeline: HTML &rarr; {@code SdmDocument} (via
+     * {@code HtmlSdmReader}, CSS cascade resolved in the reader) &rarr; paginated
+     * {@link Document} (via {@code SdmPdfLayout}).
+     */
+    private static Document renderHtmlViaSdm(String html, HtmlLoadOptions options,
+                                             boolean callerGeometry) {
+        String baseUri = options != null ? options.getBasePath() : null;
+        org.aspose.pdf.sdm.html.HtmlReadOptions ro = new org.aspose.pdf.sdm.html.HtmlReadOptions();
+        ro.setBaseUri(baseUri);
+        ro.setAllowNetwork(options != null && options.isAllowNetworkResources());
+        org.aspose.pdf.sdm.SdmDocument sdm =
+                new org.aspose.pdf.sdm.html.HtmlSdmReader().read(html, baseUri, ro);
+        org.aspose.pdf.sdm.layout.PageSetup setup = pageSetupFrom(options);
+        // When the caller did not fix a page geometry, honour the source page size
+        // the writer recorded (PDF->HTML->PDF), so a wide/landscape original is not
+        // reflowed into portrait (which explodes page counts and clips text).
+        if (!callerGeometry) {
+            applySdmPageSize(setup, sdm);
+        }
+        org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
+                new org.aspose.pdf.sdm.layout.SdmPdfLayout().render(sdm, setup);
+        return result.getDocument();
+    }
+
+    /** Overrides the page setup with the source page size recorded in the SDM
+     *  metadata ({@code page-width}/{@code page-height} in points), when present. */
+    private static void applySdmPageSize(org.aspose.pdf.sdm.layout.PageSetup setup,
+                                         org.aspose.pdf.sdm.SdmDocument sdm) {
+        try {
+            java.util.Map<String, String> c = sdm.getMetadata().getCustom();
+            String pw = c.get("page-width");
+            String ph = c.get("page-height");
+            if (pw != null && ph != null) {
+                double w = Double.parseDouble(pw);
+                double h = Double.parseDouble(ph);
+                if (w > 1 && h > 1) {
+                    setup.setPageWidth(w);
+                    setup.setPageHeight(h);
+                    // Scale margins to the page: the fixed 72pt default swallows a
+                    // small page (e.g. a 258x204 label) and explodes it across many
+                    // pages. A ~4% border (clamped) keeps content proportionate.
+                    double mx = Math.min(54, Math.max(6, w * 0.04));
+                    double my = Math.min(54, Math.max(6, h * 0.04));
+                    // Explicit source margins (DOCX sectPr pgMar, HTML meta) beat
+                    // the heuristic: content that filled one source page must not
+                    // spill onto a second because of an invented wider border.
+                    setup.setMarginLeft(metaPt(c, "margin-left", mx));
+                    setup.setMarginRight(metaPt(c, "margin-right", mx));
+                    setup.setMarginTop(metaPt(c, "margin-top", my));
+                    setup.setMarginBottom(metaPt(c, "margin-bottom", my));
+                }
+            }
+        } catch (RuntimeException ignore) {
+            // malformed metadata — keep the default setup
+        }
+    }
+
+    /** A points value from SDM metadata, or the fallback when absent/invalid. */
+    private static double metaPt(java.util.Map<String, String> meta, String key, double def) {
+        String v = meta.get(key);
+        if (v != null) {
+            try {
+                double d = Double.parseDouble(v);
+                if (d >= 0 && d < 300) {
+                    return d;
+                }
+            } catch (NumberFormatException ignored) {
+                // fall through to default
+            }
+        }
+        return def;
+    }
+
+    /** Maps the {@link HtmlLoadOptions} page geometry to an SDM {@code PageSetup}. */
+    private static org.aspose.pdf.sdm.layout.PageSetup pageSetupFrom(HtmlLoadOptions options) {
+        return pageSetupFrom(options != null ? options.getPageInfo() : null);
+    }
+
+    /** Maps an explicit {@link PageInfo} to an SDM {@code PageSetup}. */
+    private static org.aspose.pdf.sdm.layout.PageSetup pageSetupFrom(PageInfo pi) {
+        org.aspose.pdf.sdm.layout.PageSetup setup = new org.aspose.pdf.sdm.layout.PageSetup();
+        if (pi != null) {
+            if (pi.getWidth() > 0) setup.setPageWidth(pi.getWidth());
+            if (pi.getHeight() > 0) setup.setPageHeight(pi.getHeight());
+            PageInfo.MarginInfo m = pi.getMargin();
+            if (m != null) {
+                setup.setMarginTop(m.getTop());
+                setup.setMarginBottom(m.getBottom());
+                setup.setMarginLeft(m.getLeft());
+                setup.setMarginRight(m.getRight());
+            }
+        }
+        return setup;
+    }
+
+    /** Decodes HTML bytes using {@code options.getInputEncoding()} (UTF-8 default). */
+    private static String decodeHtml(byte[] bytes, HtmlLoadOptions options) {
+        java.nio.charset.Charset cs = StandardCharsets.UTF_8;
+        String enc = options != null ? options.getInputEncoding() : null;
+        if (enc != null && !enc.isEmpty()) {
+            try {
+                cs = java.nio.charset.Charset.forName(enc);
+            } catch (RuntimeException ignore) {
+                // Unknown encoding name → fall back to UTF-8.
+            }
+        }
+        return new String(bytes, cs);
+    }
+
+    /**
+     * Deep-copies every page of an SDM-produced document into this one and marks
+     * the result pre-paginated (the SDM layout engine already split pages, so
+     * {@code save()} must not re-flow them).
+     *
+     * <p>The layout engine attaches page content as <em>direct, in-memory</em>
+     * {@link PdfStream}s (see {@code SdmPdfLayout.finishPage}). The page importer
+     * deep-copies through the source's serialized object graph, so we first
+     * round-trip {@code produced} through {@code save()}/reopen — this both
+     * materializes the streams as regular indirect objects and reuses the
+     * well-tested concatenate import path.</p>
+     */
+    private void adoptSdmPages(Document produced) throws IOException {
+        this.pagesPrePaginated = true;
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        try {
+            produced.save(bos);
+        } finally {
+            try {
+                produced.close();
+            } catch (IOException e) {
+                LOG.fine(() -> "Failed to close SDM-produced document: " + e.getMessage());
+            }
+        }
+        Document parsed = new Document(new java.io.ByteArrayInputStream(bos.toByteArray()));
+        try {
+            this.getPages().add(parsed.getPages());
+        } finally {
+            try {
+                parsed.close();
+            } catch (IOException e) {
+                LOG.fine(() -> "Failed to close reopened SDM document: " + e.getMessage());
+            }
         }
     }
 
@@ -589,7 +932,29 @@ public class Document implements Closeable {
      * @return the version string
      */
     public String getVersion() {
-        return String.valueOf(parser.getVersion());
+        float headerV = parser != null ? parser.getVersion() : 1.7f;
+        String header = String.valueOf(headerV);
+        // ISO 32000 §7.5.5: a /Version name in the document catalog overrides the
+        // header version when it is later (e.g. a 1.7 file upgraded to 2.0 via an
+        // incremental update writes /Version /2.0 into the catalog).
+        try {
+            PdfDictionary cat = getCatalog();
+            if (cat != null) {
+                String cv = cat.getNameAsString("Version");
+                if (cv != null && !cv.isEmpty()) {
+                    try {
+                        if (Float.parseFloat(cv) >= headerV) {
+                            return cv;
+                        }
+                    } catch (NumberFormatException ignore) {
+                        // malformed /Version name — fall back to the header.
+                    }
+                }
+            }
+        } catch (IOException ignore) {
+            // catalog unreadable — fall back to the header version.
+        }
+        return header;
     }
 
     /**
@@ -1237,6 +1602,148 @@ public class Document implements Closeable {
     }
 
     /**
+     * Rebuilds the page tree as a balanced tree with at most 10 kids per node.
+     * API-compatible with Aspose's {@code Document.PageNodesToBalancedTree()}.
+     *
+     * @throws IOException if the page tree cannot be read
+     */
+    public void pageNodesToBalancedTree() throws IOException {
+        pageNodesToBalancedTree((byte) 10);
+    }
+
+    /**
+     * Rebuilds the page tree as a balanced tree (ISO 32000-1:2008, §7.7.3.2)
+     * with at most {@code nodeKidsCount} kids per intermediate node. A flat
+     * tree with tens of thousands of pages makes per-page lookup O(n) in
+     * consumers; a balanced tree makes it O(log n).
+     *
+     * <p>Inheritable attributes (/Resources, /MediaBox, /CropBox, /Rotate)
+     * of intermediate nodes are pushed down onto the leaf pages before the
+     * old intermediate nodes are discarded, so pages keep their effective
+     * values.</p>
+     *
+     * @param nodeKidsCount maximum kids per node (must be at least 2)
+     * @throws IOException if the page tree cannot be read
+     */
+    public void pageNodesToBalancedTree(byte nodeKidsCount) throws IOException {
+        int fanout = nodeKidsCount;
+        if (fanout < 2) {
+            throw new IllegalArgumentException("nodeKidsCount must be >= 2, got " + fanout);
+        }
+        PdfDictionary catalog = getCatalog();
+        PdfBase rootBase = catalog.get(PdfName.PAGES);
+        if (rootBase instanceof PdfObjectReference) {
+            rootBase = ((PdfObjectReference) rootBase).dereference();
+        }
+        if (!(rootBase instanceof PdfDictionary)) {
+            return;
+        }
+        PdfDictionary root = (PdfDictionary) rootBase;
+
+        // Collect leaf page entries (preserving original Kids entry objects, i.e.
+        // indirect references stay references) in document order.
+        java.util.List<PdfBase> entries = new java.util.ArrayList<>();
+        java.util.List<PdfDictionary> dicts = new java.util.ArrayList<>();
+        collectPageLeaves(root, null, null, null, null, entries, dicts,
+                java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
+        int total = dicts.size();
+        if (total == 0) {
+            return;
+        }
+
+        // Build the tree bottom-up: group runs of `fanout` siblings under new
+        // intermediate /Pages nodes until one level fits under the root.
+        java.util.List<PdfBase> levelEntries = entries;
+        java.util.List<PdfDictionary> levelDicts = dicts;
+        java.util.List<Integer> levelCounts = new java.util.ArrayList<>();
+        for (int i = 0; i < total; i++) levelCounts.add(1);
+
+        while (levelEntries.size() > fanout) {
+            java.util.List<PdfBase> nextEntries = new java.util.ArrayList<>();
+            java.util.List<PdfDictionary> nextDicts = new java.util.ArrayList<>();
+            java.util.List<Integer> nextCounts = new java.util.ArrayList<>();
+            for (int start = 0; start < levelEntries.size(); start += fanout) {
+                int end = Math.min(start + fanout, levelEntries.size());
+                PdfDictionary node = new PdfDictionary();
+                node.set(PdfName.TYPE, PdfName.PAGES);
+                PdfArray kids = new PdfArray();
+                int count = 0;
+                for (int i = start; i < end; i++) {
+                    kids.add(levelEntries.get(i));
+                    levelDicts.get(i).set(PdfName.PARENT, node);
+                    count += levelCounts.get(i);
+                }
+                node.set(PdfName.KIDS, kids);
+                node.set(PdfName.COUNT, PdfInteger.valueOf(count));
+                nextEntries.add(node);
+                nextDicts.add(node);
+                nextCounts.add(count);
+            }
+            levelEntries = nextEntries;
+            levelDicts = nextDicts;
+            levelCounts = nextCounts;
+        }
+
+        PdfArray rootKids = new PdfArray();
+        for (int i = 0; i < levelEntries.size(); i++) {
+            rootKids.add(levelEntries.get(i));
+            levelDicts.get(i).set(PdfName.PARENT, root);
+        }
+        root.set(PdfName.KIDS, rootKids);
+        root.set(PdfName.COUNT, PdfInteger.valueOf(total));
+        // Old intermediate nodes are now unreachable and get dropped by the
+        // writer's reachability walk on the next full save.
+    }
+
+    /**
+     * Depth-first collection of leaf page entries for {@link #pageNodesToBalancedTree(byte)}.
+     * Carries inheritable attributes down and materializes them on leaves that
+     * lack their own values (§7.7.3.4), because the old intermediate nodes that
+     * held them are discarded.
+     */
+    private void collectPageLeaves(PdfDictionary node, PdfBase resources, PdfBase mediaBox,
+                                   PdfBase cropBox, PdfBase rotate,
+                                   java.util.List<PdfBase> outEntries,
+                                   java.util.List<PdfDictionary> outDicts,
+                                   java.util.Set<PdfDictionary> visited) throws IOException {
+        if (!visited.add(node)) {
+            return; // cycle guard
+        }
+        PdfBase r = node.get(PdfName.RESOURCES);
+        if (r != null) resources = r;
+        PdfBase mb = node.get(PdfName.MEDIABOX);
+        if (mb != null) mediaBox = mb;
+        PdfBase cb = node.get(PdfName.CROPBOX);
+        if (cb != null) cropBox = cb;
+        PdfBase rot = node.get(PdfName.ROTATE);
+        if (rot != null) rotate = rot;
+
+        PdfArray kids = node.getArray("Kids");
+        if (kids == null) {
+            return;
+        }
+        for (int i = 0; i < kids.size(); i++) {
+            PdfBase entry = kids.get(i);
+            PdfBase resolved = entry instanceof PdfObjectReference
+                    ? ((PdfObjectReference) entry).dereference() : entry;
+            if (!(resolved instanceof PdfDictionary)) {
+                continue;
+            }
+            PdfDictionary kid = (PdfDictionary) resolved;
+            if ("Pages".equals(kid.getType()) || (kid.containsKey("Kids") && !kid.containsKey("Contents"))) {
+                collectPageLeaves(kid, resources, mediaBox, cropBox, rotate, outEntries, outDicts, visited);
+            } else {
+                if (resources != null && !kid.containsKey("Resources")) kid.set(PdfName.RESOURCES, resources);
+                if (mediaBox != null && !kid.containsKey("MediaBox")) kid.set(PdfName.MEDIABOX, mediaBox);
+                if (cropBox != null && !kid.containsKey("CropBox")) kid.set(PdfName.CROPBOX, cropBox);
+                if (rotate != null && !kid.containsKey("Rotate")) kid.set(PdfName.ROTATE, rotate);
+                outEntries.add(entry);
+                outDicts.add(kid);
+            }
+        }
+    }
+
+    /**
      * Gets whether the next save should favour a compact full rewrite
      * (object streams, no orphaned objects) over an incremental append.
      * API-compatible with Aspose's {@code Document.OptimizeSize}.
@@ -1428,6 +1935,57 @@ public class Document implements Closeable {
     public void save(String filePath, SaveFormat format) throws IOException {
         if (format == SaveFormat.Html) {
             save(filePath, new HtmlSaveOptions());
+        } else if (format == SaveFormat.DocX || format == SaveFormat.Doc) {
+            save(filePath, new DocSaveOptions());
+        } else {
+            save(filePath);
+        }
+    }
+
+    /**
+     * Saves the document to a stream in the given format (Aspose.PDF
+     * {@code Document.Save(Stream, SaveFormat)}). {@link SaveFormat#Doc} and
+     * {@link SaveFormat#DocX} both produce an OOXML package (there is no
+     * binary Word 97 serializer).
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param format       the desired output format
+     * @throws IOException if writing fails
+     */
+    public void save(OutputStream outputStream, SaveFormat format) throws IOException {
+        if (format == SaveFormat.Html) {
+            save(outputStream, new HtmlSaveOptions());
+        } else if (format == SaveFormat.DocX || format == SaveFormat.Doc) {
+            save(outputStream, new DocSaveOptions());
+        } else {
+            save(outputStream);
+        }
+    }
+
+    /**
+     * Saves the document to a file in the format determined by the runtime type
+     * of {@code options} — the single, uniform save entry point (Aspose.PDF
+     * {@code Document.save(String, SaveOptions)}). A {@link PdfSaveOptions} writes
+     * a PDF, an {@link HtmlSaveOptions} writes HTML.
+     *
+     * @param filePath the output file path
+     * @param options  the save options; their concrete type selects the format
+     *                 ({@code null} saves a plain PDF)
+     * @throws IOException if writing fails
+     */
+    public void save(String filePath, SaveOptions options) throws IOException {
+        if (options == null) {
+            save(filePath);
+        } else if (options instanceof HtmlSaveOptions) {
+            save(filePath, (HtmlSaveOptions) options);
+        } else if (options instanceof DocSaveOptions) {
+            save(filePath, (DocSaveOptions) options);
+        } else if (options instanceof PdfSaveOptions) {
+            save(filePath, (PdfSaveOptions) options);
+        } else if (options.getSaveFormat() == SaveFormat.Html) {
+            save(filePath, new HtmlSaveOptions());
+        } else if (options.getSaveFormat() == SaveFormat.DocX) {
+            save(filePath, new DocSaveOptions());
         } else {
             save(filePath);
         }
@@ -1549,12 +2107,139 @@ public class Document implements Closeable {
         if (filePath == null) {
             throw new IllegalArgumentException("File path must not be null");
         }
+        java.nio.file.Files.writeString(java.nio.file.Path.of(filePath), htmlText(options),
+                StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Converts the document to HTML markup (IR Stage 3).
+     *
+     * <p>Routing is controlled by {@link HtmlSaveOptions#getOutputMode()}:
+     * {@link HtmlOutputMode#FIXED_LAYOUT} (default) produces the classic
+     * absolutely-positioned visual copy; {@link HtmlOutputMode#STRUCTURAL}
+     * produces semantic HTML (h1..h6/p/ul/ol/table) from the Semantic Document
+     * Model — tagged PDFs use the author's structure tree, untagged PDFs use
+     * geometry heuristics unless {@link HtmlSaveOptions#isStructuralHeuristics()}
+     * is off.</p>
+     */
+    private String htmlText(HtmlSaveOptions options) throws IOException {
         flushDirtyPages();
-        if (options == null) options = new HtmlSaveOptions();
-        PdfToHtmlConverter converter = new PdfToHtmlConverter();
-        String html = converter.convert(this, options);
-        java.nio.file.Files.writeString(java.nio.file.Path.of(filePath), html,
-            StandardCharsets.UTF_8);
+        if (options == null) {
+            options = new HtmlSaveOptions();
+        }
+        if (options.getOutputMode() == HtmlOutputMode.STRUCTURAL) {
+            return org.aspose.pdf.sdm.html.StructuralHtmlPipeline.toHtml(this, options);
+        }
+        return new PdfToHtmlConverter().convert(this, options);
+    }
+
+    /**
+     * Saves the document as Office Open XML ({@code .docx}) with the specified
+     * options (IR structural pipeline).
+     *
+     * @param filePath the output {@code .docx} file path
+     * @param options  DOCX save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(String filePath, DocSaveOptions options) throws IOException {
+        if (filePath == null) {
+            throw new IllegalArgumentException("File path must not be null");
+        }
+        flushDirtyPages();
+        try (FileOutputStream fos = new FileOutputStream(filePath)) {
+            org.aspose.pdf.sdm.docx.StructuralDocxPipeline.toDocx(this, options, fos);
+        }
+    }
+
+    /**
+     * Converts the document to {@code .docx} and writes it to a stream.
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      DOCX save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(OutputStream outputStream, DocSaveOptions options) throws IOException {
+        if (outputStream == null) {
+            throw new IllegalArgumentException("Output stream must not be null");
+        }
+        flushDirtyPages();
+        org.aspose.pdf.sdm.docx.StructuralDocxPipeline.toDocx(this, options, outputStream);
+        outputStream.flush();
+    }
+
+    /**
+     * Saves the document as HTML into a stream. Resources are embedded into
+     * the markup (a stream target has no folder for external parts).
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      HTML save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(OutputStream outputStream, HtmlSaveOptions options) throws IOException {
+        if (outputStream == null) {
+            throw new IllegalArgumentException("Output stream must not be null");
+        }
+        outputStream.write(htmlText(options).getBytes(StandardCharsets.UTF_8));
+        outputStream.flush();
+    }
+
+    /**
+     * Saves the document to a stream with the specified PDF save options,
+     * honouring linearization and object/xref-stream compression (the stream
+     * counterpart of {@link #save(String, PdfSaveOptions)}).
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      PDF save options; {@code null} writes a plain PDF
+     * @throws IOException if writing fails
+     */
+    public void save(OutputStream outputStream, PdfSaveOptions options) throws IOException {
+        if (outputStream == null) {
+            throw new IllegalArgumentException("Output stream must not be null");
+        }
+        flushDirtyPages();
+        if (options != null && options.isLinearize()) {
+            if (parser == null) {
+                throw new IOException("Cannot linearize a new (unparsed) document");
+            }
+            LinearizedPDFWriter writer = new LinearizedPDFWriter();
+            writer.write(outputStream, parser, parser.getTrailer());
+        } else if (options != null && (options.isUseObjectStreams() || options.isUseXRefStream())) {
+            if (parser == null) {
+                throw new IOException("Cannot write compressed: no parser (new document)");
+            }
+            saveCompressed(outputStream, options);
+        } else {
+            save(outputStream);
+        }
+    }
+
+    /**
+     * Saves the document to a stream in the format determined by the runtime type
+     * of {@code options} — the stream counterpart of
+     * {@link #save(String, SaveOptions)} (Aspose.PDF
+     * {@code Document.save(OutputStream, SaveOptions)}).
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      the save options; their concrete type selects the format
+     *                     ({@code null} saves a plain PDF)
+     * @throws IOException if writing fails
+     */
+    public void save(OutputStream outputStream, SaveOptions options) throws IOException {
+        if (options == null) {
+            save(outputStream);
+        } else if (options instanceof HtmlSaveOptions) {
+            save(outputStream, (HtmlSaveOptions) options);
+        } else if (options instanceof DocSaveOptions) {
+            save(outputStream, (DocSaveOptions) options);
+        } else if (options instanceof PdfSaveOptions) {
+            save(outputStream, (PdfSaveOptions) options);
+        } else if (options.getSaveFormat() == SaveFormat.Html) {
+            save(outputStream, new HtmlSaveOptions());
+        } else if (options.getSaveFormat() == SaveFormat.DocX) {
+            save(outputStream, new DocSaveOptions());
+        } else {
+            save(outputStream);
+        }
     }
 
     /**
@@ -3919,6 +4604,16 @@ public void decrypt() throws IOException {
      * @return the PDF format, or null if not converted
      */
     public PdfFormat getPdfFormat() {
+        if (pdfFormat != null) {
+            return pdfFormat;
+        }
+        // A PDF 2.0 document (header 2.0 or catalog /Version /2.0) reports its
+        // format even when never explicitly converted. Earlier versions keep the
+        // historical null-until-converted behaviour (PDF/A inference keys off the
+        // pdfFormat FIELD, which this getter does not mutate).
+        if ("2.0".equals(getVersion())) {
+            return PdfFormat.v_2_0;
+        }
         return pdfFormat;
     }
 
@@ -3951,6 +4646,7 @@ public void decrypt() throws IOException {
         editedPageContentsThisSave = false;
         if (pages == null) return;
         for (Page p : pages) {
+            p.flushPendingParagraphs();
             p.flushPageInfoIfNeeded();
             persistNewLayers(p);
             if (p.isContentsDirty()) {
@@ -4534,5 +5230,70 @@ public void decrypt() throws IOException {
             baos.write(buf, 0, n);
         }
         return baos.toByteArray();
+    }
+
+    /**
+     * Flow compaction (IR Stage 2): closes vertical holes left by deletion or
+     * merge and — by default — lets content flow across page boundaries like
+     * HTML, removing emptied pages. Chrome (headers, footers, page numbers,
+     * watermarks) stays fixed; annotations travel with their content.
+     * <p>
+     * Defaults: {@code verticalGapThreshold}=30pt (corpus-calibrated),
+     * {@code keepPageBreaks}=false, {@code preserveChrome}=true,
+     * {@code mergeColumns}=false (multi-column pages are skipped with a
+     * reason). Known limitation: page-number chrome text is NOT rewritten
+     * after page removal.
+     * </p>
+     *
+     * @param options the options (null = defaults)
+     * @return the result: pages before/after, gaps closed, blocks moved,
+     *         skipped pages with reasons
+     * @throws IOException if page content cannot be read or written
+     */
+    public CompactionResult compactFlow(CompactionOptions options) throws IOException {
+        return org.aspose.pdf.sdm.flow.FlowOperations.compactFlow(this, options);
+    }
+
+    /**
+     * Merges documents into a new one: concatenates all pages, then — when
+     * {@link MergeOptions#isFlowCompaction()} — runs {@link #compactFlow} so
+     * the content of each following document begins right after the previous
+     * one instead of on a fresh page.
+     *
+     * @param docs    the source documents in order
+     * @param options the merge options (null = plain concatenation)
+     * @return the merged document
+     * @throws IOException if pages cannot be imported or compacted
+     */
+    public static Document merge(java.util.List<Document> docs, MergeOptions options)
+            throws IOException {
+        if (docs == null || docs.isEmpty()) {
+            throw new IllegalArgumentException("docs must not be null or empty");
+        }
+        Document target = new Document();
+        for (Document source : docs) {
+            // Normalize the source through a byte round-trip: freshly built
+            // documents hold DIRECT /Contents streams the page importer cannot
+            // clone (it expects parsed, indirect-object documents).
+            ByteArrayOutputStream srcBytes = new ByteArrayOutputStream(1 << 16);
+            source.save(srcBytes);
+            Document normalized = new Document(
+                    new java.io.ByteArrayInputStream(srcBytes.toByteArray()));
+            DocumentPageImporter importer = new DocumentPageImporter(target, normalized);
+            for (int i = 1; i <= normalized.getPages().getCount(); i++) {
+                // importPage clones; the page must still be spliced into the tree.
+                target.getPages().add(importer.importPage(normalized.getPages().get(i)));
+            }
+        }
+        // Round-trip through bytes: imported pages hold indirect objects that a
+        // freshly built in-memory document has no parser to resolve, and the
+        // flow reader (absorbers) needs full resolution.
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream(1 << 16);
+        target.save(buffer);
+        Document merged = new Document(new java.io.ByteArrayInputStream(buffer.toByteArray()));
+        if (options != null && options.isFlowCompaction()) {
+            merged.compactFlow(options.getCompactionOptions());
+        }
+        return merged;
     }
 }

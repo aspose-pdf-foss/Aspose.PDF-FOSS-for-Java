@@ -192,8 +192,16 @@ public class PdfFileStamp implements AutoCloseable {
         // case where stamps are added before any document is bound.
         if (document != null) {
             int pageNumber = stamp.getPageNumber() > 0 ? stamp.getPageNumber() : 0;
+            int[] pages = stamp.getPages();
             try {
-                if (pageNumber > 0 && pageNumber <= document.getPages().getCount()) {
+                if (pages != null && pages.length > 0) {
+                    // Explicit Stamp.Pages set: apply only to those 1-based pages.
+                    for (int p : pages) {
+                        if (p >= 1 && p <= document.getPages().getCount()) {
+                            applyOneStamp(p, coreStamp);
+                        }
+                    }
+                } else if (pageNumber > 0 && pageNumber <= document.getPages().getCount()) {
                     applyOneStamp(pageNumber, coreStamp);
                 } else {
                     for (int i = 1; i <= document.getPages().getCount(); i++) {
@@ -237,6 +245,7 @@ public class PdfFileStamp implements AutoCloseable {
         Stamp stamp = new Stamp();
         stamp.bindLogo(footerText);
         stamp.setOrigin(leftIndent, bottomMargin);
+        stamp.setHorizontalAlignment(org.aspose.pdf.HorizontalAlignment.Center);
         stamp.setPageNumber(0);
         stamp.setStampId(stampId);
         addStamp(stamp);
@@ -271,6 +280,7 @@ public class PdfFileStamp implements AutoCloseable {
         Stamp stamp = new Stamp();
         stamp.bindLogo(headerText);
         stamp.setOrigin(0, resolveHeaderY(topMargin));
+        stamp.setHorizontalAlignment(org.aspose.pdf.HorizontalAlignment.Center);
         stamp.setPageNumber(0);
         stamp.setStampId(stampId);
         addStamp(stamp);
@@ -290,6 +300,7 @@ public class PdfFileStamp implements AutoCloseable {
         Stamp stamp = new Stamp();
         stamp.bindImage(imageFile);
         stamp.setOrigin(0, resolveHeaderY(topMargin));
+        stamp.setHorizontalAlignment(org.aspose.pdf.HorizontalAlignment.Center);
         stamp.setPageNumber(0);
         stamp.setStampId(stampId);
         addStamp(stamp);
@@ -310,6 +321,9 @@ public class PdfFileStamp implements AutoCloseable {
         TextStamp template = new TextStamp(formattedText);
         stamp.setTextState(template.getTextState());
         stamp.setStampId(stampId);
+        // Page numbers are centered along the bottom of the page by default.
+        stamp.setHorizontalAlignment(org.aspose.pdf.HorizontalAlignment.Center);
+        stamp.setVerticalAlignment(org.aspose.pdf.VerticalAlignment.Bottom);
         stamps.add(new PendingStamp(stamp, 0));
     }
 
@@ -485,6 +499,28 @@ public class PdfFileStamp implements AutoCloseable {
                 return;
             }
         }
+        // Page-number stamps: substitute '#'/'$P' with this page's number and the
+        // total, per page. The form XObject is cached per stamp instance, so a
+        // fresh TextStamp is rendered for each page (mutating the shared stamp's
+        // value would reuse the first page's cached form).
+        if (stamp instanceof PageNumberStamp) {
+            PageNumberStamp pns = (PageNumberStamp) stamp;
+            int total = document.getPages().getCount();
+            org.aspose.pdf.TextStamp perPage =
+                    new org.aspose.pdf.TextStamp(pns.formatPageNumber(pageNumber - 1, total));
+            perPage.setTextState(pns.getTextState());
+            perPage.setStampId(pns.getStampId());
+            perPage.setOpacity(pns.getOpacity());
+            perPage.setZoom(pns.getZoom());
+            perPage.setRotate(pns.getRotate());
+            perPage.setHorizontalAlignment(pns.getHorizontalAlignment());
+            perPage.setVerticalAlignment(pns.getVerticalAlignment());
+            perPage.setLeftMargin(pns.getLeftMargin());
+            perPage.setTopMargin(pns.getTopMargin());
+            perPage.setBottomMargin(pns.getBottomMargin());
+            page.addStamp(perPage);
+            return;
+        }
         // Fallback: text/page stamps go through the existing pathway.
         page.addStamp(stamp);
     }
@@ -556,5 +592,7 @@ public class PdfFileStamp implements AutoCloseable {
         coreStamp.setXIndent(facadeStamp.getOriginX());
         coreStamp.setYIndent(facadeStamp.getOriginY());
         coreStamp.setStampId(facadeStamp.getStampId());
+        coreStamp.setHorizontalAlignment(facadeStamp.getHorizontalAlignment());
+        coreStamp.setOpacity(facadeStamp.getOpacity());
     }
 }

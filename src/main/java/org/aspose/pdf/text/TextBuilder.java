@@ -126,12 +126,14 @@ public class TextBuilder {
             write(baos, "q\n");
 
             // Fragment-level background rectangle (covers all segments roughly):
-            // position at fragment Y baseline, width estimated from primary text.
+            // position at fragment Y baseline, width from Standard-14 metrics
+            // when known, height = 1.1 × size (Aspose box: ascender band only).
             if (fragState.getBackgroundColor() != null) {
                 double fragSize = resolveFontSize(fragState);
-                double fragWidth = estimateTextWidth(fragment.getText(), fragSize);
+                double fragWidth = estimateTextWidth(fragment.getText(),
+                        resolveFontName(fragState), fragSize);
                 writeBackgroundRect(baos, fragState.getBackgroundColor(),
-                        fragX, fragY, fragWidth, fragSize * 1.32);
+                        fragX, fragY, fragWidth, fragSize * 1.1);
             }
 
             // Per-segment background rectangles (skip primary if it inherits
@@ -148,8 +150,8 @@ public class TextBuilder {
                 double sx = sp != null ? sp.getXIndent() : fragX;
                 double sy = sp != null ? sp.getYIndent() : fragY;
                 double size = resolveFontSize(segState);
-                double w = estimateTextWidth(seg.getText(), size);
-                writeBackgroundRect(baos, bg, sx, sy, w, size * 1.32);
+                double w = estimateTextWidth(seg.getText(), resolveFontName(segState), size);
+                writeBackgroundRect(baos, bg, sx, sy, w, size * 1.1);
             }
 
             // Now emit one BT…ET for the segments.
@@ -169,8 +171,12 @@ public class TextBuilder {
                 if (segState == null) {
                     segState = fragState;
                 }
-                String fontName = resolveFontName(segState);
-                double fontSize = resolveFontSize(segState);
+                // A segment added without its own font/size inherits the
+                // fragment's state (Aspose semantics), like the color below.
+                String fontName = segState.getFontName() != null
+                        ? resolveFontName(segState) : resolveFontName(fragState);
+                double fontSize = segState.getFontSize() > 0
+                        ? segState.getFontSize() : resolveFontSize(fragState);
                 String segText = seg.getText() != null ? seg.getText() : "";
 
                 // Position: if segment has explicit position use Tm, else for the
@@ -244,7 +250,13 @@ public class TextBuilder {
                 }
 
                 Color fg = segState.getForegroundColor();
-                if (fg == null) fg = fragState.getForegroundColor();
+                // The shared Color.BLACK instance is the TextState ctor default —
+                // a segment that never had a color set inherits the fragment's
+                // (an explicit setForegroundColor(new color) is a different ref).
+                if (fg == null || (fg == Color.BLACK && segState != fragState)) {
+                    Color inherited = fragState.getForegroundColor();
+                    if (inherited != null) fg = inherited;
+                }
                 if (fg != null && fg != currentFg) {
                     writeFillColorRG(baos, fg);
                     currentFg = fg;
@@ -422,7 +434,38 @@ public class TextBuilder {
     }
 
     private static String resolveFontName(TextState s) {
-        return s != null && s.getFontName() != null ? s.getFontName() : "Helvetica";
+        String base = s != null && s.getFontName() != null ? s.getFontName() : "Helvetica";
+        return applyFontStyle(base, s == null ? 0 : s.getFontStyle());
+    }
+
+    /**
+     * Derives the styled font-name variant for a {@link FontStyles} bitmask
+     * (Aspose semantics: {@code textState.setFontStyle(FontStyles.Bold)} on a
+     * by-name font resolves the {@code <name>Bold} face). Bold/Italic suffixes are
+     * concatenated with no separator ("TimesNewRoman" + Bold+Italic →
+     * "TimesNewRomanBoldItalic"), matching how Aspose names style-derived faces.
+     * A zero (Regular) style, or a name that already carries the suffix, is
+     * returned unchanged.
+     *
+     * @param base      the base font name
+     * @param fontStyle the {@link FontStyles} bitmask
+     * @return the styled font name
+     */
+    private static String applyFontStyle(String base, int fontStyle) {
+        if (base == null || fontStyle == 0) {
+            return base;
+        }
+        String suffix = "";
+        if ((fontStyle & FontStyles.Bold) != 0) {
+            suffix += "Bold";
+        }
+        if ((fontStyle & FontStyles.Italic) != 0) {
+            suffix += "Italic";
+        }
+        if (suffix.isEmpty() || base.endsWith(suffix)) {
+            return base;
+        }
+        return base + suffix;
     }
 
     private static double resolveFontSize(TextState s) {
@@ -436,6 +479,44 @@ public class TextBuilder {
      * tolerance suffices; pixel-perfect width would require a real
      * font-metric table (out of scope).
      */
+    /**
+     * Width of {@code text} in points using Standard-14 AFM widths when the
+     * font resolves to one (ISO 32000-1:2008, §9.6.2.2); falls back to the
+     * 0.55 em/char estimate for unknown fonts.
+     */
+    private static double estimateTextWidth(String text, String fontName, double fontSize) {
+        if (text == null || text.isEmpty()) {
+            return 0;
+        }
+        if (fontName != null) {
+            String n = fontName.replace(" ", "");
+            switch (n) {
+                case "TimesNewRoman": n = "Times-Roman"; break;
+                case "CourierNew":    n = "Courier"; break;
+                case "Arial":         n = "Helvetica"; break;
+                default: break;
+            }
+            int[] widths = org.aspose.pdf.engine.font.StandardFonts.getWidths(n);
+            if (widths != null) {
+                long sum = 0;
+                boolean allKnown = true;
+                for (int i = 0; i < text.length(); i++) {
+                    char c = text.charAt(i);
+                    int w = c < widths.length ? widths[c] : 0;
+                    if (w <= 0) {
+                        allKnown = false;
+                        break;
+                    }
+                    sum += w;
+                }
+                if (allKnown) {
+                    return sum / 1000.0 * fontSize;
+                }
+            }
+        }
+        return estimateTextWidth(text, fontSize);
+    }
+
     private static double estimateTextWidth(String text, double fontSize) {
         if (text == null || text.isEmpty()) return 0;
         // Average advance ≈ 0.55 em across mixed-width sans-serif text.
@@ -492,7 +573,131 @@ public class TextBuilder {
         if (paragraph == null) {
             throw new IllegalArgumentException("TextParagraph must not be null");
         }
+        // The paragraph stays "live" until the document is saved: properties
+        // set after appendParagraph (rectangle, background color, extra lines)
+        // still take effect, matching Aspose.PDF attached-paragraph semantics.
+        // Document.save → Page.flushPendingParagraphs → flushParagraph(...).
+        page.queueParagraph(paragraph);
+    }
 
+    /** Default font for paragraph lines without an explicit state (TextStamp.DefaultFont). */
+    private static final String PARAGRAPH_DEFAULT_FONT = "Helvetica";
+    /** Default font size for paragraph lines without an explicit state. */
+    private static final double PARAGRAPH_DEFAULT_SIZE = 10;
+    /** Leading factor of the padded paragraph background rectangle. */
+    private static final double PARAGRAPH_BG_LEADING = 1.16;
+
+    /**
+     * Renders a queued paragraph into the page content stream. Invoked from
+     * the save path ({@link org.aspose.pdf.Page} flushes its pending
+     * paragraphs); not intended for direct client use.
+     *
+     * @param paragraph the paragraph to render now
+     */
+    public void flushParagraph(TextParagraph paragraph) {
+        if (paragraph == null) {
+            return;
+        }
+        if (paragraph.getRectangle() != null) {
+            renderRectangleParagraph(paragraph);
+            return;
+        }
+        renderPositionedParagraph(paragraph);
+    }
+
+    /**
+     * Rectangle-bound paragraph layout (Aspose semantics, validated against
+     * the C# Add_Paragraph_* regression tests): lines stack UP from the
+     * rectangle bottom — the last line's baseline sits at LLY and each line
+     * above it is offset by the font size of the line below. A background
+     * color paints two rectangles anchored at the bottom-left corner: one of
+     * exactly the summed line heights and one padded by the leading factor.
+     */
+    private void renderRectangleParagraph(TextParagraph paragraph) {
+        List<TextFragment> lines = paragraph.getLinesList();
+        if (lines.isEmpty()) {
+            return;
+        }
+        org.aspose.pdf.Rectangle rect = paragraph.getRectangle();
+        double x = rect.getLLX();
+        double width = rect.getURX() - rect.getLLX();
+
+        int n = lines.size();
+        String[] fonts = new String[n];
+        double[] sizes = new double[n];
+        double totalHeight = 0;
+        for (int i = 0; i < n; i++) {
+            TextState state = lines.get(i).getTextState();
+            fonts[i] = state != null && state.getFontName() != null
+                    ? state.getFontName() : PARAGRAPH_DEFAULT_FONT;
+            sizes[i] = state != null && state.getFontSize() > 0
+                    ? state.getFontSize() : PARAGRAPH_DEFAULT_SIZE;
+            totalHeight += sizes[i];
+        }
+        // Line BOTTOMS stack up from the rectangle bottom: the last line's
+        // bottom sits at LLY, each previous line raised by the size of the
+        // line below it. Aspose reports Position.YIndent as the glyph-box
+        // bottom (descent included), so the C# asserts (650/675/690 in
+        // Add_Paragraph_NoWrap3) are bottoms — the emitted Tm BASELINE sits a
+        // descent (0.2 em, the extractor's default) above each bottom.
+        double[] bottoms = new double[n];
+        bottoms[n - 1] = rect.getLLY();
+        for (int i = n - 2; i >= 0; i--) {
+            bottoms[i] = bottoms[i + 1] + sizes[i + 1];
+        }
+        double[] baselines = new double[n];
+        for (int i = 0; i < n; i++) {
+            baselines[i] = bottoms[i] + sizes[i] * 0.2;
+        }
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream(256);
+        try {
+            write(baos, "q\n");
+            if (paragraph.getBackgroundColor() != null && totalHeight > 0) {
+                Color bg = paragraph.getBackgroundColor();
+                writeFillColorRG(baos, bg);
+                write(baos, formatNumber(x) + " " + formatNumber(rect.getLLY()) + " "
+                        + formatNumber(width) + " " + formatNumber(totalHeight) + " re\nf\n");
+                write(baos, formatNumber(x) + " " + formatNumber(rect.getLLY()) + " "
+                        + formatNumber(width) + " " + formatNumber(totalHeight * PARAGRAPH_BG_LEADING)
+                        + " re\nf\n");
+            }
+            write(baos, "BT\n");
+            String currentFont = null;
+            double currentSize = -1;
+            Color currentFg = null;
+            for (int i = 0; i < n; i++) {
+                if (!fonts[i].equals(currentFont) || sizes[i] != currentSize) {
+                    String resourceName = registerFont(fonts[i]);
+                    write(baos, "/" + resourceName + " " + formatNumber(sizes[i]) + " Tf\n");
+                    currentFont = fonts[i];
+                    currentSize = sizes[i];
+                }
+                TextState state = lines.get(i).getTextState();
+                Color fg = state != null ? state.getForegroundColor() : null;
+                if (fg != null && fg != currentFg) {
+                    writeFillColorRG(baos, fg);
+                    currentFg = fg;
+                }
+                write(baos, "1 0 0 1 " + formatNumber(x) + " "
+                        + formatNumber(baselines[i]) + " Tm\n");
+                write(baos, "(" + escapePdfString(lines.get(i).getText()) + ") Tj\n");
+            }
+            write(baos, "ET\n");
+            write(baos, "Q\n");
+        } catch (IOException e) {
+            throw new RuntimeException("Unexpected I/O error building content stream", e);
+        }
+        page.appendToContentStream(baos.toByteArray());
+        LOG.fine(() -> "Rendered rectangle paragraph with " + lines.size() + " line(s)");
+    }
+
+    /**
+     * Position-based paragraph layout: first line at the paragraph position,
+     * each following line moved down by line spacing × font size (historical
+     * behaviour, kept for paragraphs without a bounding rectangle).
+     */
+    private void renderPositionedParagraph(TextParagraph paragraph) {
         List<TextFragment> lines = paragraph.getLinesList();
         if (lines.isEmpty()) {
             return;
@@ -548,7 +753,11 @@ public class TextBuilder {
      * @param fontName the base font name (e.g., "Helvetica", "Times-Roman")
      * @return the resource name (e.g., "F1", "F2") used to reference this font in the content stream
      */
-    private String registerFont(String fontName) {
+    private String registerFont(String rawFontName) {
+        // PDF BaseFont names carry no spaces ("Courier New" is authored as
+        // /CourierNew); Aspose round-trips the spaceless form, and reopened
+        // documents report it via /BaseFont.
+        final String fontName = rawFontName.replace(" ", "");
         Resources resources = page.ensureResources();
         PdfDictionary resDict = resources.getPdfDictionary();
 

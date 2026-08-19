@@ -94,6 +94,36 @@ public class ParserRecoveryTest {
         }
     }
 
+    /**
+     * Some producers omit {@code /Type /Catalog} on the root object entirely
+     * (corpus PdfForm5.pdf: {@code 1 0 obj <</Pages 3 0 R /AcroForm ...>>}).
+     * Acrobat accepts such roots; the parser must too when the dictionary has
+     * a /Pages entry and no conflicting /Type.
+     */
+    @Test
+    public void acceptsCatalogWithoutTypeEntry() throws Exception {
+        StringBuilder body = new StringBuilder();
+        body.append("%PDF-1.4\n");
+        int catalogPos = body.length();
+        body.append("1 0 obj\n<< /Pages 2 0 R >>\nendobj\n");
+        int pagesPos = body.length();
+        body.append("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+        int pagePos = body.length();
+        body.append("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n");
+        int xrefPos = body.length();
+        body.append("xref\n0 4\n0000000000 65535 f \n")
+            .append(pad10(catalogPos)).append(" 00000 n \n")
+            .append(pad10(pagesPos)).append(" 00000 n \n")
+            .append(pad10(pagePos)).append(" 00000 n \n")
+            .append("trailer << /Size 4 /Root 1 0 R >>\nstartxref\n")
+            .append(xrefPos).append("\n%%EOF\n");
+        byte[] pdf = body.toString().getBytes(StandardCharsets.ISO_8859_1);
+        try (Document doc = new Document(new ByteArrayInputStream(pdf))) {
+            assertEquals(1, doc.getPages().getCount(),
+                    "typeless catalog with /Pages must open without recovery");
+        }
+    }
+
     private static String pad10(int n) {
         StringBuilder s = new StringBuilder(Integer.toString(n));
         while (s.length() < 10) s.insert(0, '0');

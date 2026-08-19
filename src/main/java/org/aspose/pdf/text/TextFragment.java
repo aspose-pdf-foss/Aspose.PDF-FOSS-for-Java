@@ -67,6 +67,11 @@ public class TextFragment extends BaseParagraph {
     // TJ adjustment keeps following text in place. May be null.
     private PdfFont sourceFont;
 
+    // Lazily-built char->code inverse of the simple source font's decode
+    // pipeline, used to re-encode replacement text into a subset font's own
+    // code space. See buildSimpleReverseMap().
+    private transient java.util.Map<Character, Integer> simpleReverseMap;
+
     // Raw /Tf operand size of the source show operator. TextState.getFontSize()
     // reports the EFFECTIVE size (Tf × Tm scale, matching Aspose), but content-
     // stream math — the TJ compensation in replaceTextOp — works in unscaled
@@ -98,6 +103,11 @@ public class TextFragment extends BaseParagraph {
     private int sourceTextLength = -1;
     private OperatorCollection sourceOperators;
     private PdfStream sourceContentStream;
+    // The /Resources dictionary that governs the source content stream (the page's
+    // resources, or a Form XObject's own resources when the text is drawn inside a
+    // form). Font replacement registers the new font here so the edited stream can
+    // resolve it. Null when unknown (falls back to the page resources).
+    private org.aspose.pdf.engine.pdfobjects.PdfDictionary sourceResources;
     private TextReplaceOptions textReplaceOptions;
     // Underline path operators detected in the source content (each group = one
     // underline subpath: re/m/l constructing ops + the f/S paint op). Removed from
@@ -105,6 +115,11 @@ public class TextFragment extends BaseParagraph {
     // TextEditOptions.ToAttemptGetUnderlineFromSource).
     private java.util.List<java.util.List<Operator>> sourceUnderlineOpGroups;
     private OperatorCollection sourceUnderlineCollection;
+    // Background-rectangle write-back state (see applyBackgroundToSource): the
+    // operators inserted for the last background colour, so a repeated
+    // set-background call (setBackgroundColor fires once per shared-state segment)
+    // is idempotent — the prior rectangles are removed before the new set.
+    private final java.util.List<Operator> backgroundInsertedOps = new ArrayList<>();
 
     /**
      * Creates a TextFragment with the given text.
@@ -131,6 +146,18 @@ public class TextFragment extends BaseParagraph {
      * @return the text
      */
     public String getText() {
+        // Aspose semantics: TextFragment.Text is the concatenation of its
+        // segments' texts (segments are the source of truth). Mutating a
+        // segment's text or adding a segment is therefore reflected here without
+        // an explicit fragment-level setText. Fall back to the stored text only
+        // when there are no segments yet.
+        if (segments != null && !segments.isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            for (TextSegment s : segments) {
+                if (s.getText() != null) sb.append(s.getText());
+            }
+            return sb.toString();
+        }
         return text;
     }
 
@@ -168,7 +195,13 @@ public class TextFragment extends BaseParagraph {
             segments.add(new TextSegment(value));
             return;
         }
+        // Aspose: setting the fragment text collapses it to a SINGLE segment —
+        // the primary segment's text is replaced and any extra segments are
+        // removed (its own style/state is preserved).
         segments.get(0).setText(value);
+        while (segments.size() > 1) {
+            segments.remove(segments.size() - 1);
+        }
     }
 
     private void replaceWithWholeWordsHyphenation(String oldText, String newText) throws IOException {
@@ -336,11 +369,24 @@ public class TextFragment extends BaseParagraph {
         if (!mutated && last == sourceOperatorIndex && sourceTextLength >= 0) {
             mutated = replaceTextInSingleOp(ops, sourceOperatorIndex, oldText, newText);
         }
+        // When the fragment spans several adjacent text-show ops, replace only
+        // the covered sub-range (tracked by sourceTextStart/Length in code
+        // units) so text SHARING the first or last op — but outside the
+        // fragment — is preserved. A subset simple font uses 1 byte per code,
+        // so the char offsets line up with the raw payload bytes (PDFNET_59698:
+        // clearing whole trailing ops wiped the sentence after a replaced date).
+        boolean crossHandled = false;
+        if (!mutated && last > sourceOperatorIndex
+                && (sourceFont == null || !sourceFont.isComposite())
+                && sourceTextStart >= 0 && sourceTextLength >= 0) {
+            mutated = replaceAcrossOperators(ops, sourceOperatorIndex, last, newText);
+            crossHandled = mutated;
+        }
         if (!mutated) {
             mutated = replaceTextOp(ops, sourceOperatorIndex, newText);
         }
 
-        if (last > sourceOperatorIndex && last < ops.size()) {
+        if (!crossHandled && last > sourceOperatorIndex && last < ops.size()) {
             for (int i = sourceOperatorIndex + 1; i <= last; i++) {
                 if (clearTextOp(ops, i)) {
                     mutated = true;
@@ -368,6 +414,434 @@ public class TextFragment extends BaseParagraph {
                 sourceContentStream.setDecodedData(serializeOperators(ops));
             } else if (page != null) {
                 page.markContentsDirty();
+            }
+        }
+    }
+
+    /**
+     * Paints a filled background rectangle behind each of this fragment's
+     * segments in the source content stream (Aspose semantics: setting
+     * {@code segment.getTextState().setBackgroundColor(c)} on an absorbed
+     * fragment tints the text's background, surviving save/reload — the
+     * {@code TextPositioning}/{@code Change_BackgroundColor} regression family).
+     *
+     * <p>All segments of an absorbed fragment share one {@link TextState}, so
+     * this is invoked once per segment with the same colour; it is idempotent —
+     * the operators inserted by a previous call for this fragment are removed
+     * before the current set is inserted. One {@code q rg re f Q} group is
+     * emitted per segment box (or the whole-fragment box when there are no
+     * segment rectangles) at the front of the stream, so the fill sits behind
+     * the glyphs and outside any {@code BT}/{@code ET} text object (path-painting
+     * operators are illegal inside a text object, §9.4.1). Coordinates are the
+     * segment rectangles in page space, matching the extractor's geometry.</p>
+     *
+     * @param color the background colour (ignored when null)
+     */
+    void applyBackgroundToSource(org.aspose.pdf.Color color) {
+        if (color == null) {
+            return;
+        }
+        try {
+            OperatorCollection ops = sourceOperators != null
+                    ? sourceOperators
+                    : page != null ? page.getContents() : null;
+            if (ops == null) {
+                return;
+            }
+            // Idempotency: drop any rectangles a prior call inserted for this
+            // fragment (setBackgroundColor fires once per shared-state segment).
+            if (!backgroundInsertedOps.isEmpty()) {
+                for (Operator inserted : backgroundInsertedOps) {
+                    int at = indexOfByIdentity(ops, inserted);
+                    if (at >= 0) {
+                        // indexOfByIdentity is 0-based (pairs with getAt/addAt), so
+                        // remove with the 0-based removeAt — NOT the 1-based delete,
+                        // which threw for at==0 and otherwise dropped the wrong operator.
+                        ops.removeAt(at);
+                    }
+                }
+                backgroundInsertedOps.clear();
+            }
+            // Collect the boxes to tint: one per segment that carries a rectangle,
+            // else the whole-fragment rectangle.
+            java.util.List<Rectangle> boxes = new ArrayList<>();
+            for (TextSegment seg : segments) {
+                Rectangle r = seg.getRectangle();
+                if (r != null) {
+                    boxes.add(r);
+                }
+            }
+            if (boxes.isEmpty()) {
+                Rectangle r = getRectangle();
+                if (r != null) {
+                    boxes.add(r);
+                }
+            }
+            if (boxes.isEmpty()) {
+                return;
+            }
+            double red = color.getR();
+            double green = color.getG();
+            double blue = color.getB();
+            // The extractor reports segment boxes in PAGE space, but the fill must
+            // be expressed in the USER space active at the fragment's text (the page
+            // content may set a base CTM — e.g. a 0.05 scale + Y translate — so the
+            // glyphs' raw coordinates are ~20x the page coordinates). Recover that
+            // CTM by replaying q/Q/cm up to the fragment's show operator, wrap the
+            // fill in a matching `cm`, and convert each page box back to user space
+            // (box_user = box_page × CTM⁻¹) so the painted rectangle lands exactly
+            // behind the glyphs regardless of the page transform.
+            org.aspose.pdf.Matrix ctm = computeCtmAt(ops, currentSourceIndex(ops));
+            org.aspose.pdf.Matrix ctmInv;
+            try {
+                ctmInv = ctm.reverse();
+            } catch (RuntimeException singular) {
+                ctmInv = new org.aspose.pdf.Matrix(); // degenerate CTM — fall back to identity
+                ctm = new org.aspose.pdf.Matrix();
+            }
+            // Insert at the front so the fill is drawn first (behind the text).
+            int insertAt = 0;
+            for (Rectangle box : boxes) {
+                double[] ll = ctmInv.transformPoint(box.getLLX(), box.getLLY());
+                double[] ur = ctmInv.transformPoint(box.getLLX() + box.getWidth(),
+                        box.getLLY() + box.getHeight());
+                // A Y-flipping base CTM (d < 0, common) maps the box to (top,
+                // negative-height); normalise to a bottom-left origin with positive
+                // extents so the emitted rectangle matches the conventional form.
+                double rx = Math.min(ll[0], ur[0]);
+                double ry = Math.min(ll[1], ur[1]);
+                double rw = Math.abs(ur[0] - ll[0]);
+                double rh = Math.abs(ur[1] - ll[1]);
+                Operator gs = new org.aspose.pdf.operators.GSave();
+                Operator cm = new org.aspose.pdf.operators.ConcatenateMatrix(ctm);
+                Operator rg = new org.aspose.pdf.operators.SetRGBColor(red, green, blue);
+                Operator re = new org.aspose.pdf.operators.Re(rx, ry, rw, rh);
+                Operator fill = new org.aspose.pdf.operators.Fill();
+                Operator gr = new org.aspose.pdf.operators.GRestore();
+                ops.addAt(insertAt++, gs);
+                ops.addAt(insertAt++, cm);
+                ops.addAt(insertAt++, rg);
+                ops.addAt(insertAt++, re);
+                ops.addAt(insertAt++, fill);
+                ops.addAt(insertAt++, gr);
+                Collections.addAll(backgroundInsertedOps, gs, cm, rg, re, fill, gr);
+            }
+            if (sourceContentStream != null) {
+                sourceContentStream.setDecodedData(serializeOperators(ops));
+            } else if (page != null) {
+                page.markContentsDirty();
+            }
+        } catch (IOException e) {
+            LOG.warning("Failed to write background colour back to content stream: " + e.getMessage());
+        }
+    }
+
+    /** Current index of this fragment's source show operator (identity-refreshed), or 0. */
+    private int currentSourceIndex(OperatorCollection ops) {
+        int idx = sourceOperatorIndex;
+        if (sourceOperator != null) {
+            int refreshed = indexOfByIdentity(ops, sourceOperator);
+            if (refreshed >= 0) {
+                idx = refreshed;
+            }
+        }
+        return idx < 0 ? 0 : Math.min(idx, ops.size());
+    }
+
+    /**
+     * Replays the graphics-state operators from the start of {@code ops} up to
+     * {@code targetIndex} and returns the current transformation matrix in effect
+     * there — the product of every {@code cm} honouring {@code q}/{@code Q}
+     * save/restore nesting. Text objects cannot contain {@code cm} (§9.4.1), so
+     * the CTM at the fragment's show operator equals the CTM at its enclosing
+     * {@code BT}. Returns identity when nothing transforms the space.
+     */
+    private static org.aspose.pdf.Matrix computeCtmAt(OperatorCollection ops, int targetIndex) {
+        org.aspose.pdf.Matrix ctm = new org.aspose.pdf.Matrix();
+        java.util.Deque<org.aspose.pdf.Matrix> stack = new java.util.ArrayDeque<>();
+        int end = Math.min(targetIndex, ops.size());
+        for (int i = 0; i < end; i++) {
+            Operator op = ops.getAt(i);
+            if (op instanceof org.aspose.pdf.operators.GSave) {
+                stack.push(ctm);
+            } else if (op instanceof org.aspose.pdf.operators.GRestore) {
+                if (!stack.isEmpty()) {
+                    ctm = stack.pop();
+                }
+            } else if (op instanceof org.aspose.pdf.operators.ConcatenateMatrix) {
+                // `cm M` sets CTM ← M · CTM (M applied to coordinates first).
+                ctm = ((org.aspose.pdf.operators.ConcatenateMatrix) op).getMatrix().multiply(ctm);
+            }
+        }
+        return ctm;
+    }
+
+    /**
+     * Writes a changed font size back into the source content stream
+     * (PDFNEWNET-30639: {@code absorbedFragment.getTextState().setFontSize(5)}
+     * must survive save/reload). The governing operator is found by walking
+     * back from the text-show op inside its BT block (§9.4.2 — text state
+     * persists): a {@code Tm} whose glyph scale carries the effective size is
+     * rescaled; otherwise the nearest {@code Tf}'s size operand is replaced.
+     *
+     * @param newSize the new font size in points (ignored if not positive)
+     */
+    void applyFontSizeToSource(double newSize) {
+        if (newSize <= 0 || sourceOperatorIndex < 0) {
+            return;
+        }
+        try {
+            OperatorCollection ops = sourceOperators != null
+                    ? sourceOperators
+                    : page != null ? page.getContents() : null;
+            if (ops == null) {
+                return;
+            }
+            int idx = sourceOperatorIndex;
+            if (sourceOperator != null) {
+                int refreshed = indexOfByIdentity(ops, sourceOperator);
+                if (refreshed >= 0) idx = refreshed;
+            }
+            if (idx < 0 || idx >= ops.size()) {
+                return;
+            }
+            boolean mutated = false;
+            for (int i = idx - 1; i >= 0; i--) {
+                Operator op = ops.getAt(i);
+                if (op instanceof org.aspose.pdf.operators.BT) {
+                    break;
+                }
+                if (op instanceof org.aspose.pdf.operators.SetTextMatrix) {
+                    org.aspose.pdf.Matrix m = ((org.aspose.pdf.operators.SetTextMatrix) op).getMatrix();
+                    double glyphScale = Math.hypot(m.getC(), m.getD());
+                    if (glyphScale > 1e-9 && Math.abs(glyphScale - 1.0) > 1e-9) {
+                        double tf = sourceTfSize > 0 ? sourceTfSize : 1.0;
+                        if (Math.abs(newSize - tf * glyphScale) < 1e-6) {
+                            break; // already at this size — no rewrite
+                        }
+                        double factor = newSize / (tf * glyphScale);
+                        ops.setAt(i, new org.aspose.pdf.operators.SetTextMatrix(new org.aspose.pdf.Matrix(
+                                m.getA() * factor, m.getB() * factor,
+                                m.getC() * factor, m.getD() * factor,
+                                m.getE(), m.getF())));
+                        mutated = true;
+                        break;
+                    }
+                    // identity glyph scale — the size lives in Tf; keep walking
+                } else if (op instanceof org.aspose.pdf.operators.SelectFont) {
+                    org.aspose.pdf.operators.SelectFont tf = (org.aspose.pdf.operators.SelectFont) op;
+                    if (Math.abs(tf.getSize() - newSize) < 1e-6) {
+                        break; // already at this size — no rewrite
+                    }
+                    ops.setAt(i, new org.aspose.pdf.operators.SelectFont(tf.getFontName(), newSize));
+                    mutated = true;
+                    break;
+                }
+            }
+            if (mutated) {
+                if (sourceContentStream != null) {
+                    sourceContentStream.setDecodedData(serializeOperators(ops));
+                } else if (page != null) {
+                    page.markContentsDirty();
+                }
+            }
+        } catch (IOException e) {
+            LOG.warning("Failed to write font size back to content stream: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Re-draws this fragment's glyphs with {@code newFont} in the source content
+     * stream (Aspose semantics: {@code absorbedFragment.getTextState().setFont(f)}
+     * must survive save/reload). Only handles an embeddable TrueType {@code Font}
+     * (non-null {@link org.aspose.pdf.text.Font#getFontData()}); Standard-14
+     * replacements carry no bytes and keep the legacy by-name behaviour.
+     * <p>
+     * Steps: (1) build/reuse an embedded Type0 (Identity-H, {@code /FontFile2})
+     * resource on the page via {@link org.aspose.pdf.engine.font.ttf.Type0FontBuilder};
+     * (2) re-encode the governing show operator's text to 2-byte glyph indices;
+     * (3) bracket that operator with a {@code Tf} selecting the new resource and a
+     * {@code Tf} restoring the previous font so surrounding text is untouched.
+     *
+     * @param newFont the replacement font (must carry TrueType bytes)
+     */
+    void applyFontToSource(org.aspose.pdf.text.Font newFont) {
+        if (newFont == null || sourceOperatorIndex < 0 || page == null) {
+            return;
+        }
+        byte[] ttf = newFont.getFontData();
+        if (ttf == null || ttf.length == 0) {
+            return;
+        }
+        // Aspose parity: assigning an embeddable font to an absorbed fragment
+        // "becomes embedded by default" (embedded + subset). Set these on the
+        // Font object so a pre-save getFont().isEmbedded()/isSubset() reflects it;
+        // callers may still flip them afterwards (e.g. setSubset(false)). This is
+        // scoped to the write-back path so it does not affect the generation path.
+        newFont.setEmbedded(true);
+        newFont.setSubset(true);
+        try {
+            OperatorCollection ops = sourceOperators != null
+                    ? sourceOperators
+                    : page.getContents();
+            if (ops == null) {
+                return;
+            }
+            int idx = sourceOperatorIndex;
+            if (sourceOperator != null) {
+                int refreshed = indexOfByIdentity(ops, sourceOperator);
+                if (refreshed >= 0) idx = refreshed;
+            }
+            if (idx < 0 || idx >= ops.size()) {
+                return;
+            }
+            Operator showOp = ops.getAt(idx);
+            String opText = getOpText(showOp);
+            if (opText == null || opText.isEmpty()) {
+                return;
+            }
+
+            // The governing font-selection op currently in scope (walk back within
+            // the enclosing text object). We restore it after our glyphs.
+            SelectFont governing = null;
+            for (int i = idx - 1; i >= 0; i--) {
+                Operator op = ops.getAt(i);
+                if (op instanceof SelectFont) { governing = (SelectFont) op; break; }
+                if (op instanceof BT || op instanceof ET) { break; }
+            }
+            double size = governing != null ? governing.getSize()
+                    : (sourceTfSize > 0 ? sourceTfSize : getTextState().getFontSize());
+            if (size <= 0) size = 1.0;
+
+            // Register (or reuse) the embedded font on the page and parse a reader
+            // for Unicode -> glyph-id encoding.
+            org.aspose.pdf.engine.font.ttf.TrueTypeReader reader =
+                    new org.aspose.pdf.engine.font.ttf.TrueTypeReader(ttf);
+            String resName = registerEmbeddedFontOnPage(newFont, ttf);
+            if (resName == null) {
+                return;
+            }
+
+            // Re-encode this operator's text as Identity-H glyph indices.
+            byte[] gidBytes = encodeAsGlyphIndices(opText, reader);
+            List<PdfBase> operand = new ArrayList<>(1);
+            operand.add(new PdfString(gidBytes));
+            ops.setAt(idx, new ShowText(operand));
+            // Bracket with Tf(new)…Tf(restore). Insert the restore first so the
+            // earlier insertion's index shift does not disturb it.
+            if (governing != null) {
+                ops.addAt(idx + 1, new SelectFont(governing.getFontName(), governing.getSize()));
+            }
+            ops.addAt(idx, new SelectFont(resName, size));
+
+            if (sourceContentStream != null) {
+                sourceContentStream.setDecodedData(serializeOperators(ops));
+            } else {
+                page.markContentsDirty();
+            }
+            // A new font resource + rewritten content stream must survive reload.
+            // An incremental append of a modified (form) content stream is not
+            // reliably resolved on reopen (the appended xref entry can be shadowed
+            // by the original), so force a full rewrite — it deduplicates objects
+            // and serialises the in-memory edits cleanly.
+            if (page.getOwningDocument() != null) {
+                page.getOwningDocument().requestFullRewrite();
+            }
+        } catch (Exception e) {
+            LOG.warning("Failed to write font change back to content stream: " + e.getMessage());
+        }
+    }
+
+    /** Encodes {@code text} as big-endian 2-byte glyph indices via the font's cmap. */
+    private static byte[] encodeAsGlyphIndices(String text,
+            org.aspose.pdf.engine.font.ttf.TrueTypeReader reader) {
+        byte[] out = new byte[text.length() * 2];
+        for (int i = 0; i < text.length(); i++) {
+            int gid = reader.getGlyphId(text.charAt(i));
+            out[2 * i] = (byte) (gid >>> 8);
+            out[2 * i + 1] = (byte) gid;
+        }
+        return out;
+    }
+
+    /**
+     * Adds an embedded Type0 font built from {@code ttf} to this page's
+     * {@code /Resources/Font}, returning its resource name. If a matching
+     * embedded font (same {@code /BaseFont}) is already present it is reused so
+     * repeated replacements do not bloat the resources.
+     *
+     * @return the resource name (e.g. {@code "FT0"}), or null on failure
+     */
+    private String registerEmbeddedFontOnPage(org.aspose.pdf.text.Font newFont, byte[] ttf) {
+        try {
+            // Register in the resources that govern the edited stream — a Form
+            // XObject's own /Resources when the text lives inside a form, else
+            // the page resources. Adding to the page would leave /FTn undefined
+            // in the form and break both rendering and extraction.
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict = sourceResources;
+            if (resDict == null) {
+                org.aspose.pdf.Resources pr = page.getResources();
+                if (pr == null) return null;
+                resDict = pr.getPdfDictionary();
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfBase fb = resDict.get("Font");
+            if (fb instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+                try { fb = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) fb).dereference(); }
+                catch (Exception ignore) { fb = null; }
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts =
+                    fb instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary
+                            ? (org.aspose.pdf.engine.pdfobjects.PdfDictionary) fb : null;
+            if (fonts == null) {
+                fonts = new org.aspose.pdf.engine.pdfobjects.PdfDictionary();
+                resDict.set(PdfName.of("Font"), fonts);
+            }
+            String rawName = newFont.getName() != null ? newFont.getName() : "EmbeddedFont";
+            String baseName = rawName.replaceAll("\\s+", "");
+            // A subset-marked font gets the conventional 6-letter "+"-suffixed tag
+            // on its /BaseFont so a reload reports getFont().isSubset() == true
+            // (Aspose subsets embedded fonts by default).
+            if (newFont.isSubset()) {
+                baseName = "AAAAAA+" + baseName;
+            }
+
+            // Reuse an already-registered embedded copy of the same font.
+            for (PdfName key : fonts.keySet()) {
+                PdfBase v = fonts.get(key);
+                org.aspose.pdf.engine.pdfobjects.PdfDictionary fd = asDict(v);
+                if (fd != null && baseName.equals(fd.getNameAsString("BaseFont"))
+                        && "Type0".equals(fd.getNameAsString("Subtype"))) {
+                    return key.getName();
+                }
+            }
+
+            org.aspose.pdf.engine.font.ttf.Type0FontBuilder.Result built =
+                    org.aspose.pdf.engine.font.ttf.Type0FontBuilder.buildLatin(baseName, ttf);
+            String resName = freshFontResourceName(fonts);
+            fonts.set(PdfName.of(resName), built.type0Font);
+            return resName;
+        } catch (Exception e) {
+            LOG.warning("Failed to register embedded font on page: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /** Dereferences {@code v} to a dictionary if possible, else null. */
+    private static org.aspose.pdf.engine.pdfobjects.PdfDictionary asDict(PdfBase v) {
+        if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+            try { v = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) v).dereference(); }
+            catch (Exception e) { return null; }
+        }
+        return v instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary
+                ? (org.aspose.pdf.engine.pdfobjects.PdfDictionary) v : null;
+    }
+
+    /** Returns a font resource name not already present in {@code fonts}. */
+    private static String freshFontResourceName(org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts) {
+        for (int i = 0; ; i++) {
+            String name = "FT" + i;
+            if (fonts.get(PdfName.of(name)) == null) {
+                return name;
             }
         }
     }
@@ -443,6 +917,142 @@ public class TextFragment extends BaseParagraph {
                 + newText
                 + currentText.substring(start + oldText.length());
         return replaceTextOp(ops, idx, replaced);
+    }
+
+    /**
+     * Replaces the fragment's text when it spans several adjacent text-show
+     * operators (kerning-split {@code Tj}/{@code TJ} interleaved with
+     * {@code Tm}/{@code Tc}). Only the codes actually covered by the fragment —
+     * the half-open code range {@code [sourceTextStart, sourceTextStart +
+     * sourceTextLength)} measured over the concatenated raw payloads of the
+     * text-show ops in {@code [first, last]} — are replaced. The insertion text
+     * lands in the first covered op; codes before/after the fragment inside the
+     * boundary ops (and any ops outside the covered range entirely) are kept
+     * verbatim.
+     * <p>
+     * Restricted to simple (single-byte) fonts by the caller: their code space
+     * is one byte per glyph, so char offsets align with raw payload byte
+     * offsets. The raw code bytes of the kept prefix/suffix are spliced in
+     * unchanged; only the replacement text is re-encoded through the font.
+     */
+    private boolean replaceAcrossOperators(OperatorCollection ops, int first, int last, String newText) {
+        int fs = sourceTextStart;
+        int fe = sourceTextStart + sourceTextLength;
+        byte[] mid = encodeReplacementText(newText).getBytes();
+        boolean insertedNew = false;
+        boolean mutated = false;
+        int cum = 0;
+        for (int i = first; i <= last && i < ops.size(); i++) {
+            byte[] raw = rawOpBytes(ops.getAt(i));
+            if (raw == null) {
+                // Non-text op (Tm/Tc/Tf/...): contributes no codes, keep as-is.
+                continue;
+            }
+            int g0 = cum;
+            int g1 = cum + raw.length;
+            cum = g1;
+            int os = Math.max(fs, g0);
+            int oe = Math.min(fe, g1);
+            if (os >= oe) {
+                // This op lies wholly outside the fragment — leave untouched.
+                continue;
+            }
+            java.io.ByteArrayOutputStream merged = new java.io.ByteArrayOutputStream();
+            merged.write(raw, 0, os - g0);                 // prefix codes kept
+            if (!insertedNew) {
+                merged.write(mid, 0, mid.length);          // replacement once
+                insertedNew = true;
+            }
+            merged.write(raw, oe - g0, raw.length - (oe - g0)); // suffix codes kept
+            if (setOpPayload(ops, i, new PdfString(merged.toByteArray()))) {
+                mutated = true;
+            }
+        }
+        return mutated;
+    }
+
+    /**
+     * Returns the concatenated raw code bytes of a text-show operator
+     * ({@code Tj}, {@code TJ}, {@code '} or {@code "}), or {@code null} for any
+     * other operator. Numeric kerning adjustments inside a {@code TJ} array are
+     * skipped — only the string payloads contribute codes.
+     */
+    private static byte[] rawOpBytes(Operator op) {
+        List<PdfBase> operands = op.getOperands();
+        if (op instanceof ShowText) {
+            if (operands != null && !operands.isEmpty()
+                    && operands.get(0) instanceof PdfString) {
+                return ((PdfString) operands.get(0)).getBytes();
+            }
+            return null;
+        }
+        String name = op.getName();
+        if ("TJ".equals(name)) {
+            if (operands != null && !operands.isEmpty()
+                    && operands.get(0) instanceof PdfArray) {
+                PdfArray arr = (PdfArray) operands.get(0);
+                java.io.ByteArrayOutputStream b = new java.io.ByteArrayOutputStream();
+                for (int i = 0; i < arr.size(); i++) {
+                    if (arr.get(i) instanceof PdfString) {
+                        byte[] s = ((PdfString) arr.get(i)).getBytes();
+                        b.write(s, 0, s.length);
+                    }
+                }
+                return b.toByteArray();
+            }
+            return null;
+        }
+        if ("'".equals(name) || "\"".equals(name)) {
+            if (operands != null && !operands.isEmpty()
+                    && operands.get(operands.size() - 1) instanceof PdfString) {
+                return ((PdfString) operands.get(operands.size() - 1)).getBytes();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Sets the raw string payload of the text-show op at {@code idx} to
+     * {@code payload}, preserving the operator subtype. Mirrors {@link
+     * #replaceTextOp} but takes a pre-encoded {@link PdfString} instead of
+     * re-encoding a decoded string.
+     */
+    private static boolean setOpPayload(OperatorCollection ops, int idx, PdfString payload) {
+        Operator op = ops.getAt(idx);
+        if (op instanceof ShowText) {
+            List<PdfBase> operand = new ArrayList<>(1);
+            operand.add(payload);
+            ops.setAt(idx, new ShowText(operand));
+            return true;
+        }
+        String name = op.getName();
+        if ("TJ".equals(name)) {
+            List<PdfBase> operands = op.getOperands();
+            if (operands != null && !operands.isEmpty()
+                    && operands.get(0) instanceof PdfArray) {
+                PdfArray newArr = new PdfArray();
+                newArr.add(payload);
+                List<PdfBase> newOperands = new ArrayList<>(operands);
+                newOperands.set(0, newArr);
+                ops.setAt(idx, new SetGlyphsPositionShowText(newOperands));
+                return true;
+            }
+        } else if ("'".equals(name) || "\"".equals(name)) {
+            List<PdfBase> operands = op.getOperands();
+            if (operands != null && !operands.isEmpty()) {
+                List<PdfBase> newOperands = new ArrayList<>(operands);
+                int textPos = newOperands.size() - 1;
+                if (newOperands.get(textPos) instanceof PdfString) {
+                    newOperands.set(textPos, payload);
+                    Operator replacement = "'".equals(name)
+                            ? new MoveToNextLineShowText(newOperands)
+                            : new SetSpacingMoveToNextLineShowText(newOperands);
+                    ops.setAt(idx, replacement);
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -667,8 +1277,11 @@ public class TextFragment extends BaseParagraph {
      * </ol>
      */
     private PdfString encodeReplacementText(String newText) {
-        if (sourceFont == null || !sourceFont.isComposite()) {
+        if (sourceFont == null) {
             return new PdfString(newText.getBytes(StandardCharsets.ISO_8859_1));
+        }
+        if (!sourceFont.isComposite()) {
+            return encodeSimpleReplacementText(newText);
         }
         String visual = TextAbsorber.reverseRtlRuns(ArabicShaper.shape(newText));
         java.util.Map<Character, Integer> reverse = new java.util.HashMap<>();
@@ -690,6 +1303,60 @@ public class TextFragment extends BaseParagraph {
             bytes[2 * i + 1] = (byte) code;
         }
         return new PdfString(bytes);
+    }
+
+    /**
+     * Encodes replacement text for a <em>simple</em> (single-byte) source
+     * font. A subset TrueType/Type1 font typically re-numbers its glyphs, so
+     * the byte code that draws (say) an {@code 'a'} is <em>not</em> the ASCII
+     * {@code 0x61} — it is whatever code the subset assigned, discoverable
+     * only by inverting the font's own decode pipeline (ToUnicode → Encoding →
+     * identity). Blindly writing ISO-8859-1 bytes therefore renders and
+     * extracts as garbage for subset fonts (e.g. {@code CAAAAA+ArialUnicodeMS}
+     * where writing {@code 'C'} produced an {@code 'H'} glyph).
+     * <p>
+     * We build a char→code reverse map by running the font's {@link
+     * org.aspose.pdf.engine.font.PdfFont#decode(byte[]) decode} over every code
+     * in the 0..255 space, so the emitted byte is guaranteed to round-trip
+     * back to the intended character. Characters absent from the subset fall
+     * back to their ISO-8859-1 byte (best effort — the glyph is not in the
+     * embedded program, so nothing better is possible without re-embedding).
+     */
+    private PdfString encodeSimpleReplacementText(String newText) {
+        java.util.Map<Character, Integer> reverse = buildSimpleReverseMap();
+        byte[] bytes = new byte[newText.length()];
+        for (int i = 0; i < newText.length(); i++) {
+            char c = newText.charAt(i);
+            Integer code = reverse.get(c);
+            bytes[i] = (byte) (code != null ? code : (c & 0xFF));
+        }
+        return new PdfString(bytes);
+    }
+
+    /**
+     * Inverts the source simple font's decode pipeline into a char→code map
+     * over the single-byte code space. Lower codes win on collision so the
+     * result is deterministic. Cached per fragment via {@link #simpleReverseMap}.
+     */
+    private java.util.Map<Character, Integer> buildSimpleReverseMap() {
+        if (simpleReverseMap != null) {
+            return simpleReverseMap;
+        }
+        java.util.Map<Character, Integer> reverse = new java.util.HashMap<>();
+        // Walk high→low so the lowest code overwrites and ends up winning.
+        for (int code = 255; code >= 0; code--) {
+            String decoded;
+            try {
+                decoded = sourceFont.decode(new byte[]{(byte) code});
+            } catch (Exception e) {
+                continue;
+            }
+            if (decoded != null && decoded.length() == 1) {
+                reverse.put(decoded.charAt(0), code);
+            }
+        }
+        simpleReverseMap = reverse;
+        return reverse;
     }
 
     /** Clears the text payload of a text-showing op at {@code idx}. */
@@ -765,11 +1432,32 @@ public class TextFragment extends BaseParagraph {
      * @param position the position
      */
     public void setPosition(Position position) {
+        Position old = this.position;
         this.position = position;
-        // Propagate position to segments that don't have their own
-        for (TextSegment seg : segments) {
-            if (seg.getPosition() == null) {
-                seg.setPosition(position);
+        if (position == null) {
+            return;
+        }
+        if (old != null) {
+            // Aspose: moving the fragment translates the WHOLE fragment — every
+            // segment shifts by the delta between the new and old origin, so
+            // segments keep their relative offsets (repositioning after segments
+            // were placed at their own positions).
+            double dx = position.getXIndent() - old.getXIndent();
+            double dy = position.getYIndent() - old.getYIndent();
+            for (TextSegment seg : segments) {
+                Position sp = seg.getPosition();
+                if (sp != null) {
+                    seg.setPosition(new Position(sp.getXIndent() + dx, sp.getYIndent() + dy));
+                } else {
+                    seg.setPosition(new Position(position.getXIndent(), position.getYIndent()));
+                }
+            }
+        } else {
+            // First placement: segments without their own position adopt it.
+            for (TextSegment seg : segments) {
+                if (seg.getPosition() == null) {
+                    seg.setPosition(position);
+                }
             }
         }
     }
@@ -1164,6 +1852,27 @@ public class TextFragment extends BaseParagraph {
      */
     public void setSourceContentStream(PdfStream sourceContentStream) {
         this.sourceContentStream = sourceContentStream;
+    }
+
+    /**
+     * Records the /Resources dictionary governing the source content stream
+     * (page resources, or a Form XObject's own resources). Engine-internal;
+     * used by {@link #applyFontToSource} to register a replacement font where
+     * the edited stream can resolve it.
+     *
+     * @param sourceResources the governing resources dictionary, or null
+     */
+    public void setSourceResources(org.aspose.pdf.engine.pdfobjects.PdfDictionary sourceResources) {
+        this.sourceResources = sourceResources;
+    }
+
+    /**
+     * Returns the /Resources dictionary governing the source content stream, or null.
+     *
+     * @return the governing resources dictionary, or null
+     */
+    public org.aspose.pdf.engine.pdfobjects.PdfDictionary getSourceResources() {
+        return sourceResources;
     }
 
     /**

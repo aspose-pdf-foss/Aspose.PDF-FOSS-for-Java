@@ -40,6 +40,9 @@ public final class FilterFactory {
 
         // JBIG2 decoder (segment parser + MMR generic regions)
         register(new JBIG2DecodeFilter());
+
+        // Crypt marker filter (§7.4.10) — pass-through, see CryptFilter notes
+        register(new CryptFilter());
     }
 
     private FilterFactory() {

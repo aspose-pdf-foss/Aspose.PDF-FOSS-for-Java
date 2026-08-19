@@ -17,8 +17,11 @@ import org.aspose.pdf.engine.parser.PDFParser;
 import org.aspose.pdf.engine.pdfobjects.PdfStream;
 
 import java.awt.AlphaComposite;
+import java.awt.BasicStroke;
 import java.awt.Font;
 import java.awt.Graphics2D;
+import java.awt.Shape;
+import java.awt.Stroke;
 import java.awt.font.FontRenderContext;
 import java.awt.geom.AffineTransform;
 import java.io.IOException;
@@ -231,6 +234,7 @@ public class TextRenderer {
         if (canDrawAsSingleRun(state, text, rawBytes)
                 && codeKeyedReaderFor(pdfFont, jdkFont) == null
                 && compositeGidFontFor(pdfFont, jdkFont) == null
+                && compositeCffCidToGidFor(pdfFont, jdkFont) == null
                 && embeddedTrueTypeFor(pdfFont, jdkFont) == null
                 // A simple CFF font reaches the single-run drawString path only
                 // when java.awt can display every decoded char; if any char is
@@ -259,6 +263,7 @@ public class TextRenderer {
                 codeKeyedReaderFor(pdfFont, jdkFont);
         org.aspose.pdf.engine.font.CIDFont gidFont = compositeGidFontFor(pdfFont, jdkFont);
         org.aspose.pdf.engine.font.TrueTypeFont embeddedTt = embeddedTrueTypeFor(pdfFont, jdkFont);
+        int[] cidCffGid = compositeCffCidToGidFor(pdfFont, jdkFont);
 
         int textIdx = 0;
         for (int i = 0; i + cidLen <= rawBytes.length; i += cidLen) {
@@ -312,6 +317,15 @@ public class TextRenderer {
                 // complex-script shaping (corpus 29111: pre-shaped Arabic
                 // presentation forms came out as isolated letterforms).
                 ckGid = gidFont.toGlyphId(charCode);
+            } else if (cidCffGid != null) {
+                // Identity-H CIDFontType0 (CID-keyed CFF): the CID selects the
+                // charstring via the inverse charset. Routing the decoded
+                // Unicode through drawString picks glyphs from the synthetic
+                // OTF cmap built for SIMPLE fonts, which is empty/garbage for
+                // composite CFFs (corpus 33408: body text as stray marks,
+                // PDFKITNET-21900: "CHAPTER I" missing).
+                ckGid = (charCode >= 0 && charCode < cidCffGid.length)
+                        ? cidCffGid[charCode] : -1;
             }
 
             // Prefer the embedded glyph outline for CIDFontType2 (corpus APS/37100,
@@ -320,7 +334,8 @@ public class TextRenderer {
             if (glyphOutline == null && gidFont != null && ckGid >= 0) {
                 glyphOutline = gidFont.glyphOutline(ckGid);
             }
-            boolean drawGv = glyphOutline == null && ckGid > 0 && (ckReader != null || cffSimpleGid != null);
+            boolean drawGv = glyphOutline == null && ckGid > 0
+                    && (ckReader != null || cffSimpleGid != null || cidCffGid != null);
             boolean drawStr = glyphOutline == null && !drawGv && ch != null && !ch.isEmpty();
 
             if (!invisible && (glyphOutline != null || drawGv || drawStr)) {
@@ -341,12 +356,16 @@ public class TextRenderer {
                         // glyf outline is already em-normalised and Y-up, matching
                         // PDF text space — no extra Y flip needed.
                         g2d.fill(glyphOutline);
+                        darkenStems(g2d, glyphOutline);
                     } else {
                         g2d.scale(1, -1);
                         if (drawGv) {
-                            g2d.drawGlyphVector(jdkFont.createGlyphVector(
-                                    g2d.getFontRenderContext(), new int[]{ckGid}), 0, 0);
-                        } else {
+                            java.awt.font.GlyphVector gv = jdkFont.createGlyphVector(
+                                    g2d.getFontRenderContext(), new int[]{ckGid});
+                            if (!darkenGlyphVector(g2d, gv)) {
+                                g2d.drawGlyphVector(gv, 0, 0);
+                            }
+                        } else if (!darkenString(g2d, jdkFont, ch)) {
                             g2d.setFont(jdkFont);
                             g2d.drawString(ch, 0, 0);
                         }
@@ -460,10 +479,39 @@ public class TextRenderer {
         if (!t0.isIdentityEncoding()) return null;
         org.aspose.pdf.engine.font.CIDFont descendant = t0.getDescendantFont();
         if (descendant == null || !descendant.isType2()) return null;
+        Font loaded = org.aspose.pdf.engine.font.cff.CFFFontLoader.load(pdfFont);
+        if (loaded != null) {
+            // Embedded program is what java.awt draws — glyph-id addressing is
+            // only valid when the drawn font IS the embedded one.
+            return loaded == jdkFont ? descendant : null;
+        }
+        // java.awt.Font rejected the embedded program (subset with no cmap/name
+        // or truncated hmtx — corpus 00129: GS-generated "Helvetica" whose glyf
+        // actually houses serif outlines), so jdkFont is a name-substituted
+        // family with the wrong glyphs. Our own TrueTypeReader still parses
+        // glyf/loca — draw the embedded outlines directly, matching Acrobat.
+        return descendant.hasGlyphOutlines() ? descendant : null;
+    }
+
+    /**
+     * Returns the CID→glyph-id map when this composite font's descendant is a
+     * CIDFontType0 (CFF in {@code FontFile3}), the encoding is Identity-H/V,
+     * and the glyphs are drawn with the embedded program — the only case where
+     * glyph-id addressing into the synthetic OTF is valid. Null otherwise.
+     */
+    private static int[] compositeCffCidToGidFor(PdfFont pdfFont, Font jdkFont) {
+        if (!(pdfFont instanceof org.aspose.pdf.engine.font.Type0Font) || jdkFont == null) {
+            return null;
+        }
+        org.aspose.pdf.engine.font.Type0Font t0 =
+                (org.aspose.pdf.engine.font.Type0Font) pdfFont;
+        if (!t0.isIdentityEncoding()) return null;
+        org.aspose.pdf.engine.font.CIDFont descendant = t0.getDescendantFont();
+        if (descendant == null || descendant.isType2()) return null;
         if (org.aspose.pdf.engine.font.cff.CFFFontLoader.load(pdfFont) != jdkFont) {
             return null;
         }
-        return descendant;
+        return org.aspose.pdf.engine.font.cff.CFFFontLoader.compositeCffCidToGid(pdfFont);
     }
 
     /**
@@ -594,9 +642,12 @@ public class TextRenderer {
 
                 g2d.setComposite(BlendComposite.fillComposite(state));
                 g2d.setColor(state.getFillColor());
-                g2d.setFont(jdkFont);
                 // Symbolic TrueType fonts with a (3,0)-only cmap (§9.6.6.4)
-                g2d.drawString(remapForSymbolicCmap(jdkFont, text, rawBytes), 0, 0);
+                String run = remapForSymbolicCmap(jdkFont, text, rawBytes);
+                if (!darkenString(g2d, jdkFont, run)) {
+                    g2d.setFont(jdkFont);
+                    g2d.drawString(run, 0, 0);
+                }
             } finally {
                 g2d.setTransform(savedTransform);
             }
@@ -610,6 +661,64 @@ public class TextRenderer {
         }
         advanceTextMatrix(state, totalAdvance);
     }
+
+    /**
+     * Acrobat print-parity stem darkening ({@code -Drender.acrobatPrintParity=true},
+     * harness-only; a no-op otherwise).
+     * <p>
+     * Acrobat (and the GDI print path that produces the visual-compare golds)
+     * rasterises glyphs with hinting/stem darkening, so small text comes out
+     * noticeably heavier than a plain anti-aliased outline fill — Java2D fills
+     * an 8pt stem at ~1 px of pale grey where Acrobat paints ~2 px near-solid.
+     * Approximate that by re-tracing the just-filled outline with a hairline
+     * stroke of constant <em>device-pixel</em> width, which fattens every glyph
+     * uniformly regardless of the current text-space scale.
+     * </p>
+     *
+     * @param g2d     graphics in the glyph's user space (fill colour/composite set)
+     * @param outline the outline that was just filled, in current user space
+     */
+    private static void darkenStems(Graphics2D g2d, Shape outline) {
+        if (!Boolean.getBoolean("render.acrobatPrintParity") || outline == null) return;
+        AffineTransform t = g2d.getTransform();
+        double scale = Math.sqrt(Math.abs(t.getDeterminant()));
+        if (scale <= 1e-9) return;
+        float w = (float) (STEM_DARKEN_DEVICE_PX / scale);
+        Stroke saved = g2d.getStroke();
+        g2d.setStroke(new BasicStroke(w, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+        g2d.draw(outline);
+        g2d.setStroke(saved);
+    }
+
+    /**
+     * Print-parity variant of {@code drawGlyphVector}: fills the vector's own
+     * outline and re-traces it. Filling the SAME shape that gets stroked keeps
+     * the two perfectly registered — stroking on top of {@code drawString}/
+     * {@code drawGlyphVector} output ghosts, because the JDK rasteriser
+     * positions glyphs with its own (hinted, integer-advance) metrics that
+     * differ sub-pixel from the outline returned by {@code getOutline}.
+     *
+     * @return true if the glyphs were painted here (parity mode on)
+     */
+    private static boolean darkenGlyphVector(Graphics2D g2d, java.awt.font.GlyphVector gv) {
+        if (!Boolean.getBoolean("render.acrobatPrintParity")) return false;
+        Shape outline = gv.getOutline(0, 0);
+        g2d.fill(outline);
+        darkenStems(g2d, outline);
+        return true;
+    }
+
+    /** {@link #darkenGlyphVector} for text that would go through drawString. */
+    private static boolean darkenString(Graphics2D g2d, Font font, String text) {
+        if (!Boolean.getBoolean("render.acrobatPrintParity")
+                || text == null || text.isEmpty()) return false;
+        return darkenGlyphVector(g2d,
+                font.createGlyphVector(g2d.getFontRenderContext(), text));
+    }
+
+    /** Total added stroke width, in device pixels, for print-parity stem darkening. */
+    private static final double STEM_DARKEN_DEVICE_PX =
+            Double.parseDouble(System.getProperty("render.printParityStemDarkenPx", "0.6"));
 
     private void adjustTextPosition(GraphicsState state, double displacement) {
         double fontSize = state.getFontSize();

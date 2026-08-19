@@ -29,11 +29,53 @@ public class Stamp {
     private String pdfFile;
     private Document pdfDocument;
     private int pdfPageNumber = 1;
+    private float opacity = 1.0f;
+    private int[] pages;
 
     /**
      * Creates a new empty {@code Stamp} instance.
      */
     public Stamp() {
+    }
+
+    /**
+     * Returns the stamp opacity (0.0 fully transparent &ndash; 1.0 fully opaque).
+     *
+     * @return the opacity
+     */
+    public float getOpacity() {
+        return opacity;
+    }
+
+    /**
+     * Sets the stamp opacity. Values are clamped to [0, 1]. When below 1 the
+     * stamp is painted through an ExtGState {@code /ca} entry.
+     *
+     * @param opacity the opacity in [0, 1]
+     */
+    public void setOpacity(float opacity) {
+        this.opacity = Math.max(0f, Math.min(1f, opacity));
+    }
+
+    /**
+     * Returns the explicit set of 1-based page numbers this stamp targets, or
+     * {@code null} when it applies to a single {@link #getPageNumber()} page (or
+     * all pages when that is 0).
+     *
+     * @return the target pages, or {@code null}
+     */
+    public int[] getPages() {
+        return pages;
+    }
+
+    /**
+     * Sets the explicit set of 1-based page numbers this stamp targets
+     * (Aspose {@code Stamp.Pages}). Overrides {@link #setPageNumber(int)}.
+     *
+     * @param pages the target page numbers (may be null)
+     */
+    public void setPages(int[] pages) {
+        this.pages = pages;
     }
 
     /**
@@ -177,6 +219,30 @@ public class Stamp {
      */
     public double getOriginY() {
         return originY;
+    }
+
+    private org.aspose.pdf.HorizontalAlignment horizontalAlignment =
+            org.aspose.pdf.HorizontalAlignment.None;
+
+    /**
+     * Sets the horizontal alignment. When {@code Center}, the stamp is centered
+     * on the page width (headers/footers/page numbers) instead of positioned by
+     * {@link #getOriginX()}.
+     *
+     * @param alignment the horizontal alignment
+     */
+    public void setHorizontalAlignment(org.aspose.pdf.HorizontalAlignment alignment) {
+        this.horizontalAlignment = alignment == null
+                ? org.aspose.pdf.HorizontalAlignment.None : alignment;
+    }
+
+    /**
+     * Returns the horizontal alignment.
+     *
+     * @return the horizontal alignment
+     */
+    public org.aspose.pdf.HorizontalAlignment getHorizontalAlignment() {
+        return horizontalAlignment;
     }
 
     /**

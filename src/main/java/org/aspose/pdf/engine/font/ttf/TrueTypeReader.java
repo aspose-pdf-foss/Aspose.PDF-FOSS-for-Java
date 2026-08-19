@@ -636,6 +636,17 @@ public class TrueTypeReader {
      * @param gid the glyph id
      * @return the em-normalised, Y-up outline, or {@code null}
      */
+    /**
+     * Returns true when the font program carries parsable outline tables
+     * ({@code glyf} + {@code loca}), i.e. {@link #getGlyphPath(int)} can serve
+     * glyph outlines.
+     *
+     * @return true when glyph outlines are available
+     */
+    public boolean hasGlyphOutlines() {
+        return loca != null && glyfOffset >= 0;
+    }
+
     public java.awt.geom.GeneralPath getGlyphPath(int gid) {
         if (loca == null || glyfOffset < 0 || gid < 0 || gid + 1 >= loca.length) {
             return null;

@@ -96,6 +96,17 @@ public class Page {
         return owningDocument;
     }
 
+    /**
+     * Returns the parser this page resolves indirect references through, or
+     * null for a detached page. Engine use (e.g. the renderer reaching the
+     * catalog's /OCProperties); not part of the public Aspose surface.
+     *
+     * @return the parser, or null
+     */
+    public PDFParser getParser() {
+        return parser;
+    }
+
     /** Sets the owning document. Called by {@link PageCollection} during add/insert. */
     void setOwningDocument(Document owningDocument) {
         this.owningDocument = owningDocument;
@@ -321,7 +332,7 @@ public class Page {
             rect = getMediaBox();
         }
         if (considerRotation && rect != null) {
-            int rotation = getRotate();
+            int rotation = ((getRotate() % 360) + 360) % 360;
             if (rotation == 90 || rotation == 270) {
                 return new Rectangle(rect.getLLX(), rect.getLLY(), rect.getLLX() + rect.getHeight(), rect.getLLY() + rect.getWidth());
             }
@@ -465,6 +476,13 @@ public class Page {
         }
         contentsCache = parsed;
         contentsDirty = false;
+        // Wire public 1-based edits (add/insert/delete/set) made through the
+        // returned collection back to the page's dirty flag, so programmatic
+        // content-stream edits are flushed to /Contents on Document.save().
+        // Engine-side 0-based helpers (setAt/removeAt/addAt) deliberately do NOT
+        // fire this, so internal serialization/normalization can't spuriously
+        // re-dirty a page mid-save (which would corrupt signature ByteRange).
+        parsed.setMutationListener(this::markContentsDirty);
         return contentsCache;
     }
 
@@ -511,12 +529,19 @@ public class Page {
             return;
         }
         Rectangle current = getMediaBox();
-        if (current == null
-                || Math.abs(current.getWidth() - w) > 0.001
-                || Math.abs(current.getHeight() - h) > 0.001
-                || Math.abs(current.getLLX()) > 0.001
-                || Math.abs(current.getLLY()) > 0.001) {
+        if (current == null) {
             setMediaBox(new Rectangle(0, 0, w, h));
+            return;
+        }
+        // Propagate the PageInfo dimensions only when they genuinely differ, and
+        // PRESERVE the existing MediaBox origin (LLX/LLY). Forcing the origin to 0
+        // here corrupted every page that legitimately carries a non-zero-origin
+        // MediaBox (PDFNET-52441).
+        if (Math.abs(current.getWidth() - w) > 0.001
+                || Math.abs(current.getHeight() - h) > 0.001) {
+            double llx = current.getLLX();
+            double lly = current.getLLY();
+            setMediaBox(new Rectangle(llx, lly, llx + w, lly + h));
         }
     }
 
@@ -851,6 +876,13 @@ public class Page {
             throw new IllegalArgumentException("Rectangle must not be null");
         }
         pageDict.set(PdfName.MEDIABOX, rect.toPdfArray());
+        // Keep a materialised PageInfo in sync so a later flushPageInfoIfNeeded()
+        // (triggered by save/insert/flatten) does not overwrite this explicitly
+        // set box with stale PageInfo dimensions (PDFNET-52441).
+        if (pageInfo != null) {
+            pageInfo.setWidth(rect.getWidth());
+            pageInfo.setHeight(rect.getHeight());
+        }
     }
 
     /**
@@ -994,6 +1026,37 @@ public class Page {
      */
     java.util.List<Layer> peekLayers() {
         return _layers;
+    }
+
+    /** Paragraphs queued by TextBuilder.appendParagraph, rendered at save time. */
+    private java.util.List<org.aspose.pdf.text.TextParagraph> pendingParagraphs;
+
+    /**
+     * Queues a paragraph for rendering into the content stream at save time
+     * (engine-internal — used by {@link org.aspose.pdf.text.TextBuilder}).
+     * Deferring the layout to the save keeps the paragraph "live": properties
+     * set after {@code appendParagraph} (rectangle, background color) still
+     * take effect, matching the Aspose.PDF attached-paragraph semantics.
+     *
+     * @param paragraph the paragraph to render when the document is saved
+     */
+    public void queueParagraph(org.aspose.pdf.text.TextParagraph paragraph) {
+        if (paragraph == null) return;
+        if (pendingParagraphs == null) {
+            pendingParagraphs = new java.util.ArrayList<>();
+        }
+        pendingParagraphs.add(paragraph);
+    }
+
+    /** Renders queued paragraphs into the content stream (save path). */
+    void flushPendingParagraphs() {
+        if (pendingParagraphs == null || pendingParagraphs.isEmpty()) return;
+        java.util.List<org.aspose.pdf.text.TextParagraph> queued = pendingParagraphs;
+        pendingParagraphs = null;
+        org.aspose.pdf.text.TextBuilder builder = new org.aspose.pdf.text.TextBuilder(this);
+        for (org.aspose.pdf.text.TextParagraph paragraph : queued) {
+            builder.flushParagraph(paragraph);
+        }
     }
 
     /** Reads the page's Optional Content Groups (see {@link #getLayers()}). */
@@ -1219,6 +1282,7 @@ public class Page {
                         i++;
                     }
                     artifact.setContents(contentOps);
+                    enrichArtifactFromContent(artifact, resources);
                     collection.add(artifact);
                 }
                 i++;
@@ -1299,6 +1363,165 @@ public class Page {
             }
         }
         return null;
+    }
+
+    /**
+     * Derives the Aspose-visible artifact properties from the marked-content
+     * operators between the artifact's BDC/BMC and EMC (PDFNEWNET-33603):
+     * <ul>
+     *   <li>rotation — from the first {@code cm} matrix ({@code atan2(b, a)}),
+     *       reported relative to the page {@code /Rotate};</li>
+     *   <li>opacity — the fill alpha {@code /ca} of an ExtGState installed via
+     *       {@code gs} (ISO 32000-1:2008, §8.4.5);</li>
+     *   <li>text — text-showing operators inside a referenced Form XObject
+     *       (typical producer pattern: {@code BDC q cm /FmN Do Q EMC});</li>
+     *   <li>image — an Image XObject drawn directly or inside the form; the
+     *       artifact rectangle then reflects the {@code cm} placement.</li>
+     * </ul>
+     */
+    private void enrichArtifactFromContent(Artifact artifact, Resources resources) {
+        List<Operator> ops = artifact.getContents();
+        if (ops == null || ops.isEmpty()) {
+            return;
+        }
+        Matrix cm = null;
+        for (Operator op : ops) {
+            if (op instanceof org.aspose.pdf.operators.ConcatenateMatrix) {
+                if (cm == null) {
+                    cm = ((org.aspose.pdf.operators.ConcatenateMatrix) op).getMatrix();
+                }
+            } else if (op instanceof org.aspose.pdf.operators.GS) {
+                Double alpha = resolveExtGStateFillAlpha(resources,
+                        ((org.aspose.pdf.operators.GS) op).getDictName());
+                if (alpha != null) {
+                    artifact.setOpacity(alpha);
+                }
+            } else if (op instanceof org.aspose.pdf.operators.Do) {
+                handleArtifactXObject(artifact, resources,
+                        ((org.aspose.pdf.operators.Do) op).getXObjectName(), cm);
+            }
+        }
+        double contentAngle = cm != null ? Math.toDegrees(Math.atan2(cm.getB(), cm.getA())) : 0;
+        artifact.setRotation(normalizeDegrees(contentAngle - getRotate()));
+    }
+
+    /** Fill alpha /ca of the named ExtGState, or null when absent (§8.4.5, Table 58). */
+    private Double resolveExtGStateFillAlpha(Resources resources, String gsName) {
+        if (resources == null || gsName == null) {
+            return null;
+        }
+        PdfDictionary resDict = resources.getPdfDictionary();
+        if (resDict == null) {
+            return null;
+        }
+        PdfDictionary extGStates = resDict.getDictionary("ExtGState");
+        if (extGStates == null) {
+            return null;
+        }
+        PdfDictionary gs = extGStates.getDictionary(gsName);
+        if (gs == null || gs.get("ca") == null) {
+            return null;
+        }
+        return (double) gs.getFloat("ca", 1f);
+    }
+
+    /**
+     * Resolves the named XObject drawn inside an artifact: an Image XObject
+     * marks the artifact as an image artifact; a Form XObject is scanned for
+     * text-showing operators and nested images.
+     */
+    private void handleArtifactXObject(Artifact artifact, Resources resources,
+                                       String name, Matrix cm) {
+        PdfStream xobj = resolveNamedXObject(
+                resources != null ? resources.getPdfDictionary() : null, name);
+        if (xobj == null) {
+            return;
+        }
+        String subtype = xobj.getNameAsString("Subtype");
+        if ("Image".equals(subtype)) {
+            markArtifactImage(artifact, cm);
+            return;
+        }
+        if (!"Form".equals(subtype)) {
+            return;
+        }
+        try {
+            OperatorCollection formOps = ContentStreamParser.parseToCollection(xobj);
+            StringBuilder text = new StringBuilder();
+            PdfDictionary formRes = xobj.getDictionary("Resources");
+            for (int i = 0; i < formOps.size(); i++) {
+                Operator fop = formOps.getAt(i);
+                String opName = fop.getName();
+                if ("Tj".equals(opName) && !fop.getOperands().isEmpty()) {
+                    PdfBase operand = fop.getOperands().get(0);
+                    if (operand instanceof PdfString) {
+                        text.append(((PdfString) operand).getString());
+                    }
+                } else if ("TJ".equals(opName) && !fop.getOperands().isEmpty()) {
+                    PdfBase operand = fop.getOperands().get(0);
+                    if (operand instanceof PdfArray) {
+                        PdfArray arr = (PdfArray) operand;
+                        for (int j = 0; j < arr.size(); j++) {
+                            if (arr.get(j) instanceof PdfString) {
+                                text.append(((PdfString) arr.get(j)).getString());
+                            }
+                        }
+                    }
+                } else if (fop instanceof org.aspose.pdf.operators.Do) {
+                    PdfStream nested = resolveNamedXObject(formRes,
+                            ((org.aspose.pdf.operators.Do) fop).getXObjectName());
+                    if (nested != null && "Image".equals(nested.getNameAsString("Subtype"))) {
+                        markArtifactImage(artifact, cm);
+                    }
+                }
+            }
+            if (text.length() > 0) {
+                String existing = artifact.getText();
+                if (existing == null || existing.isEmpty()) {
+                    artifact.setText(text.toString());
+                }
+            }
+        } catch (IOException e) {
+            LOG.fine(() -> "Failed to scan artifact form XObject '" + name + "': " + e.getMessage());
+        }
+    }
+
+    /** Looks up /XObject/<name> in a resources dictionary, resolving references. */
+    private PdfStream resolveNamedXObject(PdfDictionary resDict, String name) {
+        if (resDict == null || name == null) {
+            return null;
+        }
+        PdfDictionary xobjects = resDict.getDictionary("XObject");
+        if (xobjects == null) {
+            return null;
+        }
+        PdfBase target = resolveRef(xobjects.get(name));
+        return target instanceof PdfStream ? (PdfStream) target : null;
+    }
+
+    /** Marks the artifact as image-bearing and derives its rectangle from the cm placement. */
+    private void markArtifactImage(Artifact artifact, Matrix cm) {
+        if (artifact.getImage() == null) {
+            artifact.setImage(new Image());
+        }
+        if (cm != null) {
+            double[] p0 = cm.transformPoint(0, 0);
+            double[] p1 = cm.transformPoint(1, 0);
+            double[] p2 = cm.transformPoint(0, 1);
+            double[] p3 = cm.transformPoint(1, 1);
+            double llx = Math.min(Math.min(p0[0], p1[0]), Math.min(p2[0], p3[0]));
+            double lly = Math.min(Math.min(p0[1], p1[1]), Math.min(p2[1], p3[1]));
+            double urx = Math.max(Math.max(p0[0], p1[0]), Math.max(p2[0], p3[0]));
+            double ury = Math.max(Math.max(p0[1], p1[1]), Math.max(p2[1], p3[1]));
+            artifact.setRectangle(new Rectangle(llx, lly, urx, ury));
+        }
+    }
+
+    /** Normalizes an angle in degrees to the range (-180, 180]. */
+    private static double normalizeDegrees(double a) {
+        while (a <= -180) a += 360;
+        while (a > 180) a -= 360;
+        return a;
     }
 
     private Artifact createArtifact(PdfDictionary properties) {
@@ -1715,15 +1938,26 @@ public class Page {
 
         ContentStreamBuilder builder = new ContentStreamBuilder();
         builder.saveState();
-        double rotation = stamp.getRotateAngle();
-        if (rotation != 0) {
-            double rad = Math.toRadians(rotation);
-            double cos = Math.cos(rad);
-            double sin = Math.sin(rad);
-            builder.concatMatrix(cos, sin, -sin, cos, x, y);
-        } else {
-            builder.concatMatrix(1, 0, 0, 1, x, y);
+        // Opacity < 1: install an ExtGState with /ca and /CA and select it via gs,
+        // so the stamp is drawn semi-transparent (§8.4.5). At full opacity no gs is
+        // emitted (matches the default opaque render).
+        double stampOpacity = stamp.getOpacity();
+        if (stampOpacity < 1.0) {
+            String gsName = installStampOpacityGState(resources, stampOpacity, stamp.getStampId());
+            builder.setExtGState(gsName);
         }
+        double rotation = stamp.getRotateAngle();
+        // Zoom scales the placement matrix so the drawn XObject is magnified
+        // (matrix a/d = cos*zoom, b/c = ±sin*zoom). Without this, setZoom was a
+        // no-op (matrix stayed unit-scaled). See TextStamp.getZoom / setZoom.
+        double zoom = stamp.getZoom();
+        if (zoom <= 0) {
+            zoom = 1;
+        }
+        double rad = Math.toRadians(rotation);
+        double cos = Math.cos(rad);
+        double sin = Math.sin(rad);
+        builder.concatMatrix(cos * zoom, sin * zoom, -sin * zoom, cos * zoom, x, y);
         builder.drawXObject(resourceName);
         builder.restoreState();
 
@@ -1806,17 +2040,29 @@ public class Page {
     }
 
     private static byte[] readImageBytes(ImageStamp stamp) throws IOException {
+        // Reuse bytes read on a previous application so ONE stamp can be applied to
+        // several pages — an InputStream is single-pass and would be exhausted by
+        // the first page otherwise (PDFNET Verify_Zoom2 loops over all pages).
+        byte[] cached = stamp.getCachedBytes();
+        if (cached != null) {
+            return cached;
+        }
+        byte[] bytes = null;
         InputStream is = stamp.getImageStream();
         if (is != null) {
-            return readAllBytes(is);
-        }
-        String file = stamp.getFile();
-        if (file != null && !file.isEmpty()) {
-            try (InputStream fis = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(file))) {
-                return readAllBytes(fis);
+            bytes = readAllBytes(is);
+        } else {
+            String file = stamp.getFile();
+            if (file != null && !file.isEmpty()) {
+                try (InputStream fis = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(file))) {
+                    bytes = readAllBytes(fis);
+                }
             }
         }
-        return null;
+        if (bytes != null && bytes.length > 0) {
+            stamp.setCachedBytes(bytes);
+        }
+        return bytes;
     }
 
     private static byte[] readAllBytes(InputStream is) throws IOException {
@@ -1967,6 +2213,11 @@ public class Page {
         formStream.set("Type", PdfName.of("XObject"));
         formStream.set("Subtype", PdfName.of("Form"));
         formStream.set("BBox", new Rectangle(0, 0, Math.max(width, 1.0), Math.max(height, 1.0)).toPdfArray());
+        // Tag the form with the stamp id so it can be identified on read-back
+        // (mirrors Aspose's /StampId marker used by stamp analysis).
+        if (stamp.getStampId() != 0) {
+            formStream.set("StampId", PdfInteger.valueOf(stamp.getStampId()));
+        }
 
         ContentStreamBuilder builder = new ContentStreamBuilder();
         builder.beginText();
@@ -2247,6 +2498,31 @@ public class Page {
         return candidate;
     }
 
+    /**
+     * Installs an ExtGState carrying the stamp's constant alpha ({@code /ca} and
+     * {@code /CA}) in the page's {@code /Resources/ExtGState} and returns its
+     * resource name, for {@link ContentStreamBuilder#setExtGState(String)}.
+     *
+     * @param resources the page resources
+     * @param opacity   the constant alpha in [0,1]
+     * @param stampId   the stamp id (used to build a stable resource name)
+     * @return the ExtGState resource name
+     */
+    private String installStampOpacityGState(Resources resources, double opacity, int stampId) {
+        PdfDictionary extGStates = resources.getExtGState();
+        if (extGStates == null) {
+            extGStates = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("ExtGState"), extGStates);
+        }
+        String name = createUniqueXObjectName(extGStates, "GS", stampId);
+        PdfDictionary gs = new PdfDictionary();
+        gs.set(PdfName.of("Type"), PdfName.of("ExtGState"));
+        gs.set(PdfName.of("ca"), new PdfFloat(opacity));
+        gs.set(PdfName.of("CA"), new PdfFloat(opacity));
+        extGStates.set(PdfName.of(name), gs);
+        return name;
+    }
+
     private byte[] wrapStampContent(byte[] content, int stampId, String type, String resourceName) {
         StringBuilder sb = new StringBuilder();
         sb.append(OPENPDF_STAMP_BEGIN).append(stampId).append(':').append(type);
@@ -2345,17 +2621,31 @@ public class Page {
         if (operators == null) {
             throw new IllegalArgumentException("Operators must not be null");
         }
-        StringBuilder sb = new StringBuilder();
+        // Byte-level serialization: op.toString() routes operands through
+        // US-ASCII and turns every byte >= 0x80 in literal strings into '?'
+        // (same defect flushContentsIfDirty fixed in Sprint 30 — WinAnsi
+        // umlauts, CID codes). writeTo preserves the exact operand bytes.
+        java.io.ByteArrayOutputStream contentBytes = new java.io.ByteArrayOutputStream();
         for (Operator op : operators) {
-            sb.append(op.toString()).append('\n');
+            op.writeTo(contentBytes);
+            contentBytes.write('\n');
         }
-        byte[] data = sb.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+        byte[] data = contentBytes.toByteArray();
         PdfStream stream = new PdfStream();
         stream.setDecodedData(data);
         pageDict.set(PdfName.CONTENTS, stream);
-        // Replace the cache: the caller-supplied collection becomes the new
-        // authoritative view; nothing is dirty because we just wrote it.
-        this.contentsCache = operators;
+        // Invalidate the cache rather than caching the caller-supplied
+        // collection verbatim. The renderer (and other engine consumers)
+        // dispatch on operator SUBTYPE — the cm handler applies the matrix only
+        // for a ConcatenateMatrix instance, q/Q only for GSave/GRestore, etc.
+        // A programmatically built list of generic Operator("cm")/Operator("q")
+        // objects (e.g. from flow compaction) would therefore be SILENTLY
+        // SKIPPED when rendered in-memory, while the very same content renders
+        // correctly after save→reload (the parser reconstructs typed operators).
+        // Dropping the cache makes the next getContents() re-parse the faithful
+        // bytes we just wrote through ContentStreamParser, yielding typed,
+        // render-ready operators — so in-memory render matches the saved output.
+        this.contentsCache = null;
         this.contentsDirty = false;
         // We just wrote authoritative bytes from the caller's collection, so the
         // page is no longer in a degraded (undecodable-source) state.

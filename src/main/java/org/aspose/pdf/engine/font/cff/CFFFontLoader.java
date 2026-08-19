@@ -4,14 +4,13 @@ import org.aspose.pdf.engine.font.FontDescriptor;
 import org.aspose.pdf.engine.font.FontEncoding;
 import org.aspose.pdf.engine.font.PdfFont;
 import org.aspose.pdf.engine.pdfobjects.PdfStream;
+import org.aspose.pdf.engine.util.WeakIdentityHashMap;
 
 import java.awt.Font;
 import java.awt.FontFormatException;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.util.Collections;
 import java.util.HashMap;
-import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.logging.Logger;
 
@@ -41,19 +40,89 @@ public final class CFFFontLoader {
     // dictionaries (e.g. the evaluation watermark subset) from two different
     // documents compare equal — a content-keyed cache then returns one
     // document's parsed font/glyph map for another's, corrupting glyphs
-    // (e.g. space → 'L'). IdentityHashMap keys on the instance, so each
-    // document's distinct dictionary instance gets its own entry while
-    // intra-document reuse (the parser hands back the same instance) still hits.
+    // (e.g. space → 'L'). Identity keying gives each document's distinct
+    // dictionary instance its own entry while intra-document reuse (the parser
+    // hands back the same instance) still hits.
+    //
+    // The keys are held WEAKLY (WeakIdentityHashMap, not IdentityHashMap): a
+    // plain IdentityHashMap pins every font dictionary it ever sees for the
+    // life of the JVM, so a long-running convert/render loop over thousands of
+    // documents accumulates one entry — plus a heavy AWT Font — per embedded
+    // CFF font and eventually exhausts the heap. Weak keys let each closed
+    // document's font dictionaries (and their cache entries) be reclaimed. The
+    // values (Font / int[]) do not reference the key, so no entry is pinned by
+    // its own value.
 
     /** Cache: font-dict instance → loaded AWT Font (or null on failure). */
-    private static final Map<Object, Font> CACHE =
-            Collections.synchronizedMap(new IdentityHashMap<>());
+    private static final WeakIdentityHashMap<Object, Font> CACHE =
+            new WeakIdentityHashMap<>();
 
     /** Cache: font-dict instance → 256-entry charcode→CFF gid map for simple CFF fonts (or null). */
-    private static final Map<Object, int[]> CODE_TO_GID =
-            Collections.synchronizedMap(new IdentityHashMap<>());
+    private static final WeakIdentityHashMap<Object, int[]> CODE_TO_GID =
+            new WeakIdentityHashMap<>();
+
+    /** Cache: font-dict instance → CID→CFF-gid map for composite CFF fonts (or null). */
+    private static final WeakIdentityHashMap<Object, int[]> CID_TO_GID =
+            new WeakIdentityHashMap<>();
 
     private CFFFontLoader() {}
+
+    /**
+     * Returns the CID → glyph-id map for a composite font whose descendant is
+     * a CID-keyed CFF ({@code /CIDFontType0} with {@code FontFile3}), or
+     * {@code null} when the font is not composite-CFF or cannot be parsed.
+     * <p>
+     * In a CID-keyed CFF the charset maps gid → CID (Adobe TN#5176 §18); the
+     * renderer needs the inverse to select glyphs for Identity-H CIDs. For a
+     * name-keyed CFF used as a CIDFont descendant, CIDs address charstrings
+     * directly (ISO 32000-1 §9.7.4.2), so the map is identity. Glyph ids index
+     * the synthetic OTF built by {@link OpenTypeBuilder} (CFF gid order is
+     * preserved), so they are valid for
+     * {@link Font#createGlyphVector(java.awt.font.FontRenderContext, int[])}.
+     */
+    public static int[] compositeCffCidToGid(PdfFont pdfFont) {
+        if (pdfFont == null || !pdfFont.isComposite()) return null;
+        Object key = pdfFont.getFontDictionary();
+        if (key == null) key = pdfFont;
+        if (CID_TO_GID.containsKey(key)) return CID_TO_GID.get(key);
+
+        int[] map = buildCompositeCffCidToGid(pdfFont);
+        CID_TO_GID.put(key, map);
+        return map;
+    }
+
+    private static int[] buildCompositeCffCidToGid(PdfFont pdfFont) {
+        FontDescriptor fd = pdfFont.getFontDescriptor();
+        if (fd == null || fd.getFontFile2() != null) return null;
+        PdfStream fontFile3 = fd.getFontFile3();
+        if (fontFile3 == null) return null;
+        CFFParser cff;
+        try {
+            byte[] cffBytes = fontFile3.getDecodedData();
+            if (cffBytes == null || cffBytes.length < 4) return null;
+            cff = new CFFParser(cffBytes);
+        } catch (IOException e) {
+            LOG.fine(() -> "compositeCffCidToGid: CFF parse failed for "
+                    + pdfFont.getBaseFont() + ": " + e);
+            return null;
+        }
+        if (!cff.cidKeyed) {
+            int[] identity = new int[cff.numGlyphs];
+            for (int gid = 0; gid < cff.numGlyphs; gid++) identity[gid] = gid;
+            return identity;
+        }
+        int maxCid = 0;
+        for (int gid = 0; gid < cff.numGlyphs; gid++) {
+            if (cff.charsetSids[gid] > maxCid) maxCid = cff.charsetSids[gid];
+        }
+        int[] map = new int[maxCid + 1];
+        java.util.Arrays.fill(map, -1);
+        for (int gid = 0; gid < cff.numGlyphs; gid++) {
+            int cid = cff.charsetSids[gid];
+            if (cid >= 0 && map[cid] < 0) map[cid] = gid;
+        }
+        return map;
+    }
 
     /**
      * Returns a 256-entry array mapping each 1-byte character code to its glyph
@@ -229,13 +298,17 @@ public final class CFFFontLoader {
         Integer spaceGid = nameToGid.get("space");
         if (spaceGid != null) unicodeToGid.putIfAbsent(0x20, spaceGid);
 
-        // Build advance-width array (units 1/1000 em)
+        // Build advance-width array (units 1/1000 em). First code wins, matching
+        // the unicodeToGid cmap above: several codes can share one glyph name
+        // (WinAnsi maps both 0x20 and 0xA0 nbsp to "space"), and a sharer that
+        // falls outside the PDF /Widths range reports the 1000-unit default —
+        // letting it overwrite turned every space into a full em (corpus 35126).
         int[] widths = new int[cff.numGlyphs];
         for (int code = 0; code <= 255; code++) {
             String name = (enc != null) ? enc.getGlyphName(code) : null;
             if (name == null) continue;
             Integer gid = nameToGid.get(name);
-            if (gid == null) continue;
+            if (gid == null || widths[gid] > 0) continue;
             double w = pdfFont.getWidth(code);
             if (w > 0) widths[gid] = (int) Math.round(w);
         }

@@ -194,4 +194,44 @@ public abstract class MarkupAnnotation extends Annotation {
         }
         return val;
     }
+
+    /** Cached interior color (/IC); {@code null} means "not read / not set". */
+    private Color interiorColor;
+
+    /**
+     * Returns the interior (fill) color of a shape markup annotation — the
+     * {@code /IC} entry (ISO 32000-1 §12.5.6.8: Square/Circle/Polygon/PolyLine).
+     * Markup annotations that carry no {@code /IC} return {@code null}.
+     *
+     * @return the interior color, or {@code null} if none
+     */
+    public Color getInteriorColor() {
+        if (interiorColor != null) return interiorColor;
+        PdfBase ic = dict.get("IC");
+        if (ic instanceof PdfArray) {
+            PdfArray arr = (PdfArray) ic;
+            if (arr.size() == 3) {
+                return Color.fromRgb(arr.getFloat(0, 0), arr.getFloat(1, 0), arr.getFloat(2, 0));
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Sets the interior (fill) color — the {@code /IC} entry. {@code null} removes it.
+     *
+     * @param color the interior color, or {@code null} to clear
+     */
+    public void setInteriorColor(Color color) {
+        this.interiorColor = color;
+        if (color == null) {
+            dict.remove(PdfName.of("IC"));
+            return;
+        }
+        PdfArray ic = new PdfArray();
+        ic.add(new PdfFloat(color.getR()));
+        ic.add(new PdfFloat(color.getG()));
+        ic.add(new PdfFloat(color.getB()));
+        dict.set(PdfName.of("IC"), ic);
+    }
 }

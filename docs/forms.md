@@ -189,7 +189,7 @@ try (Document doc = new Document("file.pdf")) {
 
 ## Limitations
 
-- **XFA**: only data-layer access; full XFA rendering not supported.
+- **XFA forms** are covered on their own page — reading/filling data, conversion to AcroForm, flattening, and rendering. See [xfa.md](xfa.md).
 - **Field appearances**: the library generates standard appearances on save; complex custom appearances from the original document may be regenerated.
-- **JavaScript actions**: the library does not execute embedded form JavaScript (intentional; for security).
-- **Digital signatures attached to form fields**: see [docs/security.md](security.md).
+- **AcroForm JavaScript actions**: embedded form JavaScript is not executed for AcroForm fields (intentional, for security). XFA scripting is handled separately during XFA conversion/rendering — see [xfa.md](xfa.md).
+- **Digital signatures on form fields**: see [signatures.md](signatures.md).

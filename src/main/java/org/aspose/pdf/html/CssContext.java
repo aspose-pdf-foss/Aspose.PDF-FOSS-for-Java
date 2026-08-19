@@ -32,6 +32,13 @@ public class CssContext {
     private double marginRight;
     private double width;
     private double height;
+    private String display;
+    private double widthPercent;
+    private String cssFloat;
+    private String whiteSpace;
+    private double borderBottomWidth;
+    private Color borderBottomColor;
+    private String borderBottomStyle;
 
     /**
      * Creates a new child context that inherits text properties from this context.
@@ -53,6 +60,10 @@ public class CssContext {
         c.color = this.color;
         c.lineHeight = this.lineHeight;
         c.textAlign = this.textAlign;
+        // NOTE: white-space is intentionally NOT inherited here. CSS does inherit
+        // it, but our table layout cannot honour "nowrap" on every descendant of a
+        // nowrap ancestor without columns overlapping; restrict nowrap to elements
+        // a rule (or the HTML nowrap attribute) targets directly.
         return c;
     }
 
@@ -343,6 +354,63 @@ public class CssContext {
     }
 
     /**
+     * Returns the width as a percentage of the containing block (0 = not a
+     * percentage width). Box property, not inherited.
+     *
+     * @return the width percentage
+     */
+    public double getWidthPercent() {
+        return widthPercent;
+    }
+
+    /**
+     * Sets the width as a percentage of the containing block.
+     *
+     * @param pct the width percentage
+     */
+    public void setWidthPercent(double pct) {
+        this.widthPercent = pct;
+    }
+
+    /**
+     * Returns the CSS {@code float} value ({@code left}/{@code right}), or
+     * {@code null}. Box property, not inherited.
+     *
+     * @return the float value
+     */
+    public String getCssFloat() {
+        return cssFloat;
+    }
+
+    /**
+     * Sets the CSS {@code float} value.
+     *
+     * @param f the float value
+     */
+    public void setCssFloat(String f) {
+        this.cssFloat = f;
+    }
+
+    /**
+     * Returns the CSS {@code white-space} value ({@code nowrap}, {@code normal},
+     * …), or {@code null}. Inherited.
+     *
+     * @return the white-space value
+     */
+    public String getWhiteSpace() {
+        return whiteSpace;
+    }
+
+    /**
+     * Sets the CSS {@code white-space} value.
+     *
+     * @param ws the white-space value
+     */
+    public void setWhiteSpace(String ws) {
+        this.whiteSpace = ws;
+    }
+
+    /**
      * Returns the explicit height in points, or 0 if not set.
      *
      * @return the height
@@ -358,5 +426,81 @@ public class CssContext {
      */
     public void setHeight(double height) {
         this.height = height;
+    }
+
+    /**
+     * Returns the CSS {@code display} value (e.g. {@code flex}, {@code table},
+     * {@code table-cell}, {@code none}), or {@code null} if not set. Not
+     * inherited — reset for each element.
+     *
+     * @return the display value, or {@code null}
+     */
+    public String getDisplay() {
+        return display;
+    }
+
+    /**
+     * Sets the CSS {@code display} value.
+     *
+     * @param display the display value, or {@code null}
+     */
+    public void setDisplay(String display) {
+        this.display = display;
+    }
+
+    /**
+     * Returns the bottom-border thickness in points (0 = none). Box property,
+     * not inherited.
+     *
+     * @return the bottom-border thickness
+     */
+    public double getBorderBottomWidth() {
+        return borderBottomWidth;
+    }
+
+    /**
+     * Sets the bottom-border thickness in points.
+     *
+     * @param w the thickness
+     */
+    public void setBorderBottomWidth(double w) {
+        this.borderBottomWidth = w;
+    }
+
+    /**
+     * Returns the bottom-border colour, or {@code null}.
+     *
+     * @return the bottom-border colour
+     */
+    public Color getBorderBottomColor() {
+        return borderBottomColor;
+    }
+
+    /**
+     * Sets the bottom-border colour.
+     *
+     * @param c the colour
+     */
+    public void setBorderBottomColor(Color c) {
+        this.borderBottomColor = c;
+    }
+
+    /**
+     * Returns the bottom-border style ({@code solid}/{@code dotted}/{@code dashed}),
+     * or {@code null}.
+     *
+     * @return the border style
+     */
+    public String getBorderBottomStyle() {
+        return borderBottomStyle;
+    }
+
+    /**
+     * Sets the bottom-border style.
+     *
+     * @param style the style keyword
+     */
+    public void setBorderBottomStyle(String style) {
+        this.borderBottomStyle = style;
     }
 }

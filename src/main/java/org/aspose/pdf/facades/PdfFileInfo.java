@@ -624,12 +624,17 @@ public class PdfFileInfo implements Closeable {
                 detectCustomPasswordCapabilities(encDict, password);
                 return;
             }
-            hasOpenPassword = encDict.getU() != null && encDict.getU().length > 0;
-            hasEditPassword = encDict.getO() != null && encDict.getO().length > 0;
+            // /U and /O are ALWAYS present in an encrypted PDF (they hold the
+            // computed validation hashes even for an empty password —
+            // ISO 32000-1:2008, §7.6.3.4). "Has a password" therefore means the
+            // EMPTY password does not authenticate, not that the entry exists
+            // (PDFNEWNET-33768: owner-only protection ⇒ HasOpenPassword=false).
+            StandardSecurityHandler handler = new StandardSecurityHandler(encDict, getDocumentId(parser));
+            hasOpenPassword = !handler.authenticateUserPassword(new byte[0]);
+            hasEditPassword = !handler.authenticateOwnerPassword(new byte[0]);
             if (password == null) {
                 return;
             }
-            StandardSecurityHandler handler = new StandardSecurityHandler(encDict, getDocumentId(parser));
             byte[] passwordBytes = password.getBytes(StandardCharsets.ISO_8859_1);
             if (handler.authenticateUserPassword(passwordBytes)) {
                 passwordType = PasswordType.User;

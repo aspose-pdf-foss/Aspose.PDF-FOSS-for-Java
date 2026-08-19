@@ -36,28 +36,27 @@ public class JPXDecodeFilterDWTTest {
     }
 
     /**
-     * 9/7 inverse DWT: when low half = K (the spec's gain) and high half = 0,
-     * we expect the reconstruction to be 1.0 everywhere (since forward 9/7
-     * of constant-1 input divides the low coefficients by K).
-     *
-     * <p>If the inverse incorrectly multiplied low by 1/K instead of K, the
-     * reconstruction would be 1/K^2 ≈ 0.66 instead of 1.0.</p>
+     * 9/7 inverse DWT: the ISO 15444-1 F.4.8.1 forward transform of a
+     * constant-1 signal yields low = 1.0 (the lifting's DC gain is cancelled
+     * by the final ×1/K low-band scaling) and high = 0, so the inverse fed
+     * (1 | 0) must reconstruct 1.0 everywhere. Pins the STANDARD scaling
+     * convention (inverse: low ×K, high ×1/K) that real encoders (OpenJPEG,
+     * Kakadu) produce — verified against OpenJPEG-encoded oracle codestreams.
+     * The previous K²-based scaling reconstructed ~2× contrast on every real
+     * 9/7 stream.
      */
     @Test
     public void dwt97_constantLow_zeroHigh_reconstructsConstant() {
         int len = 16;
         int halfLen = (len + 1) / 2;
         double[] buf = new double[len];
-        // If forward 9/7 of constant-1 input produces LL = 1/K (low samples
-        // divided by K), then inverse should be fed 1/K to recover 1.
-        // We feed K^-1 directly and expect 1.0 output.
-        for (int i = 0; i < halfLen; i++) buf[i] = 1.0 / K_97; // low
+        for (int i = 0; i < halfLen; i++) buf[i] = 1.0; // low
 
         JPXDecodeFilter.inverseDWT97_1D(buf, 0, len);
 
         for (int i = 0; i < len; i++) {
             assertEquals(1.0, buf[i], EPS_97,
-                    "9/7 IDWT of (1/K, ..., 1/K | 0,...,0) should reconstruct 1; idx " + i);
+                    "9/7 IDWT of (1, ..., 1 | 0,...,0) should reconstruct 1; idx " + i);
         }
     }
 
@@ -75,9 +74,8 @@ public class JPXDecodeFilterDWTTest {
     }
 
     /**
-     * Alternative 9/7 convention: forward MULTIPLIES low by K instead of
-     * dividing. If THIS is the convention used by Kakadu / JPEG 2000 spec,
-     * feeding low = K to inverse should yield 1.0.
+     * Linearity of the inverse: feeding low = K must reconstruct K everywhere
+     * (the transform is linear, so scaling the input scales the output).
      */
     @Test
     public void dwt97_constantLow_K_check_alternate() {
@@ -88,9 +86,9 @@ public class JPXDecodeFilterDWTTest {
 
         JPXDecodeFilter.inverseDWT97_1D(buf, 0, len);
 
-        System.out.println("[dwt97] feed K=" + K_97 + " expect ?");
         for (int i = 0; i < len; i++) {
-            System.out.printf("  out[%d] = %.6f%n", i, buf[i]);
+            assertEquals(K_97, buf[i], EPS_97,
+                    "9/7 IDWT of (K, ..., K | 0,...,0) should reconstruct K; idx " + i);
         }
     }
 
@@ -137,47 +135,25 @@ public class JPXDecodeFilterDWTTest {
             int ri = mirror.applyAsInt(i + 1);
             x[i] += D * (x[li] + x[ri]);
         }
-        // Scaling: convention 1 — even (low) /= K², odd (high) *= K². The inverse
-        // multiplies low by K² so that the lifting's residual 1/K loss-side
-        // gain produces the correct DC reconstruction (see DeviceCMYK comments
-        // and dwt97_constantLow_zeroHigh_reconstructsConstant).
-        double K2 = K_97 * K_97;
+        // Scaling per ISO F.4.8.1: even (low) /= K, odd (high) *= K — the
+        // convention real encoders write; our inverse undoes it with
+        // low ×K, high ×1/K.
         double[] sc1 = x.clone();
-        for (int i = 0; i < len; i += 2) sc1[i] /= K2;
-        for (int i = 1; i < len; i += 2) sc1[i] *= K2;
-        // Convention 2 — even *= K, odd /= K (legacy, won't round-trip under
-        // the K² inverse; left as a probe).
-        double[] sc2 = x.clone();
-        for (int i = 0; i < len; i += 2) sc2[i] *= K_97;
-        for (int i = 1; i < len; i += 2) sc2[i] /= K_97;
+        for (int i = 0; i < len; i += 2) sc1[i] /= K_97;
+        for (int i = 1; i < len; i += 2) sc1[i] *= K_97;
 
-        // De-interleave each into [low ... | high ...] layout that our IDWT expects.
+        // De-interleave into the [low ... | high ...] layout our IDWT expects.
         int halfLen = (len + 1) / 2;
-        double[] sub1 = new double[len], sub2 = new double[len];
+        double[] sub1 = new double[len];
         for (int n = 0; n < halfLen; n++) sub1[n] = sc1[2 * n];
         for (int n = 0; n < len - halfLen; n++) sub1[halfLen + n] = sc1[2 * n + 1];
-        for (int n = 0; n < halfLen; n++) sub2[n] = sc2[2 * n];
-        for (int n = 0; n < len - halfLen; n++) sub2[halfLen + n] = sc2[2 * n + 1];
 
-        // Apply our inverse
         double[] rec1 = sub1.clone();
-        double[] rec2 = sub2.clone();
         JPXDecodeFilter.inverseDWT97_1D(rec1, 0, len);
-        JPXDecodeFilter.inverseDWT97_1D(rec2, 0, len);
 
-        System.out.println("[roundtrip] orig=" + java.util.Arrays.toString(orig));
-        System.out.println("[roundtrip] rec  (forward /K, *K — convention 1): "
-                + java.util.Arrays.toString(rec1));
-        System.out.println("[roundtrip] rec  (forward *K, /K — convention 2): "
-                + java.util.Arrays.toString(rec2));
-
-        // One of these must match (within EPS).
-        boolean conv1ok = true, conv2ok = true;
         for (int i = 0; i < len; i++) {
-            if (Math.abs(rec1[i] - orig[i]) > 1e-3) conv1ok = false;
-            if (Math.abs(rec2[i] - orig[i]) > 1e-3) conv2ok = false;
+            assertEquals(orig[i], rec1[i], 1e-3,
+                    "9/7 forward(ISO scaling) → inverse should round-trip; idx " + i);
         }
-        System.out.println("[roundtrip] convention1 OK=" + conv1ok + "   convention2 OK=" + conv2ok);
-        assertTrue(conv1ok || conv2ok, "Neither scaling convention round-trips");
     }
 }

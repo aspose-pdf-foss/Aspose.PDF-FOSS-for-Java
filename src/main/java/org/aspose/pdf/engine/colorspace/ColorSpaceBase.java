@@ -72,8 +72,14 @@ public abstract class ColorSpaceBase {
                 return CmykDisplay.toRGBInt(comps);
             case 3:
             default:
-                return DeviceRGB.INSTANCE.toRGBInt(comps[0], comps[1],
+                // Only plain DeviceRGB reaches this dispatch (tagged spaces —
+                // CalRGB/Lab/ICC — override toRGBInt(double[]) and merely
+                // delegate their final packing to DeviceRGB.toRGBInt), so the
+                // untagged print-parity shift belongs here, not inside
+                // DeviceRGB itself, or tagged colors would be double-shifted.
+                int rgb = DeviceRGB.INSTANCE.toRGBInt(comps[0], comps[1],
                         comps.length > 2 ? comps[2] : 0);
+                return RgbPrintShift.active() ? RgbPrintShift.shift(rgb) : rgb;
         }
     }
 
@@ -98,14 +104,20 @@ public abstract class ColorSpaceBase {
      * resources dictionary hands back the SAME PdfArray instance for a given
      * name, so identity keys hit reliably ({@code PdfArray.equals} is deep
      * value equality — unusable here both for cost and for cross-document
-     * collisions). Bounded: cleared wholesale when full so closed documents'
-     * objects are not pinned indefinitely.
+     * collisions).
+     *
+     * <p>The keys are held weakly: a resolved value such as
+     * {@link ICCBasedColorSpace} keeps a back-reference to its {@code PDFParser},
+     * so a plain strong-keyed static cache pins a whole document graph per
+     * cached colour space — 256 of those exhaust the heap in a long
+     * convert/render loop. With weak keys, once a document is closed and dropped
+     * its colour-space arrays become unreachable and the entries evaporate.
+     * ({@link org.aspose.pdf.engine.parser.PDFParser#close()} additionally drops
+     * the object cache and trailer, so the retained value's parser back-reference
+     * is lightweight.)</p>
      */
-    private static final java.util.Map<PdfBase, ColorSpaceBase> RESOLVE_CACHE =
-            java.util.Collections.synchronizedMap(new java.util.IdentityHashMap<>());
-
-    /** Cache bound — typical documents define a handful of color spaces. */
-    private static final int RESOLVE_CACHE_MAX = 256;
+    private static final org.aspose.pdf.engine.util.WeakIdentityHashMap<PdfBase, ColorSpaceBase>
+            RESOLVE_CACHE = new org.aspose.pdf.engine.util.WeakIdentityHashMap<>();
 
     public static ColorSpaceBase resolve(PdfBase csObj, Resources resources,
                                           PDFParser parser) throws IOException {
@@ -124,9 +136,6 @@ public abstract class ColorSpaceBase {
                 return cached;
             }
             ColorSpaceBase resolved = resolveFromArray((PdfArray) csObj, resources, parser);
-            if (RESOLVE_CACHE.size() >= RESOLVE_CACHE_MAX) {
-                RESOLVE_CACHE.clear();
-            }
             RESOLVE_CACHE.put(csObj, resolved);
             return resolved;
         }

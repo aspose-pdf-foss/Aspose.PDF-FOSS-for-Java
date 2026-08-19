@@ -269,13 +269,19 @@ public final class CCITTFaxDecodeFilter implements PdfFilter {
         while (rows == 0 || linesDecoded < rows) {
             if (br.eof()) break;
 
+            // Byte-align FIRST (§7.4.6 /EncodedByteAlign): each row's coded
+            // data begins on a byte boundary. Aligning only after the EOL
+            // probe let the previous row's zero fill bits (≤7) join the next
+            // code's leading zeros into a phantom "EOL" (≥11 zeros + 1) that
+            // swallowed that code — corpus 35275: rows desynced at ~x500 and
+            // the certificate scan smeared into noise.
+            if (byteAlign) br.alignToByte();
             // Consume an EOL pattern (≥11 zeros + 1, incl. fill bits) when one
             // is ahead — T.4 streams routinely carry EOLs before every line
             // even when the PDF /EndOfLine flag is false (corpus 29753: every
             // row is EOL-prefixed; treating the EOL zeros as white-run data
             // desynced the Huffman stream and smeared the whole fax page).
             consumeEOLIfPresent(br);
-            if (byteAlign) br.alignToByte();
 
             byte[] line = new byte[rowBytes];
             int col = 0;
@@ -300,9 +306,11 @@ public final class CCITTFaxDecodeFilter implements PdfFilter {
             linesDecoded++;
 
             // A bad code desyncs the bit stream — everything after it is
-            // garbage until the next EOL. Scan forward and resume there
-            // instead of decoding noise (each EOL marks a fresh row start).
-            if (rowError && !resyncToEOL(br)) {
+            // garbage until the next resync point. With /EncodedByteAlign
+            // the next byte boundary IS a resync point (the loop head
+            // realigns), so keep decoding; otherwise scan for the next EOL
+            // (each EOL marks a fresh row start).
+            if (rowError && !byteAlign && !resyncToEOL(br)) {
                 break; // no further EOL — rest of the data is unusable
             }
 

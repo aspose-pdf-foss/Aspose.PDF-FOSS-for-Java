@@ -58,6 +58,7 @@ public final class PDFLexer {
         private final TokenType type;
         private final String value;
         private final long position;
+        private boolean malformed;
 
         /**
          * Creates a new token.
@@ -70,6 +71,22 @@ public final class PDFLexer {
             this.type = type;
             this.value = value;
             this.position = position;
+        }
+
+        /**
+         * Marks this token as lexically malformed (e.g. a number carrying a
+         * second decimal point, or a "number" with no digits at all). The
+         * object/xref parsers stay lenient and ignore the flag; the content
+         * stream parser uses it to stop executing a damaged stream the way
+         * Acrobat does.
+         */
+        void setMalformed() {
+            this.malformed = true;
+        }
+
+        /** Returns true when the token was lexically malformed. */
+        public boolean isMalformed() {
+            return malformed;
         }
 
         /** Returns the token type. */
@@ -453,23 +470,39 @@ public final class PDFLexer {
         sb.append((char) firstChar);
         boolean hasDecimalPoint = (firstChar == '.');
 
+        boolean sawDigit = firstChar >= '0' && firstChar <= '9';
+        int terminator;
         while (true) {
             int c = reader.peek();
             if (c >= '0' && c <= '9') {
                 reader.read();
                 sb.append((char) c);
+                sawDigit = true;
             } else if (c == '.' && !hasDecimalPoint) {
                 reader.read();
                 sb.append('.');
                 hasDecimalPoint = true;
             } else {
+                terminator = c;
                 break;
             }
         }
 
         TokenType type = hasDecimalPoint ? TokenType.REAL : TokenType.INTEGER;
         LOGGER.log(Level.FINER, "{0} at {1}: {2}", new Object[]{type, pos, sb.toString()});
-        return new Token(type, sb.toString(), pos);
+        Token token = new Token(type, sb.toString(), pos);
+        // Damaged-stream signatures (corpus 46075.pdf, corrupted separators):
+        // a '.' attached to a number that already has one ("669.835.566"), or
+        // a digitless "number" fused to a non-delimiter (".c.0"). A digitless
+        // "." followed by whitespace stays a benign generator quirk that
+        // recovers as 0 (". 10 Td" — see ContentStreamParserTest).
+        boolean secondDot = terminator == '.' && hasDecimalPoint;
+        boolean fusedDigitless = !sawDigit
+                && !(terminator == -1 || isWhitespace(terminator) || isDelimiter(terminator));
+        if (secondDot || fusedDigitless) {
+            token.setMalformed();
+        }
+        return token;
     }
 
     /**

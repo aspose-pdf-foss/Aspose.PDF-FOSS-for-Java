@@ -35,6 +35,13 @@ public final class CFFParser {
     public final int numGlyphs;
     /** Glyph-id → glyph-name table (length == numGlyphs; index 0 is always ".notdef"). */
     public final String[] glyphNames;
+    /**
+     * Glyph-id → raw charset SID (length == numGlyphs; entry 0 is 0). In a
+     * CID-keyed font these values are CIDs, not string ids (Adobe TN#5176 §18).
+     */
+    public final int[] charsetSids;
+    /** True when the Top DICT carries a /ROS operator — a CID-keyed font. */
+    public final boolean cidKeyed;
 
     /**
      * Parses a CFF stream.
@@ -97,7 +104,9 @@ public final class CFFParser {
         this.numGlyphs = charStrings.count;
 
         // -- Charset --
+        this.cidKeyed = topDict.hasRos;
         this.glyphNames = new String[numGlyphs];
+        this.charsetSids = new int[numGlyphs];
         glyphNames[0] = ".notdef";
         if (numGlyphs > 1) {
             readCharset(topDict.charsetOffset, customStrings);
@@ -115,6 +124,7 @@ public final class CFFParser {
         int charStringType = 2;       // op 12-6: default 2 (Type 2)
         int privateDictSize = 0;      // op 18 second operand
         int privateDictOffset = 0;    // op 18 first operand
+        boolean hasRos = false;       // op 12-30: Registry-Ordering-Supplement (CID-keyed)
     }
 
     private static TopDict parseTopDict(byte[] dict) {
@@ -191,6 +201,7 @@ public final class CFFParser {
                 }
                 break;
             case 1206: if (n > 0) t.charStringType = (int) operands[0]; break;
+            case 1230: t.hasRos = true; break;
             default: /* ignore */ break;
         }
     }
@@ -246,18 +257,23 @@ public final class CFFParser {
 
     private void readCharset(int offset, String[] customStrings) throws IOException {
         if (offset == 0) {
-            // Predefined ISOAdobe charset
+            // Predefined charset: ISOAdobe for name-keyed fonts; for a
+            // CID-keyed font the default charset is the identity CID mapping.
             for (int gid = 1; gid < numGlyphs && gid < CFFStandardStrings.ISO_ADOBE_LEN; gid++) {
                 glyphNames[gid] = CFFStandardStrings.lookup(gid);
             }
             for (int gid = CFFStandardStrings.ISO_ADOBE_LEN; gid < numGlyphs; gid++) {
                 glyphNames[gid] = "glyph" + gid;
             }
+            for (int gid = 1; gid < numGlyphs; gid++) charsetSids[gid] = gid;
             return;
         }
         if (offset == 1 || offset == 2) {
             // Predefined Expert / ExpertSubset — rarely seen. Fall back to numeric names.
-            for (int gid = 1; gid < numGlyphs; gid++) glyphNames[gid] = "glyph" + gid;
+            for (int gid = 1; gid < numGlyphs; gid++) {
+                glyphNames[gid] = "glyph" + gid;
+                charsetSids[gid] = gid;
+            }
             return;
         }
         pos = offset;
@@ -266,6 +282,7 @@ public final class CFFParser {
             for (int gid = 1; gid < numGlyphs; gid++) {
                 int sid = readU16();
                 glyphNames[gid] = sidToName(sid, customStrings);
+                charsetSids[gid] = sid;
             }
         } else if (format == 1 || format == 2) {
             int gid = 1;
@@ -273,7 +290,8 @@ public final class CFFParser {
                 int first = readU16();
                 int nLeft = (format == 1) ? readU8() : readU16();
                 for (int i = 0; i <= nLeft && gid < numGlyphs; i++) {
-                    glyphNames[gid++] = sidToName(first + i, customStrings);
+                    glyphNames[gid] = sidToName(first + i, customStrings);
+                    charsetSids[gid++] = first + i;
                 }
             }
         } else {

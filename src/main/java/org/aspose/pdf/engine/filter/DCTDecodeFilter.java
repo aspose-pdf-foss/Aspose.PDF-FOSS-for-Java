@@ -57,6 +57,13 @@ public final class DCTDecodeFilter implements PdfFilter {
         // CMYK-declared image with RGB-sized payload.
         if (bands == 4) {
             boolean inverted = isAdobeInvertedCmyk(encoded);
+            // Image-level /Decode [1 0 1 0 1 0 1 0] (§8.9.5.2, forwarded via
+            // PdfStream.getEffectiveDecodeParams) inverts each CMYK component
+            // AFTER filter decode — fold it into the APP14 decision (XOR):
+            // an Adobe-inverted JPEG whose /Decode un-inverts is net normal.
+            if (isFullInversionDecode(params, 4)) {
+                inverted = !inverted;
+            }
             byte[] decoded = new byte[w * h * 3];
             int[] pixel = new int[4];
             int off = 0;
@@ -234,6 +241,31 @@ public final class DCTDecodeFilter implements PdfFilter {
      * and follow this convention; the rare non-inverted variant would have an
      * APP14 with a different transform code.</p>
      */
+    /**
+     * True when the forwarded image-level {@code /Decode} array requests a
+     * full per-component inversion ({@code [1 0]} repeated for every
+     * component). Partial or non-inverting arrays return false — only the
+     * all-inverted form composes with the APP14 inversion as a simple XOR.
+     *
+     * @param params filter params (augmented with /Decode by PdfStream)
+     * @param comps  expected component count
+     * @return true for a full [1 0 ×comps] inversion
+     */
+    private static boolean isFullInversionDecode(PdfDictionary params, int comps) {
+        if (params == null) return false;
+        org.aspose.pdf.engine.pdfobjects.PdfBase d = params.get("Decode");
+        if (!(d instanceof org.aspose.pdf.engine.pdfobjects.PdfArray)) return false;
+        org.aspose.pdf.engine.pdfobjects.PdfArray a =
+                (org.aspose.pdf.engine.pdfobjects.PdfArray) d;
+        if (a.size() != comps * 2) return false;
+        for (int i = 0; i < comps; i++) {
+            if (a.getFloat(2 * i, -1f) != 1f || a.getFloat(2 * i + 1, -1f) != 0f) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static boolean isAdobeInvertedCmyk(byte[] encoded) {
         if (encoded == null || encoded.length < 14) return true;
         // Walk past SOI (FF D8) and scan marker segments until SOS or EOI.

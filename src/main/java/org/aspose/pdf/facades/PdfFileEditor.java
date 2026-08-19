@@ -327,6 +327,7 @@ public class PdfFileEditor {
         }
         Map<String, Document> sourceDocs = new LinkedHashMap<>();
         try (Document baseDoc = new Document(inputFiles[0])) {
+            convertXfaFormToStandard(baseDoc);
             PageCollection basePages = baseDoc.getPages();
             int basePageCountBefore = basePages.getCount();
             // Track per-source how many pages we appended and the appended-page
@@ -336,6 +337,7 @@ public class PdfFileEditor {
                 Document srcDoc = sourceDocs.get(sourcePath);
                 if (srcDoc == null) {
                     srcDoc = new Document(sourcePath);
+                    convertXfaFormToStandard(srcDoc);
                     sourceDocs.put(sourcePath, srcDoc);
                 }
                 int pagesBefore = basePages.getCount();
@@ -589,12 +591,14 @@ public class PdfFileEditor {
         }
         Map<InputStream, Document> sourceDocs = new IdentityHashMap<>();
         try (Document baseDoc = new Document(inputStreams[0])) {
+            convertXfaFormToStandard(baseDoc);
             PageCollection basePages = baseDoc.getPages();
             for (int i = 1; i < inputStreams.length; i++) {
                 InputStream sourceStream = inputStreams[i];
                 Document srcDoc = sourceDocs.get(sourceStream);
                 if (srcDoc == null) {
                     srcDoc = new Document(sourceStream);
+                    convertXfaFormToStandard(srcDoc);
                     sourceDocs.put(sourceStream, srcDoc);
                 }
                 basePages.add(srcDoc.getPages());
@@ -636,6 +640,24 @@ public class PdfFileEditor {
         } catch (Exception e) {
             LOG.log(Level.WARNING, "Failed to concatenate documents", e);
             return false;
+        }
+    }
+
+    /**
+     * Converts a dynamic XFA form to a standard AcroForm before merging.
+     * XFA cannot survive page-level concatenation (the packet describes the
+     * whole document), so Aspose's concatenate converts XFA sources to
+     * standard forms — a dynamic form expands to its paginated layout
+     * (PDFNET_44335). Failures are logged and the document is merged as-is.
+     */
+    private void convertXfaFormToStandard(Document doc) {
+        try {
+            org.aspose.pdf.forms.Form form = doc.getForm();
+            if (form != null && form.getType() == org.aspose.pdf.forms.Form.FormType.XFA) {
+                form.setType(org.aspose.pdf.forms.Form.FormType.Standard);
+            }
+        } catch (IOException | RuntimeException e) {
+            LOG.log(Level.FINE, "XFA to standard form conversion failed during concatenate", e);
         }
     }
 
@@ -864,9 +886,11 @@ public class PdfFileEditor {
         try {
             Document doc = new Document(inputFile);
             PageCollection pages = doc.getPages();
-            int[] sorted = pageNumbers.clone();
-            Arrays.sort(sorted);
-            // Delete in reverse order to preserve indices
+            // Dedupe: a page number listed twice must delete only once —
+            // after the first removal the same index would hit the FOLLOWING
+            // page (C# Verify_Delete2 passes 11 twice). Delete in reverse
+            // order to preserve indices.
+            int[] sorted = java.util.stream.IntStream.of(pageNumbers).distinct().sorted().toArray();
             for (int i = sorted.length - 1; i >= 0; i--) {
                 if (sorted[i] >= 1 && sorted[i] <= pages.getCount()) {
                     pages.delete(sorted[i]);
@@ -1021,20 +1045,15 @@ public class PdfFileEditor {
             ch = resolveResizeValue(parameters.getContentsHeight(), pageHeight);
         }
 
-        // Auto-adjust if sums differ from page dimensions — match Aspose's
-        // tolerant behavior; callers often over- or under-specify margins.
-        double sumX = lm + cw + rm;
-        if (sumX > 0 && Math.abs(sumX - pageWidth) > 0.1) {
-            double k = pageWidth / sumX;
-            lm *= k; cw *= k; rm *= k;
-        }
-        double sumY = tm + ch + bm;
-        if (sumY > 0 && Math.abs(sumY - pageHeight) > 0.1) {
-            double k = pageHeight / sumY;
-            tm *= k; ch *= k; bm *= k;
-        }
+        // The caller's margins + content area DEFINE the new page size (Aspose
+        // ResizeContents semantics): newWidth = leftMargin + contentWidth +
+        // rightMargin, newHeight = topMargin + contentHeight + bottomMargin. When
+        // the content dimension is auto (null) it was set to pageDim - margins
+        // above, so the new size equals the old one (a pure re-margin, no resize).
+        double newWidth = lm + cw + rm;
+        double newHeight = tm + ch + bm;
 
-        if (cw <= 0 || ch <= 0) {
+        if (cw <= 0 || ch <= 0 || newWidth <= 0 || newHeight <= 0) {
             LOG.warning("Resolved content area is non-positive, skipping resize");
             return;
         }
@@ -1047,6 +1066,16 @@ public class PdfFileEditor {
         double ty = bm;
         PdfPageEditor.wrapPageContent(page, scaleX, 0, 0, scaleY, tx, ty);
         transformAnnotations(page, scaleX, scaleY, tx, ty);
+
+        // Resize the page box itself to the new dimensions — otherwise the scaled
+        // content sits on a page that still reports the old size (PDFNET-59563:
+        // resize-to-A4 must actually change getCropBox()/getRect()). Both boxes
+        // are normalised to the new origin-0 rectangle.
+        if (Math.abs(newWidth - pageWidth) > 0.001 || Math.abs(newHeight - pageHeight) > 0.001) {
+            Rectangle newBox = new Rectangle(0, 0, newWidth, newHeight);
+            page.setMediaBox(newBox);
+            page.setCropBox(newBox);
+        }
     }
 
     /**
@@ -1088,8 +1117,14 @@ public class PdfFileEditor {
             }
             if (a == null) continue;
 
+            // A Text (note) annotation is a fixed-size icon: its /Rect defines the
+            // icon anchor, not a scalable region, so Acrobat/Aspose leave it
+            // unchanged on a content resize. Only translate its origin? No —
+            // matched behavior keeps it entirely fixed. All other annotations
+            // scale with the content.
+            boolean fixedIcon = a instanceof org.aspose.pdf.annotations.TextAnnotation;
             Rectangle r = a.getRect();
-            if (r != null) {
+            if (r != null && !fixedIcon) {
                 a.setRect(new Rectangle(
                         r.getLLX() * scaleX + tx,
                         r.getLLY() * scaleY + ty,
@@ -1129,6 +1164,23 @@ public class PdfFileEditor {
                         out.add(transformXYArray(stroke, scaleX, scaleY, tx, ty));
                     }
                     ink.setInkList(out);
+                }
+            }
+
+            if (a instanceof org.aspose.pdf.annotations.LineAnnotation) {
+                // The /L entry (start & end points) is in page space and must be
+                // transformed alongside /Rect, like InkList/QuadPoints above.
+                org.aspose.pdf.annotations.LineAnnotation ln =
+                        (org.aspose.pdf.annotations.LineAnnotation) a;
+                org.aspose.pdf.Point s = ln.getStarting();
+                if (s != null) {
+                    ln.setStarting(new org.aspose.pdf.Point(
+                            s.getX() * scaleX + tx, s.getY() * scaleY + ty));
+                }
+                org.aspose.pdf.Point e = ln.getEnding();
+                if (e != null) {
+                    ln.setEnding(new org.aspose.pdf.Point(
+                            e.getX() * scaleX + tx, e.getY() * scaleY + ty));
                 }
             }
         }

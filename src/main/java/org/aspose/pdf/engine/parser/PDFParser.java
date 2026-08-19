@@ -92,6 +92,11 @@ public final class PDFParser implements Closeable {
 
         // 1. Parse header: %PDF-X.Y
         parseHeader();
+        if (headerOffset > 0) {
+            // Leading junk before %PDF-: stored byte offsets are measured from
+            // the header (Acrobat convention) — tell the xref parser the base.
+            xrefParser.setBaseOffset(headerOffset);
+        }
 
         try {
             // 2. Find startxref position
@@ -311,6 +316,16 @@ public final class PDFParser implements Closeable {
         }
         if (root instanceof PdfDictionary
                 && "Catalog".equals(((PdfDictionary) root).getNameAsString("Type"))) {
+            return (PdfDictionary) root;
+        }
+        // Some producers omit /Type /Catalog entirely (corpus PdfForm5:
+        // "1 0 obj <</Pages 3 0 R /AcroForm 35 0 R>>"). Acrobat accepts such
+        // roots; a /Pages entry with NO conflicting /Type is a strong catalog
+        // signal, while the strict check above still rejects xref-corruption
+        // mispoints (an image stream mistaken for the root carries a /Type).
+        if (root instanceof PdfDictionary
+                && ((PdfDictionary) root).getNameAsString("Type") == null
+                && ((PdfDictionary) root).get("Pages") != null) {
             return (PdfDictionary) root;
         }
         // /Root referred to a non-catalog object — typical when xref offsets
@@ -707,6 +722,9 @@ public final class PDFParser implements Closeable {
      * Parses the PDF/FDF header (%PDF-X.Y or %FDF-X.Y).
      * FDF (Forms Data Format) files use the same PDF object model as PDF (ISO 32000-1 §12.7.7).
      */
+    /** Position of the %PDF- header when the file has leading junk bytes; else 0. */
+    private long headerOffset;
+
     private void parseHeader() throws IOException {
         reader.seek(0);
         String line = reader.readLine();
@@ -737,6 +755,7 @@ public final class PDFParser implements Closeable {
                 throw new IOException("Not a PDF/FDF file: missing %PDF- or %FDF- header");
             }
             LOGGER.log(Level.WARNING, "Found PDF/FDF header at offset {0}; tolerating leading junk bytes", headerPos);
+            headerOffset = headerPos;
             reader.seek(headerPos);
             line = reader.readLine();
             if (line == null || (!line.startsWith("%PDF-") && !line.startsWith("%FDF-"))) {
@@ -1409,12 +1428,37 @@ public final class PDFParser implements Closeable {
     }
 
     /**
-     * Closes the underlying reader, releasing any associated resources.
+     * Closes the underlying reader and drops the parsed object graph, releasing
+     * the associated resources.
+     *
+     * <p>Besides closing the reader this deliberately clears the lazy-load
+     * {@link #objectCache} and nulls {@link #trailer} / {@link #xrefEntries}.
+     * The trailer strongly references the {@code /Root} catalog and hence the
+     * entire page tree (down to every font dictionary), and the object cache
+     * holds every object ever loaded. Process-wide render caches (e.g. the
+     * colour-space resolve cache, which stores an {@code ICCBasedColorSpace}
+     * that keeps a back-reference to this parser) can outlive the owning
+     * {@link org.aspose.pdf.Document}; if a closed parser kept its trailer and
+     * object cache, that single retained reference would pin the whole document
+     * graph, so a long convert/render loop over thousands of files exhausts the
+     * heap. Dropping them here makes a closed parser lightweight, so a lingering
+     * reference retains almost nothing.</p>
+     *
+     * <p>After {@code close()} the parser must not be used to resolve further
+     * objects — the reader is closed, matching the pre-existing contract.</p>
      *
      * @throws IOException if an I/O error occurs
      */
     @Override
     public void close() throws IOException {
-        reader.close();
+        try {
+            reader.close();
+        } finally {
+            objectCache.clear();
+            loadingInProgress.clear();
+            trailer = null;
+            xrefEntries = null;
+            decryptor = null;
+        }
     }
 }

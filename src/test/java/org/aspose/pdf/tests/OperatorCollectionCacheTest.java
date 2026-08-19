@@ -189,10 +189,21 @@ public class OperatorCollectionCacheTest {
         page.setContents(replacement);
 
         OperatorCollection ops2 = page.getContents();
-        assertSame(replacement, ops2,
-                "setContents() must make the supplied collection the new cache");
+        // setContents() invalidates the cache and writes authoritative bytes; the
+        // next getContents() RE-PARSES them into typed, render-ready operators
+        // (ConcatenateMatrix/GSave/… rather than generic Operator instances) — so
+        // it returns a fresh collection, not the caller-supplied one.
         assertNotSame(ops1, ops2,
                 "previous cache must be evicted after setContents()");
+        assertNotSame(replacement, ops2,
+                "setContents() invalidates the cache; getContents() re-parses the written bytes");
+        // …but the re-parsed content reflects the replacement (the 'fresh' text).
+        StringBuilder rendered = new StringBuilder();
+        for (Operator op : ops2) {
+            rendered.append(op.toString()).append(' ');
+        }
+        assertTrue(rendered.toString().contains("fresh"),
+                "re-parsed content must contain the replacement text, was: " + rendered);
     }
 
     @Test

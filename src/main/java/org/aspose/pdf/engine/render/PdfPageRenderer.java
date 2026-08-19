@@ -61,10 +61,79 @@ public class PdfPageRenderer {
     private static final int MAX_FORM_DEPTH = 10;
 
     private final TextRenderer textRenderer = new TextRenderer();
+
+    /** Canvas size in device pixels of the page being rendered — sizes the
+     *  offscreen buffers for transparency-group compositing. */
+    private int canvasPixelW;
+    private int canvasPixelH;
+
+    /** Optional-content groups hidden for this render (§8.11.4: the catalog's
+     *  /OCProperties default configuration; in Acrobat-print-parity mode the
+     *  /Usage /Print /PrintState overrides it). Identity-keyed — the parser
+     *  caches resolved objects, so a group's dictionary is one instance. */
+    private final java.util.Set<PdfDictionary> hiddenOcgs =
+            java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+    /** Marked-content nesting: true = that BDC level suppresses painting. */
+    private final Deque<Boolean> mcStack = new ArrayDeque<>();
+    /** Count of active suppressing marked-content levels (0 = paint normally). */
+    private int ocSuppress;
+
+    /** When true, text-show ops advance the text matrix but paint nothing
+     *  (executed at Tr=3, invisible) — used to rasterize a page's vector-only
+     *  underlay for HTML export without duplicating the HTML text layer. */
+    private boolean suppressText;
+    /** With {@link #suppressText}: keep NON-HORIZONTAL text painted (fixed-layout
+     *  targets re-emit only horizontal text as positioned frames). */
+    private boolean suppressTextKeepRotated;
+    /** When true, raster images (Image XObjects and inline BI images) are
+     *  skipped; vector paths, shadings and Form-XObject recursion still paint. */
+    private boolean suppressRasterImages;
     {
         // Type 3 glyphs are content streams (§9.6.5); the text renderer calls
         // back into this operator machinery to execute them.
         textRenderer.setType3Executor(this::executeType3GlyphStream);
+    }
+
+    /**
+     * Suppresses text painting for subsequent renders (text-show ops still
+     * advance the text matrix, so surrounding graphics are unaffected).
+     *
+     * @param suppressText true to paint no glyphs
+     */
+    public void setSuppressText(boolean suppressText) {
+        this.suppressText = suppressText;
+    }
+
+    /**
+     * With {@link #setSuppressText}: keeps rotated (non-horizontal) text painted.
+     * A fixed-layout export positions only horizontal text as editable frames,
+     * so diagonal/vertical labels must stay visible in the underlay pixels.
+     *
+     * @param keep true to keep rotated text
+     */
+    public void setSuppressTextKeepRotated(boolean keep) {
+        this.suppressTextKeepRotated = keep;
+    }
+
+    /** True when the current combined text transform (Tm x CTM) is not horizontal. */
+    private static boolean isRotatedText(GraphicsState state) {
+        org.aspose.pdf.Matrix tm = state.getTextMatrix();
+        org.aspose.pdf.Matrix combined = tm.multiply(state.getCTM());
+        // The text x-axis maps to (a, b): horizontal text keeps |b| ~ 0
+        // (allowing the usual y-flip renderers apply via the CTM).
+        double a = combined.getA();
+        double b = combined.getB();
+        return Math.abs(b) > 0.05 * (Math.abs(a) + 1e-6);
+    }
+
+    /**
+     * Suppresses raster-image painting (Image XObjects and inline images) for
+     * subsequent renders; vector content still paints.
+     *
+     * @param suppressRasterImages true to paint no raster images
+     */
+    public void setSuppressRasterImages(boolean suppressRasterImages) {
+        this.suppressRasterImages = suppressRasterImages;
     }
 
     /**
@@ -77,16 +146,312 @@ public class PdfPageRenderer {
      * @throws IOException if reading the content stream fails
      */
     public BufferedImage renderPage(Page page, double dpiX, double dpiY) throws IOException {
-        Rectangle mediaBox = page.getMediaBox();
+        // Acrobat print-parity: a document /OutputIntents CMYK profile (PDF/X
+        // print condition, e.g. FOGRA27) governs Acrobat's DeviceCMYK print
+        // conversion — install it for this render (thread-local; cleared in
+        // the finally below).
+        boolean outputIntentSet = false;
+        boolean rgbShiftSet = false;
+        if (Boolean.getBoolean("render.acrobatPrintParity")) {
+            // Acrobat's print flattener kicks in when the page uses ANY
+            // transparency feature; only then does its print pipeline convert
+            // through the document's color intents. Opaque pages print with
+            // Acrobat's default CMYK handling (the measured lattice) and
+            // DeviceRGB identity — measured on two PDF/X-1a files with the
+            // IDENTICAL FOGRA27 intent: 35126 (ca=0.5 present, gold =
+            // intent-converted (146,178,193)) vs 9781444123166 crops (opaque,
+            // gold = default lattice (153,151,151) for 0.4K, zero pixels at
+            // the intent-converted values). So BOTH the /OutputIntents CMYK
+            // transform and the AdobeRGB shift (see RgbPrintShift) are gated
+            // on the same per-page transparency scan.
+            boolean flattened = pageHasTransparency(page);
+            if (flattened || "false".equals(System.getProperty("render.printParityIntentFlattenGate"))) {
+                outputIntentSet = installOutputIntent(page);
+            }
+            if (flattened && org.aspose.pdf.engine.colorspace.RgbPrintShift.enabled()) {
+                org.aspose.pdf.engine.colorspace.RgbPrintShift.setActive(true);
+                rgbShiftSet = true;
+            }
+        }
+        try {
+            return renderPageInternal(page, dpiX, dpiY);
+        } finally {
+            if (outputIntentSet) {
+                org.aspose.pdf.engine.colorspace.CmykPrintLut.clearOutputIntent();
+            }
+            if (rgbShiftSet) {
+                org.aspose.pdf.engine.colorspace.RgbPrintShift.clear();
+            }
+        }
+    }
+
+    /**
+     * Detects whether the page carries any transparency feature that would
+     * push Acrobat's print pipeline through its transparency flattener:
+     * a form-XObject transparency group, an ExtGState with alpha &lt; 1, a
+     * soft mask or a non-Normal blend mode, or an image with an /SMask (or
+     * JPX /SMaskInData). Walks form XObjects, tiling patterns and annotation
+     * normal appearances recursively (depth-capped, cycle-safe).
+     */
+    private boolean pageHasTransparency(Page page) {
+        try {
+            PdfDictionary dict = page.getPdfDictionary();
+            if (dict == null) return false;
+            java.util.Set<PdfBase> seen =
+                    java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+            // NOTE: a page-level /Group /S /Transparency alone is NOT a
+            // trigger — PowerPoint exports stamp it on every page and
+            // Acrobat still prints such pages identity when the content is
+            // opaque (corpus 55919 p49: "0.6 0 0 rg" printed exactly as
+            // (153,0,0); our shifted (180,0,0) failed at neigh 0.018).
+            // /Resources is INHERITABLE (§7.7.3.4) — corpus 38922 keeps it on
+            // the /Pages node; reading only the page dict missed the /ca<1
+            // ExtGState there (Acrobat shifted p46, we didn't: our blue
+            // (45,97,209) vs gold (0,97,212) = shift(ours) exactly). Walk the
+            // /Parent chain by hand — Page.getResources() would lazy-CREATE
+            // an empty dict on resource-less pages, mutating the document.
+            PdfBase resObj = resolveRef(dict.get("Resources"));
+            PdfBase node = dict;
+            for (int up = 0; resObj == null && node instanceof PdfDictionary && up < 32; up++) {
+                node = resolveRef(((PdfDictionary) node).get("Parent"));
+                if (node instanceof PdfDictionary) {
+                    resObj = resolveRef(((PdfDictionary) node).get("Resources"));
+                }
+            }
+            if (resourcesHaveTransparency(resObj, seen, 0)) {
+                return true;
+            }
+            PdfBase annots = resolveRef(dict.get("Annots"));
+            if (annots instanceof PdfArray) {
+                PdfArray arr = (PdfArray) annots;
+                for (int i = 0; i < arr.size(); i++) {
+                    PdfBase a = resolveRef(arr.get(i));
+                    if (!(a instanceof PdfDictionary)) continue;
+                    PdfBase ap = resolveRef(((PdfDictionary) a).get("AP"));
+                    if (!(ap instanceof PdfDictionary)) continue;
+                    PdfBase n = resolveRef(((PdfDictionary) ap).get("N"));
+                    if (n instanceof PdfDictionary && !(n instanceof PdfStream)) {
+                        // Appearance state sub-dictionary — check every state.
+                        for (PdfName key : ((PdfDictionary) n).keySet()) {
+                            PdfBase st = resolveRef(((PdfDictionary) n).get(key));
+                            if (st instanceof PdfStream
+                                    && formIsTransparent((PdfStream) st, seen, 0)) {
+                                return true;
+                            }
+                        }
+                    } else if (n instanceof PdfStream
+                            && formIsTransparent((PdfStream) n, seen, 0)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "transparency scan failed: " + e);
+        }
+        return false;
+    }
+
+    /** Transparency scan of one resources dictionary (recursive). */
+    private boolean resourcesHaveTransparency(PdfBase resObj, java.util.Set<PdfBase> seen,
+                                              int depth) {
+        if (!(resObj instanceof PdfDictionary) || depth > 12 || !seen.add(resObj)) {
+            return false;
+        }
+        PdfDictionary res = (PdfDictionary) resObj;
+
+        PdfBase egs = resolveRef(res.get("ExtGState"));
+        if (egs instanceof PdfDictionary) {
+            for (PdfName key : ((PdfDictionary) egs).keySet()) {
+                PdfBase gsObj = resolveRef(((PdfDictionary) egs).get(key));
+                if (!(gsObj instanceof PdfDictionary)) continue;
+                PdfDictionary gs = (PdfDictionary) gsObj;
+                if (alphaBelowOne(gs.get("CA")) || alphaBelowOne(gs.get("ca"))) return true;
+                PdfBase sm = resolveRef(gs.get("SMask"));
+                if (sm instanceof PdfDictionary) return true;
+                PdfBase bm = resolveRef(gs.get("BM"));
+                String bmName = bm instanceof PdfName ? ((PdfName) bm).getName()
+                        : (bm instanceof PdfArray && ((PdfArray) bm).size() > 0
+                           && resolveRef(((PdfArray) bm).get(0)) instanceof PdfName
+                           ? ((PdfName) resolveRef(((PdfArray) bm).get(0))).getName() : null);
+                if (bmName != null && !"Normal".equals(bmName) && !"Compatible".equals(bmName)) {
+                    return true;
+                }
+            }
+        }
+
+        PdfBase xobjs = resolveRef(res.get("XObject"));
+        if (xobjs instanceof PdfDictionary) {
+            for (PdfName key : ((PdfDictionary) xobjs).keySet()) {
+                PdfBase xo = resolveRef(((PdfDictionary) xobjs).get(key));
+                if (!(xo instanceof PdfStream)) continue;
+                PdfStream st = (PdfStream) xo;
+                PdfBase sub = resolveRef(st.get("Subtype"));
+                String subName = sub instanceof PdfName ? ((PdfName) sub).getName() : "";
+                if ("Image".equals(subName)) {
+                    if (resolveRef(st.get("SMask")) instanceof PdfStream) return true;
+                    PdfBase smd = resolveRef(st.get("SMaskInData"));
+                    if (smd instanceof org.aspose.pdf.engine.pdfobjects.PdfInteger
+                            && ((org.aspose.pdf.engine.pdfobjects.PdfInteger) smd).intValue() > 0) {
+                        return true;
+                    }
+                } else if (formIsTransparent(st, seen, depth)) {
+                    return true;
+                }
+            }
+        }
+
+        PdfBase pats = resolveRef(res.get("Pattern"));
+        if (pats instanceof PdfDictionary) {
+            for (PdfName key : ((PdfDictionary) pats).keySet()) {
+                PdfBase pat = resolveRef(((PdfDictionary) pats).get(key));
+                if (pat instanceof PdfStream) { // tiling pattern cell
+                    if (resourcesHaveTransparency(
+                            resolveRef(((PdfStream) pat).get("Resources")), seen, depth + 1)) {
+                        return true;
+                    }
+                } else if (pat instanceof PdfDictionary) { // shading pattern
+                    PdfBase pgs = resolveRef(((PdfDictionary) pat).get("ExtGState"));
+                    if (pgs instanceof PdfDictionary
+                            && (alphaBelowOne(((PdfDictionary) pgs).get("CA"))
+                                || alphaBelowOne(((PdfDictionary) pgs).get("ca"))
+                                || resolveRef(((PdfDictionary) pgs).get("SMask"))
+                                        instanceof PdfDictionary)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Form XObject: transparency in its resources (recursively).
+     *  A form-level /Group /S /Transparency alone is NOT a trigger — the
+     *  99991 experiment printed an opaque form group IDENTITY, same as the
+     *  page-level group; only real alpha/SMask/blend content counts. */
+    private boolean formIsTransparent(PdfStream form, java.util.Set<PdfBase> seen, int depth) {
+        return resourcesHaveTransparency(resolveRef(form.get("Resources")), seen, depth + 1);
+    }
+
+    /** True when the value is a number strictly below 1 (constant alpha). */
+    private boolean alphaBelowOne(PdfBase v) {
+        v = resolveRef(v);
+        if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfInteger) {
+            return ((org.aspose.pdf.engine.pdfobjects.PdfInteger) v).intValue() < 1;
+        }
+        if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfFloat) {
+            return ((org.aspose.pdf.engine.pdfobjects.PdfFloat) v).floatValue() < 0.999f;
+        }
+        return false;
+    }
+
+    /**
+     * Installs the document's /OutputIntents DestOutputProfile (if any, CMYK
+     * only) as the print-parity CMYK transform for the current thread.
+     *
+     * @return true when a profile was installed (caller must clear)
+     */
+    private boolean installOutputIntent(Page page) {
+        try {
+            org.aspose.pdf.engine.parser.PDFParser p = page.getParser();
+            if (p == null) return false;
+            PdfDictionary catalog = p.getCatalog();
+            if (catalog == null) return false;
+            PdfBase intents = resolveRef(catalog.get("OutputIntents"));
+            if (!(intents instanceof PdfArray)) return false;
+            PdfArray arr = (PdfArray) intents;
+            for (int i = 0; i < arr.size(); i++) {
+                PdfBase item = resolveRef(arr.get(i));
+                if (!(item instanceof PdfDictionary)) continue;
+                // A U.S. Web Coated (SWOP) intent IS Acrobat's default CMYK
+                // working space — the measured print lattice already encodes
+                // Acrobat's own rendering of it (with Adobe-CMM black-point
+                // handling), while the JDK-CMM colorimetric conversion of the
+                // same profile diverges visibly: corpus 36697 (PDF/X, SWOP)
+                // solid magenta printed (246,86,160) = the measured lattice,
+                // but the ICC-driven lattice gave the crushed (236,0,140).
+                // Keep the measured lattice for SWOP; install only genuinely
+                // different print conditions (e.g. FOGRA27, corpus session-4).
+                if (isSwopIntent((PdfDictionary) item)) continue;
+                PdfBase prof = resolveRef(((PdfDictionary) item).get("DestOutputProfile"));
+                if (prof instanceof PdfStream) {
+                    org.aspose.pdf.engine.colorspace.CmykPrintLut.setOutputIntent(
+                            ((PdfStream) prof).getDecodedData());
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "OutputIntent install failed: " + e);
+        }
+        return false;
+    }
+
+    /** True when the output intent names the U.S. Web Coated (SWOP) condition. */
+    private static boolean isSwopIntent(PdfDictionary intent) {
+        for (String key : new String[]{"OutputConditionIdentifier", "OutputCondition", "Info"}) {
+            PdfBase v = resolveRef(intent.get(key));
+            if (v instanceof PdfString) {
+                String s = ((PdfString) v).getString();
+                if (s != null) {
+                    String u = s.toUpperCase(java.util.Locale.ROOT);
+                    if (u.contains("SWOP") || u.contains("CGATS TR 001")
+                            || u.contains("U.S. WEB COATED")) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The page box a render maps to the raster: the CropBox (§14.11.2) clamped
+     * to the MediaBox, falling back to the MediaBox and then US Letter. Pixel
+     * (0,0) of {@link #renderPage} is the top-left of this box — exposed so
+     * callers cropping page regions out of a render share the exact mapping.
+     *
+     * @param page the page
+     * @return the effective box (never null)
+     */
+    public static Rectangle effectiveRenderBox(Page page) {
+        // Pages are displayed/printed clipped to the CROP box (§14.11.2), not
+        // the media box — printer's-marks documents (corpus 40971) carry crop
+        // marks and colour bars in the MediaBox margin that Acrobat never
+        // shows. getCropBox() falls back to MediaBox when absent; clamp to the
+        // MediaBox so a malformed CropBox cannot blow up the raster.
+        Rectangle mediaBox = page.getCropBox();
+        Rectangle media = page.getMediaBox();
+        if (mediaBox == null) {
+            mediaBox = media;
+        } else if (media != null) {
+            double llx = Math.max(Math.min(mediaBox.getLLX(), mediaBox.getURX()),
+                                  Math.min(media.getLLX(), media.getURX()));
+            double lly = Math.max(Math.min(mediaBox.getLLY(), mediaBox.getURY()),
+                                  Math.min(media.getLLY(), media.getURY()));
+            double urx = Math.min(Math.max(mediaBox.getLLX(), mediaBox.getURX()),
+                                  Math.max(media.getLLX(), media.getURX()));
+            double ury = Math.min(Math.max(mediaBox.getLLY(), mediaBox.getURY()),
+                                  Math.max(media.getLLY(), media.getURY()));
+            if (urx > llx && ury > lly) {
+                mediaBox = new Rectangle(llx, lly, urx, ury);
+            }
+        }
         if (mediaBox == null) {
             mediaBox = new Rectangle(0, 0, 612, 792); // US Letter default
         }
+        return mediaBox;
+    }
+
+    private BufferedImage renderPageInternal(Page page, double dpiX, double dpiY) throws IOException {
+        Rectangle mediaBox = effectiveRenderBox(page);
 
         double pageW = Math.abs(mediaBox.getWidth());
         double pageH = Math.abs(mediaBox.getHeight());
 
-        // For 90/270 degree rotation, swap display dimensions
-        int rotation = page.getRotate();
+        // For 90/270 degree rotation, swap display dimensions.
+        // /Rotate may be negative or >= 360 (§7.7.3.3 only requires a multiple
+        // of 90) — normalize into [0, 360): corpus Test3.pdf uses -90 (≡ 270),
+        // which Acrobat rotates but an exact-match switch silently dropped.
+        int rotation = ((page.getRotate() % 360) + 360) % 360;
         double displayW = (rotation == 90 || rotation == 270) ? pageH : pageW;
         double displayH = (rotation == 90 || rotation == 270) ? pageW : pageH;
 
@@ -96,6 +461,8 @@ public class PdfPageRenderer {
         // (corpus 25716-2: constant ~2800px changed region on every page).
         int pixelW = Math.max(1, (int) Math.floor(displayW * dpiX / 72.0 + 0.5));
         int pixelH = Math.max(1, (int) Math.floor(displayH * dpiY / 72.0 + 0.5));
+        this.canvasPixelW = pixelW;
+        this.canvasPixelH = pixelH;
 
         BufferedImage image = new BufferedImage(pixelW, pixelH, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2d = image.createGraphics();
@@ -129,17 +496,54 @@ public class PdfPageRenderer {
             g2d.translate(-mediaBox.getLLX(), -mediaBox.getLLY());
         }
 
-        // White background — use MediaBox coordinates in the (now offset) user space
-        g2d.setColor(java.awt.Color.WHITE);
-        g2d.fillRect((int) mediaBox.getLLX(), (int) mediaBox.getLLY(),
-                (int) Math.ceil(pageW), (int) Math.ceil(pageH));
+        // §11.4.7: a page with a /Group /S /Transparency entry is an ISOLATED
+        // group — its content composites against a fully transparent initial
+        // backdrop and the group RESULT is then imposed on the white medium.
+        // Painting straight onto a pre-filled white canvas breaks non-Normal
+        // blend modes at page level: corpus PDFKITNET-21900 p3 paints its
+        // black spread background with /BM /Screen, and Screen over opaque
+        // white is always white, erasing the background Acrobat keeps. For
+        // pure Normal content the two orders are identical (src-over is
+        // associative), so the transparent backdrop is safe whenever the
+        // group entry is present. Kill switch: render.pageGroupBackdrop.
+        boolean transparentBackdrop = pageHasTransparencyGroup(page)
+                && !"false".equals(System.getProperty("render.pageGroupBackdrop"));
+        if (!transparentBackdrop) {
+            // White background — MediaBox coordinates in the (now offset) user space
+            g2d.setColor(java.awt.Color.WHITE);
+            g2d.fillRect((int) mediaBox.getLLX(), (int) mediaBox.getLLY(),
+                    (int) Math.ceil(pageW), (int) Math.ceil(pageH));
+        }
 
-        // Process content stream
+        // Optional-content visibility for this page's document (§8.11.4).
+        initOcgVisibility(page);
+
+        // Process content stream. §7.8.2: a /Contents ARRAY is one logical
+        // stream — state carries across segments (real-world pages rely on a
+        // segment-1 cm applying to segment 2: PDFNEWNET-34130_1, PDFNET_37834).
+        // The opt-in -Drender.contentStreamIsolation=true renders each segment
+        // with a fresh graphics state instead (diagnostic aid for producers
+        // that assume Acrobat-style per-stream q/Q repair).
         try {
-            OperatorCollection ops = page.getContents();
-            if (ops != null) {
-                Resources resources = page.getResources();
-                processOperators(ops, resources, g2d, null, 0);
+            Resources resources = page.getResources();
+            java.util.List<PdfStream> segments =
+                    "true".equals(System.getProperty("render.contentStreamIsolation"))
+                            ? pageContentSegments(page) : null;
+            if (segments != null && segments.size() > 1) {
+                for (PdfStream segment : segments) {
+                    try {
+                        OperatorCollection segOps =
+                                org.aspose.pdf.engine.parser.ContentStreamParser.parseToCollection(segment);
+                        processOperators(segOps, resources, g2d, null, 0);
+                    } catch (Exception e) {
+                        LOG.fine(() -> "Error rendering content segment: " + e.getMessage());
+                    }
+                }
+            } else {
+                OperatorCollection ops = page.getContents();
+                if (ops != null) {
+                    processOperators(ops, resources, g2d, null, 0);
+                }
             }
         } catch (Exception e) {
             LOG.warning(() -> "Error rendering page: " + e.getMessage());
@@ -158,7 +562,35 @@ public class PdfPageRenderer {
         }
 
         g2d.dispose();
+        if (transparentBackdrop) {
+            // Impose the page-group result on the white medium (§11.4.7).
+            BufferedImage flat = new BufferedImage(pixelW, pixelH, BufferedImage.TYPE_INT_ARGB);
+            Graphics2D fg = flat.createGraphics();
+            fg.setColor(java.awt.Color.WHITE);
+            fg.fillRect(0, 0, pixelW, pixelH);
+            fg.drawImage(image, 0, 0, null);
+            fg.dispose();
+            return flat;
+        }
         return image;
+    }
+
+    /**
+     * True when the page dictionary carries a /Group attribute dictionary of
+     * subtype /Transparency (§11.4.7) — such a page is rendered as an
+     * isolated transparency group over a transparent backdrop.
+     */
+    private boolean pageHasTransparencyGroup(Page page) {
+        try {
+            PdfDictionary dict = page.getPdfDictionary();
+            if (dict == null) return false;
+            PdfBase g = resolveRef(dict.get("Group"));
+            if (!(g instanceof PdfDictionary)) return false;
+            PdfBase s = resolveRef(((PdfDictionary) g).get("S"));
+            return s instanceof PdfName && "Transparency".equals(((PdfName) s).getName());
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** Iterates page annotations and draws each one's Normal Appearance stream. */
@@ -188,6 +620,33 @@ public class PdfPageRenderer {
             flags = ((org.aspose.pdf.engine.pdfobjects.PdfInteger) fVal).intValue();
         }
         if ((flags & 0x02) != 0 || (flags & 0x01) != 0 || (flags & 0x20) != 0) return;
+
+        // Acrobat print-parity mode (harness-only, -Drender.acrobatPrintParity=true):
+        // Acrobat's silent print ("Comments & Forms: Document") omits comment
+        // markup even when the Print flag is set: rubber stamps (corpus golds)
+        // and file-attachment paperclips (corpus 45780 prints as a blank page),
+        // plus note/popup/sound icons. Skip them so renders compare against
+        // Acrobat-printed golds. Normal (view-semantics) rendering paints them.
+        if (Boolean.getBoolean("render.acrobatPrintParity")) {
+            org.aspose.pdf.engine.pdfobjects.PdfBase sub = resolveRef(annot.get("Subtype"));
+            if (sub instanceof org.aspose.pdf.engine.pdfobjects.PdfName) {
+                switch (((org.aspose.pdf.engine.pdfobjects.PdfName) sub).getName()) {
+                    case "Stamp":
+                    case "FileAttachment":
+                    case "Text":
+                    case "Popup":
+                    case "Sound":
+                        return;
+                    default:
+                        break;
+                }
+            }
+            // Print semantics (§12.5.3): an annotation is printed only when
+            // its Print flag (bit 3) is set. Screen rendering shows such
+            // annotations (e.g. submit buttons), Acrobat's print output does
+            // not — skip them so renders compare against printed golds.
+            if ((flags & 0x04) == 0) return;
+        }
 
         org.aspose.pdf.engine.pdfobjects.PdfBase ap = resolveRef(annot.get("AP"));
         if (!(ap instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary)) return;
@@ -242,10 +701,11 @@ public class PdfPageRenderer {
             state.concatMatrix(new Matrix(sx, 0, 0, sy, tx, ty));
 
             Deque<GraphicsState> stack = new ArrayDeque<>();
+            GraphicsState apInitial = state.clone();
             for (Operator op : formOps) {
                 if (Thread.currentThread().isInterrupted()) break; // cancelled
                 try {
-                    state = processOperator(op, state, stack, formRes, g2d, null, 1);
+                    state = processOperator(op, state, stack, apInitial, formRes, g2d, null, 1);
                 } catch (Exception ignore) { /* tolerate per-op errors */ }
             }
         } catch (Exception e) {
@@ -269,6 +729,9 @@ public class PdfPageRenderer {
                                   Graphics2D g2d, PDFParser parser, int formDepth) {
         Deque<GraphicsState> stateStack = new ArrayDeque<>();
         GraphicsState state = new GraphicsState();
+        // Snapshot for Q-underflow recovery (see the "Q" case): a restore on
+        // an empty stack resets to the state the content started with.
+        GraphicsState initialState = state.clone();
 
         for (Operator op : ops) {
             // Honour cancellation: render work is CPU-bound and never blocks
@@ -280,10 +743,42 @@ public class PdfPageRenderer {
                 break;
             }
             try {
-                state = processOperator(op, state, stateStack, resources, g2d, parser, formDepth);
+                state = processOperator(op, state, stateStack, initialState,
+                        resources, g2d, parser, formDepth);
             } catch (Exception e) {
                 LOG.fine(() -> "Skipping operator " + op.getName() + ": " + e.getMessage());
             }
+        }
+    }
+
+    /**
+     * Resolves the page's {@code /Contents} into its stream segments, or
+     * {@code null} when it is a single stream (no isolation needed).
+     */
+    private java.util.List<PdfStream> pageContentSegments(org.aspose.pdf.Page page) {
+        try {
+            PdfBase contents = page.getPdfDictionary().get("Contents");
+            if (contents instanceof PdfObjectReference) {
+                contents = ((PdfObjectReference) contents).dereference();
+            }
+            if (!(contents instanceof PdfArray)) {
+                return null;
+            }
+            PdfArray arr = (PdfArray) contents;
+            java.util.List<PdfStream> result = new java.util.ArrayList<>(arr.size());
+            for (int i = 0; i < arr.size(); i++) {
+                PdfBase item = arr.get(i);
+                if (item instanceof PdfObjectReference) {
+                    item = ((PdfObjectReference) item).dereference();
+                }
+                if (item instanceof PdfStream) {
+                    result.add((PdfStream) item);
+                }
+            }
+            return result;
+        } catch (Exception e) {
+            LOG.fine(() -> "Failed to resolve /Contents segments: " + e.getMessage());
+            return null;
         }
     }
 
@@ -292,12 +787,90 @@ public class PdfPageRenderer {
      * callers must use the returned value to handle Q (restore) correctly.
      */
     private GraphicsState processOperator(Operator op, GraphicsState state,
-                                 Deque<GraphicsState> stateStack, Resources resources,
+                                 Deque<GraphicsState> stateStack, GraphicsState initialState,
+                                 Resources resources,
                                  Graphics2D g2d, PDFParser parser, int formDepth)
             throws IOException {
 
         // Use the typed operator subclasses where available
         String name = op.getName();
+
+        // Inside a hidden optional-content block (§8.11.3): marks are not
+        // painted, but state, clipping and text-position side effects still
+        // apply. Painting ops are skipped here (path ops still finish so a
+        // pending W clip installs); text-show ops run below with rendering
+        // mode 3 (invisible) so the text matrix advances correctly.
+        if (ocSuppress > 0) {
+            switch (name) {
+                case "Do":
+                case "sh":
+                case "BI":
+                case "EI":
+                    return state;
+                case "f":
+                case "F":
+                case "f*":
+                case "B":
+                case "B*":
+                case "S":
+                    finishPathOp(g2d, state);
+                    return state;
+                case "s":
+                case "b":
+                case "b*":
+                    state.closePath();
+                    finishPathOp(g2d, state);
+                    return state;
+                case "Tj":
+                case "TJ":
+                case "'":
+                case "\"": {
+                    int savedTr = state.getTextRenderingMode();
+                    state.setTextRenderingMode(3);
+                    try {
+                        return processOperatorUnchecked(op, state, stateStack, initialState,
+                                resources, g2d, parser, formDepth, name);
+                    } finally {
+                        state.setTextRenderingMode(savedTr);
+                    }
+                }
+                default:
+                    break; // state-changing ops execute normally
+            }
+        }
+        // Vector-underlay mode: glyphs are not painted but the text matrix
+        // must still advance (same Tr=3 trick as hidden optional content).
+        // In keep-rotated mode, non-horizontal text stays painted: a fixed-layout
+        // target re-emits only HORIZONTAL text as positioned frames (Word cannot
+        // place diagonal text), so rotated labels must survive in the pixels.
+        if (suppressText && !(suppressTextKeepRotated && isRotatedText(state))) {
+            switch (name) {
+                case "Tj":
+                case "TJ":
+                case "'":
+                case "\"": {
+                    int savedTr = state.getTextRenderingMode();
+                    state.setTextRenderingMode(3);
+                    try {
+                        return processOperatorUnchecked(op, state, stateStack, initialState,
+                                resources, g2d, parser, formDepth, name);
+                    } finally {
+                        state.setTextRenderingMode(savedTr);
+                    }
+                }
+                default:
+                    break;
+            }
+        }
+        return processOperatorUnchecked(op, state, stateStack, initialState, resources,
+                g2d, parser, formDepth, name);
+    }
+
+    private GraphicsState processOperatorUnchecked(Operator op, GraphicsState state,
+                                 Deque<GraphicsState> stateStack, GraphicsState initialState,
+                                 Resources resources,
+                                 Graphics2D g2d, PDFParser parser, int formDepth, String name)
+            throws IOException {
 
         switch (name) {
             // ======== Graphics State ========
@@ -308,6 +881,17 @@ public class PdfPageRenderer {
                 if (!stateStack.isEmpty()) {
                     state = stateStack.pop();
                     // Re-apply clip from restored state
+                    applyClip(g2d, state);
+                } else if (initialState != null) {
+                    // Q-underflow: more restores than saves. Acrobat resets to
+                    // the state the content stream started with, discarding
+                    // accumulated naked-state changes (an un-saved global cm),
+                    // so content appended after such a stream — a producer
+                    // pattern for page furniture — draws in pristine page
+                    // space (PDFNEWNET-31408: the mended-in image otherwise
+                    // inherits a leaked 0.05/flip CTM and renders as a
+                    // thumbnail in the wrong corner).
+                    state = initialState.clone();
                     applyClip(g2d, state);
                 }
                 break;
@@ -611,10 +1195,22 @@ public class PdfPageRenderer {
                 }
                 break;
 
-            // ======== Marked Content (ignored for rendering) ========
+            // ======== Marked Content ========
+            // Only /OC blocks affect rendering: content inside a hidden
+            // optional-content group is not painted (§8.11.3). State and
+            // clipping operators inside the block still execute.
+            case "BDC": {
+                boolean hidden = isHiddenOcBlock(op, resources);
+                mcStack.push(hidden);
+                if (hidden) ocSuppress++;
+                break;
+            }
             case "BMC":
-            case "BDC":
+                mcStack.push(Boolean.FALSE);
+                break;
             case "EMC":
+                if (!mcStack.isEmpty() && mcStack.pop()) ocSuppress--;
+                break;
             case "MP":
             case "DP":
                 break;
@@ -654,8 +1250,47 @@ public class PdfPageRenderer {
                                         new AffineTransform(g2d.getTransform());
                                     shadingToDevice.concatenate(
                                         matrixToTransform(state.getCTM()));
-                                    org.aspose.pdf.engine.pattern.ShadingRenderer.render(
-                                        g2d, shading, shadingToDevice, g2d.getClipBounds());
+                                    // §11.6.5.2: an ExtGState /SMask modulates sh
+                                    // fills too — pattern tiles that set a
+                                    // /Luminosity mask before "sh" (corpus
+                                    // PDFJAVA-39739 trifold panels) must paint
+                                    // through the mask, not opaque.
+                                    if (state.getSoftMask() != null
+                                            && !"false".equals(System.getProperty("render.softMaskPaint"))
+                                            && canvasPixelW > 0 && canvasPixelH > 0) {
+                                        BufferedImage buf = new BufferedImage(
+                                                canvasPixelW, canvasPixelH,
+                                                BufferedImage.TYPE_INT_ARGB);
+                                        Graphics2D og = buf.createGraphics();
+                                        try {
+                                            og.setRenderingHints(g2d.getRenderingHints());
+                                            og.setClip(new java.awt.Rectangle(
+                                                    0, 0, canvasPixelW, canvasPixelH));
+                                            og.setTransform(g2d.getTransform());
+                                            if (g2d.getClip() != null) og.clip(g2d.getClip());
+                                            org.aspose.pdf.engine.pattern.ShadingRenderer.render(
+                                                og, shading, shadingToDevice, og.getClipBounds());
+                                        } finally {
+                                            og.dispose();
+                                        }
+                                        applySoftMaskToBuffer(buf, state.getSoftMask(), g2d,
+                                                state, resources, parser, formDepth);
+                                        AffineTransform savedT = g2d.getTransform();
+                                        java.awt.Composite savedC = g2d.getComposite();
+                                        try {
+                                            g2d.setTransform(new AffineTransform());
+                                            g2d.setComposite(BlendComposite.groupComposite(
+                                                    state.getBlendMode(),
+                                                    state.getNonStrokingAlpha()));
+                                            g2d.drawImage(buf, 0, 0, null);
+                                        } finally {
+                                            g2d.setComposite(savedC);
+                                            g2d.setTransform(savedT);
+                                        }
+                                    } else {
+                                        org.aspose.pdf.engine.pattern.ShadingRenderer.render(
+                                            g2d, shading, shadingToDevice, g2d.getClipBounds());
+                                    }
                                 }
                             } catch (IOException ex) {
                                 LOG.fine(() -> "Failed to render shading: " + ex.getMessage());
@@ -670,7 +1305,9 @@ public class PdfPageRenderer {
             case "BI":
                 // The parser folds the whole BI..ID..EI object into one BI
                 // operator: operands[0] = image dict, operands[1] = raw data.
-                renderInlineImage(g2d, state, op, parser);
+                if (!suppressRasterImages) {
+                    renderInlineImage(g2d, state, op, parser);
+                }
                 break;
             case "ID":
             case "EI":
@@ -704,6 +1341,50 @@ public class PdfPageRenderer {
         GeneralPath path = state.getCurrentPath();
         if (path.getBounds2D().isEmpty()) return;
 
+        // §11.6.5.2: an ExtGState /SMask modulates EVERY painting operator,
+        // not just transparency-group composites. Direct path fills (e.g. a
+        // shading-pattern fill under a /Luminosity mask — corpus 49703
+        // ex99-25_slide8 gray "fan") previously painted fully opaque because
+        // the mask was only honoured in renderFormOffscreen. Render the fill
+        // offscreen, multiply its alpha by the mask, composite once.
+        if (state.getSoftMask() != null
+                && !"false".equals(System.getProperty("render.softMaskPaint"))
+                && canvasPixelW > 0 && canvasPixelH > 0) {
+            BufferedImage buf = new BufferedImage(canvasPixelW, canvasPixelH,
+                    BufferedImage.TYPE_INT_ARGB);
+            Graphics2D og = buf.createGraphics();
+            try {
+                og.setRenderingHints(g2d.getRenderingHints());
+                // Full-device clip first (identity space): shading fills need
+                // non-null clip bounds to know their target area.
+                og.setClip(new java.awt.Rectangle(0, 0, canvasPixelW, canvasPixelH));
+                og.setTransform(g2d.getTransform());
+                if (g2d.getClip() != null) og.clip(g2d.getClip());
+                GraphicsState fillState = state.clone();
+                fillState.setSoftMask(null);
+                fillState.setBlendMode("Normal");
+                fillPath(og, fillState, windingRule, resources, formDepthBox, parser);
+            } finally {
+                og.dispose();
+            }
+            int depth = formDepthBox != null ? formDepthBox[0] : 0;
+            applySoftMaskToBuffer(buf, state.getSoftMask(), g2d, state, resources,
+                    parser, depth);
+            AffineTransform savedT = g2d.getTransform();
+            java.awt.Composite savedC = g2d.getComposite();
+            try {
+                g2d.setTransform(new AffineTransform());
+                // /ca was already applied by the inner fill's composite; the
+                // outer composite only carries the blend mode.
+                g2d.setComposite(BlendComposite.groupComposite(state.getBlendMode(), 1f));
+                g2d.drawImage(buf, 0, 0, null);
+            } finally {
+                g2d.setComposite(savedC);
+                g2d.setTransform(savedT);
+            }
+            return;
+        }
+
         AffineTransform saved = g2d.getTransform();
         Shape savedClip = g2d.getClip();
         try {
@@ -715,12 +1396,18 @@ public class PdfPageRenderer {
             String patternName = state.getFillPatternName();
             if (patternName != null && resources != null) {
                 int depth = formDepthBox != null ? formDepthBox[0] : 0;
+                // §8.7.3.1: a Pattern's /Matrix maps pattern space to the DEFAULT
+                // (initial) coordinate system of the content stream in which the
+                // pattern is used — NOT the CTM in effect at the fill. `saved` was
+                // captured before applyCtmTransform, so it is exactly that default
+                // space (page base, or the enclosing form's base for a nested fill).
+                AffineTransform patternBase = saved;
                 // Shading patterns (PatternType 2) paint a gradient inside the
                 // path; tiling patterns (PatternType 1) tile a cell.
-                if (renderShadingPatternFill(g2d, state, path, resources, patternName, parser)) {
+                if (renderShadingPatternFill(g2d, state, path, resources, patternName, parser, patternBase)) {
                     return;
                 }
-                if (renderTilingPatternFill(g2d, state, path, resources, patternName, depth)) {
+                if (renderTilingPatternFill(g2d, state, path, resources, patternName, depth, patternBase)) {
                     return;
                 }
                 // Fall through to solid colour if pattern couldn't be rendered
@@ -743,7 +1430,8 @@ public class PdfPageRenderer {
      */
     private boolean renderShadingPatternFill(Graphics2D g2d, GraphicsState state,
                                              GeneralPath path, Resources resources,
-                                             String patternName, PDFParser parser) {
+                                             String patternName, PDFParser parser,
+                                             AffineTransform patternBase) {
         if (Boolean.getBoolean("openpdf.shadingpattern.disable")) return false;
         try {
             PdfDictionary patterns = resources.getPdfDictionary() != null
@@ -764,11 +1452,13 @@ public class PdfPageRenderer {
             Matrix patMatrix = matrixFromPdfArray(resolveRef(patDict.get("Matrix")));
             if (patMatrix == null) patMatrix = new Matrix(1, 0, 0, 1, 0, 0);
 
-            // g2d already carries base × CTM (applyCtmTransform ran). The pattern
-            // matrix maps shading space into that current user space (no /cm runs
-            // between setting the pattern and the fill in these streams), so the
-            // shading→device map is the current transform × pattern matrix.
-            AffineTransform shadingToDevice = new AffineTransform(g2d.getTransform());
+            // §8.7.3.1: the pattern /Matrix maps shading space into the content
+            // stream's DEFAULT coordinate system (patternBase), NOT the CTM active
+            // at the fill. Using g2d.getTransform() (= base × CTM) shifted the
+            // gradient by any `cm` in flight — e.g. corpus 34156 fills its page
+            // background pattern under a `1 0 0 1 0 792 cm`, pushing the shading a
+            // full page off-screen. The shading→device map is base × patternMatrix.
+            AffineTransform shadingToDevice = new AffineTransform(patternBase);
             shadingToDevice.concatenate(matrixToTransform(patMatrix));
 
             Shape savedClip = g2d.getClip();
@@ -800,7 +1490,8 @@ public class PdfPageRenderer {
      */
     private boolean renderTilingPatternFill(Graphics2D g2d, GraphicsState state,
                                              GeneralPath path, Resources resources,
-                                             String patternName, int formDepth) {
+                                             String patternName, int formDepth,
+                                             AffineTransform patternBase) {
         if (Boolean.getBoolean("openpdf.pattern.disable")) return false;
         try {
             org.aspose.pdf.engine.pdfobjects.PdfDictionary patterns =
@@ -839,18 +1530,25 @@ public class PdfPageRenderer {
                     org.aspose.pdf.engine.parser.ContentStreamParser.parse(patBytes);
             if (patOps == null) return false;
 
-            // Compute path bounds in PATTERN-SPACE coordinates so we know how
-            // many tile iterations to run. clipBounds is in user space; pattern
-            // space = user × patMatrix^-1.
             java.awt.geom.AffineTransform patAffine = new java.awt.geom.AffineTransform(
                     patMatrix.getA(), patMatrix.getB(),
                     patMatrix.getC(), patMatrix.getD(),
                     patMatrix.getE(), patMatrix.getF());
-            java.awt.geom.AffineTransform inv;
-            try { inv = patAffine.createInverse(); }
+            // §8.7.3.1: pattern space maps to the content stream's DEFAULT space
+            // (patternBase) via the pattern /Matrix, NOT the CTM at the fill.
+            // patternToDevice = patternBase × patMatrix.
+            java.awt.geom.AffineTransform patternToDevice = new java.awt.geom.AffineTransform(patternBase);
+            patternToDevice.concatenate(patAffine);
+            // Compute the fill path's bounds in PATTERN space to bound the tile
+            // loop. The path is in current user space; device = currentTransform ×
+            // user, and pattern = patternToDevice⁻¹ × device, so
+            // userToPattern = patternToDevice⁻¹ × currentTransform.
+            java.awt.geom.AffineTransform userToPattern;
+            try { userToPattern = patternToDevice.createInverse(); }
             catch (java.awt.geom.NoninvertibleTransformException e) { return false; }
+            userToPattern.concatenate(g2d.getTransform());
             java.awt.geom.Rectangle2D userBounds = path.getBounds2D();
-            java.awt.geom.Rectangle2D patBounds = inv.createTransformedShape(userBounds).getBounds2D();
+            java.awt.geom.Rectangle2D patBounds = userToPattern.createTransformedShape(userBounds).getBounds2D();
 
             int iMin = (int) Math.floor((patBounds.getMinX() - bbox.getURX()) / xStep);
             int iMax = (int) Math.ceil((patBounds.getMaxX() - bbox.getLLX()) / xStep);
@@ -873,10 +1571,13 @@ public class PdfPageRenderer {
                 LOG.fine(() -> "Pattern tiling skipped for " + patternName + " (tileCount=" + tileCount + ")");
                 return false;
             }
-            // Clip to path (user space) and apply pattern matrix.
+            // Clip to the fill path in the CURRENT transform (base × CTM), then
+            // switch g2d to pattern space (patternToDevice) for cell replay. The
+            // clip is tracked by Java2D in device space, so it survives the
+            // transform change and correctly masks the tiled cells.
             g2d.clip(path);
             java.awt.geom.AffineTransform afterCtm = g2d.getTransform();
-            g2d.transform(patAffine);
+            g2d.setTransform(patternToDevice);
 
             for (int j = jMin; j <= jMax; j++) {
                 for (int i = iMin; i <= iMax; i++) {
@@ -898,11 +1599,12 @@ public class PdfPageRenderer {
                         patState.setClipPath(new java.awt.geom.GeneralPath(tileClip));
                     }
                     java.util.Deque<GraphicsState> stack = new java.util.ArrayDeque<>();
+                    GraphicsState patInitial = patState.clone();
                     for (Operator po : patOps) {
                         if (Thread.currentThread().isInterrupted()) break; // cancelled
                         try {
-                            patState = processOperator(po, patState, stack, patResources, g2d, null,
-                                    formDepth + 1);
+                            patState = processOperator(po, patState, stack, patInitial,
+                                    patResources, g2d, null, formDepth + 1);
                         } catch (Exception e) { /* tolerate per-op */ }
                     }
                     g2d.setClip(tileClip); // undo any clip the cell left behind
@@ -959,8 +1661,12 @@ public class PdfPageRenderer {
         try {
             applyCtmTransform(g2d, state);
             if (state.getStrokingAlpha() < 1.0f) {
-                g2d.setComposite(AlphaComposite.getInstance(
-                        AlphaComposite.SRC_OVER, state.getStrokingAlpha()));
+                // Under print-parity, Normal-mode alpha strokes flatten in ink
+                // space like fills (see BlendComposite.groupComposite).
+                g2d.setComposite(org.aspose.pdf.engine.colorspace.CmykPrintLut.inkBlendActive()
+                        ? BlendComposite.groupComposite(null, state.getStrokingAlpha())
+                        : AlphaComposite.getInstance(
+                                AlphaComposite.SRC_OVER, state.getStrokingAlpha()));
             } else {
                 g2d.setComposite(AlphaComposite.SrcOver);
             }
@@ -1045,8 +1751,16 @@ public class PdfPageRenderer {
         if (!(val instanceof PdfStream)) return;
         PdfStream stream = (PdfStream) val;
 
+        // §8.11.3: an XObject may carry its own /OC membership.
+        if (!hiddenOcgs.isEmpty() && isOcHidden(stream.get("OC"))) {
+            return;
+        }
+
         String subtype = stream.getNameAsString("Subtype");
         if ("Image".equals(subtype)) {
+            if (suppressRasterImages) {
+                return;
+            }
             renderImage(g2d, state, stream, xobjName, parser);
         } else if ("Form".equals(subtype)) {
             renderForm(g2d, state, stream, xobjName, resources, parser, formDepth);
@@ -1309,6 +2023,23 @@ public class PdfPageRenderer {
             return;
         }
 
+        // §11.6.6: a /Group /S /Transparency form composites as a UNIT — the
+        // outer constant alpha applies to the group's result, while alphas and
+        // blend mode are reset to defaults (1.0 / Normal) before its content
+        // stream executes. Painting inner ops straight onto the canvas made
+        // 30%-alpha overlay forms opaque, because forms routinely re-assert
+        // their own /ExtGState with ca=1 inside (corpus 38917 aerial-map
+        // overlays). Render such groups offscreen and composite once.
+        float groupAlpha = state.getNonStrokingAlpha();
+        boolean needsComposite = groupAlpha < 0.999f
+                || state.getSoftMask() != null
+                || !"Normal".equals(state.getBlendMode());
+        if (needsComposite && isTransparencyGroup(stream)) {
+            renderFormOffscreen(g2d, state, stream, name, parentResources, parser,
+                    formDepth, groupAlpha);
+            return;
+        }
+
         try {
             XForm form = new XForm(stream, name, parser);
             OperatorCollection formOps = form.getContents();
@@ -1329,10 +2060,12 @@ public class PdfPageRenderer {
             // clip blocks accumulate by intersection until everything is
             // clipped away (llPDFLib-style per-cell clipping).
             Deque<GraphicsState> formStack = new ArrayDeque<>();
+            GraphicsState formInitial = formState.clone();
             for (Operator op : formOps) {
                 if (Thread.currentThread().isInterrupted()) break; // cancelled
                 try {
-                    formState = processOperator(op, formState, formStack, formRes, g2d, parser, formDepth + 1);
+                    formState = processOperator(op, formState, formStack, formInitial,
+                            formRes, g2d, parser, formDepth + 1);
                 } catch (Exception e) {
                     LOG.fine(() -> "Error in form " + name + " operator " + op.getName());
                 }
@@ -1342,6 +2075,364 @@ public class PdfPageRenderer {
             applyClip(g2d, state);
         } catch (Exception e) {
             LOG.fine(() -> "Failed to render form XObject " + name + ": " + e.getMessage());
+        }
+    }
+
+    // ======== Optional content (§8.11) ========
+
+    /**
+     * Builds the hidden-OCG set for this render from the catalog's
+     * /OCProperties: the default configuration /D (/BaseState, /ON, /OFF);
+     * under {@code -Drender.acrobatPrintParity=true} each group's
+     * /Usage /Print /PrintState overrides it (§8.11.4.4) — Acrobat's print
+     * path uses the print usage, so e.g. non-printing artwork layers vanish
+     * from its output even when visible on screen.
+     */
+    private void initOcgVisibility(Page page) {
+        hiddenOcgs.clear();
+        mcStack.clear();
+        ocSuppress = 0;
+        try {
+            org.aspose.pdf.engine.parser.PDFParser p = page.getParser();
+            if (p == null) return;
+            PdfDictionary catalog = p.getCatalog();
+            if (catalog == null) return;
+            PdfBase ocPropsVal = resolveRef(catalog.get("OCProperties"));
+            if (!(ocPropsVal instanceof PdfDictionary)) return;
+            PdfDictionary ocProps = (PdfDictionary) ocPropsVal;
+
+            java.util.List<PdfDictionary> allOcgs = new java.util.ArrayList<>();
+            PdfBase ocgsVal = resolveRef(ocProps.get("OCGs"));
+            if (ocgsVal instanceof PdfArray) {
+                PdfArray arr = (PdfArray) ocgsVal;
+                for (int i = 0; i < arr.size(); i++) {
+                    PdfBase g = resolveRef(arr.get(i));
+                    if (g instanceof PdfDictionary) allOcgs.add((PdfDictionary) g);
+                }
+            }
+
+            PdfBase dVal = resolveRef(ocProps.get("D"));
+            PdfDictionary config = dVal instanceof PdfDictionary ? (PdfDictionary) dVal : null;
+            if (config != null) {
+                PdfBase base = resolveRef(config.get("BaseState"));
+                boolean baseOff = base instanceof org.aspose.pdf.engine.pdfobjects.PdfName
+                        && "OFF".equals(((org.aspose.pdf.engine.pdfobjects.PdfName) base).getName());
+                if (baseOff) hiddenOcgs.addAll(allOcgs);
+                applyOcgStateList(config.get("OFF"), true);
+                applyOcgStateList(config.get("ON"), false);
+            }
+
+            if (Boolean.getBoolean("render.acrobatPrintParity")) {
+                for (PdfDictionary ocg : allOcgs) {
+                    PdfBase usage = resolveRef(ocg.get("Usage"));
+                    if (!(usage instanceof PdfDictionary)) continue;
+                    PdfBase print = resolveRef(((PdfDictionary) usage).get("Print"));
+                    if (!(print instanceof PdfDictionary)) continue;
+                    PdfBase st = resolveRef(((PdfDictionary) print).get("PrintState"));
+                    if (st instanceof org.aspose.pdf.engine.pdfobjects.PdfName) {
+                        if ("OFF".equals(((org.aspose.pdf.engine.pdfobjects.PdfName) st).getName())) {
+                            hiddenOcgs.add(ocg);
+                        } else {
+                            hiddenOcgs.remove(ocg);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "OCProperties parse failed: " + e.getMessage());
+        }
+    }
+
+    /** Adds/removes every OCG in an /ON or /OFF array to the hidden set. */
+    private void applyOcgStateList(PdfBase listVal, boolean hide) {
+        PdfBase resolved = resolveRef(listVal);
+        if (!(resolved instanceof PdfArray)) return;
+        PdfArray arr = (PdfArray) resolved;
+        for (int i = 0; i < arr.size(); i++) {
+            PdfBase g = resolveRef(arr.get(i));
+            if (!(g instanceof PdfDictionary)) continue;
+            if (hide) hiddenOcgs.add((PdfDictionary) g);
+            else hiddenOcgs.remove(g);
+        }
+    }
+
+    /**
+     * True when the membership expression of an /OC entry — an OCG or OCMD
+     * dictionary — is hidden. OCMDs use the default AnyOn policy: visible
+     * when any member group is on (§8.11.2.2; /VE expressions not evaluated).
+     */
+    private boolean isOcHidden(PdfBase ocVal) {
+        PdfBase oc = resolveRef(ocVal);
+        if (!(oc instanceof PdfDictionary)) return false;
+        PdfDictionary dict = (PdfDictionary) oc;
+        String type = dict.getNameAsString("Type");
+        if ("OCMD".equals(type)) {
+            PdfBase members = resolveRef(dict.get("OCGs"));
+            if (members instanceof PdfDictionary) {
+                return hiddenOcgs.contains(members);
+            }
+            if (members instanceof PdfArray) {
+                PdfArray arr = (PdfArray) members;
+                boolean any = false;
+                for (int i = 0; i < arr.size(); i++) {
+                    PdfBase g = resolveRef(arr.get(i));
+                    if (g instanceof PdfDictionary) {
+                        any = true;
+                        if (!hiddenOcgs.contains(g)) return false; // one on → visible
+                    }
+                }
+                return any;
+            }
+            return false;
+        }
+        return hiddenOcgs.contains(dict);
+    }
+
+    /** Resolves a BDC /OC properties operand (name into /Properties, or inline dict). */
+    private boolean isHiddenOcBlock(Operator op, Resources resources) {
+        if (hiddenOcgs.isEmpty() || !(op instanceof BDC)) return false;
+        BDC bdc = (BDC) op;
+        if (!"OC".equals(bdc.getTag())) return false;
+        PdfBase props = bdc.getProperties();
+        if (props instanceof org.aspose.pdf.engine.pdfobjects.PdfName && resources != null) {
+            PdfDictionary propDict = resources.getProperties();
+            if (propDict == null) return false;
+            props = propDict.get(((org.aspose.pdf.engine.pdfobjects.PdfName) props).getName());
+        }
+        return isOcHidden(props);
+    }
+
+    /** True when the form XObject declares a transparency group (§11.6.6). */
+    private boolean isTransparencyGroup(PdfStream stream) {
+        PdfBase grp = resolveRef(stream.get("Group"));
+        if (!(grp instanceof PdfDictionary)) return false;
+        PdfBase s = resolveRef(((PdfDictionary) grp).get("S"));
+        return s instanceof org.aspose.pdf.engine.pdfobjects.PdfName
+                && "Transparency".equals(((org.aspose.pdf.engine.pdfobjects.PdfName) s).getName());
+    }
+
+    /**
+     * Renders a transparency-group form XObject into an offscreen ARGB buffer
+     * and composites the result onto the canvas once, with the caller's
+     * constant alpha (§11.6.6). Inside the group the alpha constants and blend
+     * mode start at their defaults (1.0 / Normal); the group is treated as
+     * isolated (transparent backdrop) — an approximation for non-isolated
+     * groups that is exact for the dominant overlay-with-ca use case.
+     */
+    private void renderFormOffscreen(Graphics2D g2d, GraphicsState state,
+                                     PdfStream stream, String name, Resources parentResources,
+                                     PDFParser parser, int formDepth, float groupAlpha) {
+        // NOTE: BufferedImage graphics report a MAX_VALUE-sized device — the
+        // real canvas size is tracked by renderPage.
+        if (canvasPixelW <= 0 || canvasPixelH <= 0) return;
+        // Size the offscreen buffer to the group's actual device footprint
+        // (current clip ∩ form /BBox ∩ canvas) instead of the whole page.
+        // Overlay-heavy pages nest hundreds of small transparency-group forms;
+        // a full-canvas buffer per group is O(pageArea) each and dominates
+        // wall-clock on large pages (PDFNET_39298: a 4362×3622pt page at 300dpi
+        // is ~274 MP, ×704 groups = a 300s timeout). Sub-rect buffers make each
+        // cost proportional to the group, not the page.
+        java.awt.Rectangle dev = offscreenDeviceBounds(g2d, state, stream, parser);
+        if (dev.width <= 0 || dev.height <= 0) return;
+        int bufW = dev.width;
+        int bufH = dev.height;
+        BufferedImage buf = new BufferedImage(bufW, bufH, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D og = buf.createGraphics();
+        try {
+            og.setRenderingHints(g2d.getRenderingHints());
+            // Full-buffer clip first (identity space): shading fills need
+            // non-null clip bounds to know their target area.
+            og.setClip(new java.awt.Rectangle(0, 0, bufW, bufH));
+            // Device→buffer shift so device pixel (dev.x,dev.y) lands at (0,0).
+            java.awt.geom.AffineTransform bt =
+                    java.awt.geom.AffineTransform.getTranslateInstance(-dev.x, -dev.y);
+            bt.concatenate(g2d.getTransform());
+            og.setTransform(bt);
+            if (g2d.getClip() != null) og.clip(g2d.getClip());
+
+            GraphicsState groupState = state.clone();
+            groupState.setNonStrokingAlpha(1.0f);
+            groupState.setStrokingAlpha(1.0f);
+            groupState.setBlendMode("Normal");
+            groupState.setSoftMask(null);
+            renderForm(og, groupState, stream, name, parentResources, parser, formDepth);
+        } finally {
+            og.dispose();
+        }
+
+        // §11.6.5.2: modulate the group's alpha by the soft mask, if one is set.
+        if (state.getSoftMask() != null) {
+            applySoftMaskToBuffer(buf, state.getSoftMask(), g2d, state,
+                    parentResources, parser, formDepth, dev.x, dev.y);
+        }
+
+        java.awt.geom.AffineTransform savedTransform = g2d.getTransform();
+        java.awt.Composite savedComposite = g2d.getComposite();
+        try {
+            g2d.setTransform(new java.awt.geom.AffineTransform());
+            g2d.setComposite(BlendComposite.groupComposite(
+                    state.getBlendMode(), Math.max(0f, Math.min(1f, groupAlpha))));
+            g2d.drawImage(buf, dev.x, dev.y, null);
+        } finally {
+            g2d.setComposite(savedComposite);
+            g2d.setTransform(savedTransform);
+        }
+    }
+
+    /**
+     * Device-space rectangle a transparency group can actually paint into:
+     * the current clip intersected with the form's {@code /BBox} (§8.10.1
+     * clips form content) and the page canvas, padded 1px for anti-aliased
+     * edges. Falls back to clip∩canvas when the BBox is absent/unusable.
+     */
+    private java.awt.Rectangle offscreenDeviceBounds(Graphics2D g2d, GraphicsState state,
+                                                     PdfStream stream, PDFParser parser) {
+        java.awt.Rectangle region = new java.awt.Rectangle(0, 0, canvasPixelW, canvasPixelH);
+        java.awt.Shape clip = g2d.getClip();
+        if (clip != null) {
+            region = region.intersection(
+                    g2d.getTransform().createTransformedShape(clip).getBounds());
+        }
+        try {
+            XForm form = new XForm(stream, "", parser);
+            Rectangle bbox = form.getBBox();
+            if (bbox != null) {
+                java.awt.geom.AffineTransform t =
+                        new java.awt.geom.AffineTransform(g2d.getTransform());
+                t.concatenate(matrixToTransform(form.getMatrix().multiply(state.getCTM())));
+                java.awt.geom.Rectangle2D r2 = new java.awt.geom.Rectangle2D.Double(
+                        Math.min(bbox.getLLX(), bbox.getURX()),
+                        Math.min(bbox.getLLY(), bbox.getURY()),
+                        Math.abs(bbox.getWidth()), Math.abs(bbox.getHeight()));
+                region = region.intersection(t.createTransformedShape(r2).getBounds());
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "Offscreen bounds: BBox unusable, using clip bounds");
+        }
+        if (region.width > 0 && region.height > 0) {
+            region.grow(1, 1);
+            region = region.intersection(
+                    new java.awt.Rectangle(0, 0, canvasPixelW, canvasPixelH));
+        }
+        return region;
+    }
+
+    /**
+     * Multiplies the alpha channel of {@code buf} by the soft mask (§11.6.5):
+     * the mask's /G transparency group is rendered offscreen under the same
+     * device transform; /S /Luminosity converts the result's luminance to
+     * alpha over a black backdrop (or /BC), /S /Alpha uses its alpha channel.
+     */
+    private void applySoftMaskToBuffer(BufferedImage buf, PdfDictionary mask,
+                                       Graphics2D g2d, GraphicsState state,
+                                       Resources parentResources, PDFParser parser,
+                                       int formDepth) {
+        applySoftMaskToBuffer(buf, mask, g2d, state, parentResources, parser, formDepth, 0, 0);
+    }
+
+    /**
+     * Offset-aware variant: {@code buf} covers the device sub-rectangle whose
+     * top-left is ({@code offX},{@code offY}), so the mask group is rendered
+     * with the same device→buffer shift.
+     */
+    private void applySoftMaskToBuffer(BufferedImage buf, PdfDictionary mask,
+                                       Graphics2D g2d, GraphicsState state,
+                                       Resources parentResources, PDFParser parser,
+                                       int formDepth, int offX, int offY) {
+        PdfBase gVal = resolveRef(mask.get("G"));
+        if (!(gVal instanceof PdfStream)) return;
+        PdfBase sVal = resolveRef(mask.get("S"));
+        boolean luminosity = !(sVal instanceof org.aspose.pdf.engine.pdfobjects.PdfName)
+                || "Luminosity".equals(((org.aspose.pdf.engine.pdfobjects.PdfName) sVal).getName());
+
+        BufferedImage maskBuf = new BufferedImage(buf.getWidth(), buf.getHeight(),
+                BufferedImage.TYPE_INT_ARGB);
+        Graphics2D mg = maskBuf.createGraphics();
+        try {
+            mg.setRenderingHints(g2d.getRenderingHints());
+            if (luminosity) {
+                // Luminosity backdrop: black unless /BC gives another level.
+                float bc = 0f;
+                PdfBase bcVal = resolveRef(mask.get("BC"));
+                if (bcVal instanceof org.aspose.pdf.engine.pdfobjects.PdfArray
+                        && ((org.aspose.pdf.engine.pdfobjects.PdfArray) bcVal).size() > 0) {
+                    PdfBase c0 = resolveRef(((org.aspose.pdf.engine.pdfobjects.PdfArray) bcVal).get(0));
+                    if (c0 instanceof org.aspose.pdf.engine.pdfobjects.PdfInteger) {
+                        bc = ((org.aspose.pdf.engine.pdfobjects.PdfInteger) c0).intValue();
+                    } else if (c0 instanceof org.aspose.pdf.engine.pdfobjects.PdfFloat) {
+                        bc = ((org.aspose.pdf.engine.pdfobjects.PdfFloat) c0).floatValue();
+                    }
+                }
+                int level = (int) (Math.max(0f, Math.min(1f, bc)) * 255);
+                mg.setColor(new java.awt.Color(level, level, level));
+                mg.fillRect(0, 0, maskBuf.getWidth(), maskBuf.getHeight());
+            }
+            // Without a clip the shading renderer has no target bounds and
+            // silently skips (gradient masks came out flat). Set the full
+            // device area while the transform is still identity.
+            mg.setClip(new java.awt.Rectangle(0, 0, maskBuf.getWidth(), maskBuf.getHeight()));
+            // Same device→buffer shift as the group buffer this mask modulates.
+            java.awt.geom.AffineTransform mt =
+                    java.awt.geom.AffineTransform.getTranslateInstance(-offX, -offY);
+            mt.concatenate(g2d.getTransform());
+            mg.setTransform(mt);
+            if (g2d.getClip() != null) {
+                mg.clip(g2d.getClip());
+            }
+            GraphicsState maskState = state.clone();
+            maskState.setNonStrokingAlpha(1.0f);
+            maskState.setStrokingAlpha(1.0f);
+            maskState.setBlendMode("Normal");
+            maskState.setSoftMask(null);
+            // Render the mask group in the CTM captured at gs-time
+            // (§11.6.5.2) — the caller may have issued cm since.
+            if (state.getSoftMaskCtm() != null) {
+                maskState.setCTM(state.getSoftMaskCtm());
+            }
+            // The mask is now also applied mid-path (direct fill under
+            // /SMask): the caller's PENDING path must not leak into the mask
+            // group — corpus 49703's mask re-declares the same triangle and
+            // the doubled subpath cancels itself under even-odd filling.
+            maskState.clearPath();
+            // A luminosity/alpha mask is an ALPHA source, not page color:
+            // Acrobat derives the mask from group luminosity before any
+            // print color conversion — suspend the print-parity RGB shift
+            // (it darkens shadow tones and would skew the alpha ramp).
+            boolean shiftWas = org.aspose.pdf.engine.colorspace.RgbPrintShift.active();
+            if (shiftWas) org.aspose.pdf.engine.colorspace.RgbPrintShift.setActive(false);
+            try {
+                renderForm(mg, maskState, (PdfStream) gVal, "SMask", parentResources,
+                        parser, formDepth);
+            } finally {
+                if (shiftWas) org.aspose.pdf.engine.colorspace.RgbPrintShift.setActive(true);
+            }
+        } catch (Exception e) {
+            LOG.fine(() -> "Soft-mask render failed: " + e.getMessage());
+            return;
+        } finally {
+            mg.dispose();
+        }
+
+        int w = buf.getWidth(), h = buf.getHeight();
+        int[] row = new int[w];
+        int[] mrow = new int[w];
+        for (int y = 0; y < h; y++) {
+            buf.getRGB(0, y, w, 1, row, 0, w);
+            maskBuf.getRGB(0, y, w, 1, mrow, 0, w);
+            for (int x = 0; x < w; x++) {
+                int m = mrow[x];
+                int factor;
+                if (luminosity) {
+                    // Unpainted mask pixels keep the backdrop; luminance→alpha.
+                    factor = (77 * ((m >> 16) & 0xFF) + 150 * ((m >> 8) & 0xFF)
+                            + 29 * (m & 0xFF)) >> 8;
+                } else {
+                    factor = (m >>> 24);
+                }
+                int a = (row[x] >>> 24) * factor / 255;
+                row[x] = (a << 24) | (row[x] & 0x00FFFFFF);
+            }
+            buf.setRGB(0, y, w, 1, row, 0, w);
         }
     }
 
@@ -1359,9 +2450,10 @@ public class PdfPageRenderer {
         try {
             Deque<GraphicsState> stack = new ArrayDeque<>();
             GraphicsState state = glyphState;
+            GraphicsState glyphInitial = glyphState.clone();
             for (Operator op : ops) {
                 try {
-                    state = processOperator(op, state, stack, resources, g2d, parser, 1);
+                    state = processOperator(op, state, stack, glyphInitial, resources, g2d, parser, 1);
                 } catch (Exception e) {
                     LOG.fine(() -> "Type3 glyph operator " + op.getName()
                             + " failed: " + e.getMessage());
@@ -1399,6 +2491,19 @@ public class PdfPageRenderer {
         state.setStrokingAlpha((float) gs.getStrokingAlpha());
         state.setNonStrokingAlpha((float) gs.getNonStrokingAlpha());
         state.setBlendMode(gs.getBlendMode());
+
+        // /SMask (§11.6.5.1): a dictionary installs a soft mask, /None clears it.
+        PdfBase sm = resolveRef(((PdfDictionary) val).get("SMask"));
+        if (sm instanceof PdfDictionary) {
+            state.setSoftMask((PdfDictionary) sm);
+            // §11.6.5.2: the mask group's coordinate space is fixed NOW — a
+            // cm between gs and the masked paint op must not move the mask
+            // (corpus 34703 panel gloss: "1 0 0 -1" flip after gs pushed the
+            // mask off-canvas, BC=1 made the gloss fully opaque white).
+            state.setSoftMaskCtm(state.getCTM());
+        } else if (sm != null) {
+            state.setSoftMask(null);
+        }
     }
 
     // ======== Advanced color ========

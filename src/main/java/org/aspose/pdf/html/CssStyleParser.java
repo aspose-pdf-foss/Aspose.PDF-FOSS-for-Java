@@ -132,14 +132,104 @@ public final class CssStyleParser {
                 break;
             case "width":
                 ctx.setWidth(parseDimension(value, 0));
+                if (value != null && value.trim().endsWith("%")) {
+                    try {
+                        ctx.setWidthPercent(Double.parseDouble(
+                                value.trim().substring(0, value.trim().length() - 1).trim()));
+                    } catch (NumberFormatException ignored) { }
+                }
+                break;
+            case "float":
+                ctx.setCssFloat(value.trim().toLowerCase());
+                break;
+            case "white-space":
+                ctx.setWhiteSpace(value.trim().toLowerCase());
                 break;
             case "height":
                 ctx.setHeight(parseDimension(value, 0));
+                break;
+            case "display":
+                ctx.setDisplay(value.trim().toLowerCase());
+                break;
+            case "border-bottom":
+                // Shorthand: <width> <style> <color> in any order (e.g.
+                // "1px dotted #6C8CD9", "0.5pt solid rgba(0,0,0,1)").
+                parseBorderBottomShorthand(ctx, value);
+                break;
+            case "border-bottom-width":
+                ctx.setBorderBottomWidth(parseDimension(value, 0));
+                break;
+            case "border-bottom-style":
+                ctx.setBorderBottomStyle(value.trim().toLowerCase());
+                break;
+            case "border-bottom-color":
+                Color bbc = parseColor(value);
+                if (bbc != null) {
+                    ctx.setBorderBottomColor(bbc);
+                }
                 break;
             default:
                 LOG.fine(() -> "Ignoring unsupported CSS property: " + property);
                 break;
         }
+    }
+
+    /** CSS border-style keywords. */
+    private static final java.util.Set<String> BORDER_STYLES = new java.util.HashSet<>(
+            java.util.Arrays.asList("none", "hidden", "solid", "dotted", "dashed",
+                    "double", "groove", "ridge", "inset", "outset"));
+
+    /**
+     * Parses a {@code border-bottom} shorthand ({@code <width> <style> <color>}
+     * in any order) into the context's bottom-border fields. Tokens are split on
+     * whitespace but parentheses are respected so {@code rgba(0, 0, 0, 1)} stays
+     * one token.
+     */
+    private static void parseBorderBottomShorthand(CssContext ctx, String value) {
+        if (value == null || value.trim().isEmpty()) {
+            return;
+        }
+        for (String tok : splitRespectingParens(value.trim())) {
+            String low = tok.toLowerCase(java.util.Locale.ROOT);
+            if (BORDER_STYLES.contains(low)) {
+                ctx.setBorderBottomStyle(low);
+                continue;
+            }
+            Color c = parseColor(tok);
+            if (c != null) {
+                ctx.setBorderBottomColor(c);
+                continue;
+            }
+            // Anything else is treated as the width dimension.
+            ctx.setBorderBottomWidth(parseDimension(tok, 0));
+        }
+    }
+
+    /** Splits on whitespace while keeping parenthesised groups (e.g. rgba(...)) intact. */
+    private static java.util.List<String> splitRespectingParens(String s) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        int depth = 0;
+        StringBuilder cur = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char ch = s.charAt(i);
+            if (ch == '(') {
+                depth++;
+            } else if (ch == ')') {
+                depth = Math.max(0, depth - 1);
+            }
+            if (Character.isWhitespace(ch) && depth == 0) {
+                if (cur.length() > 0) {
+                    out.add(cur.toString());
+                    cur.setLength(0);
+                }
+            } else {
+                cur.append(ch);
+            }
+        }
+        if (cur.length() > 0) {
+            out.add(cur.toString());
+        }
+        return out;
     }
 
     /**
@@ -239,9 +329,12 @@ public final class CssStyleParser {
             return parseHexColor(v.substring(1));
         }
 
-        // rgb() functional
+        // rgb() / rgba() functional
         if (v.startsWith("rgb(") && v.endsWith(")")) {
             return parseRgbFunction(v.substring(4, v.length() - 1));
+        }
+        if (v.startsWith("rgba(") && v.endsWith(")")) {
+            return parseRgbFunction(v.substring(5, v.length() - 1));
         }
 
         LOG.fine(() -> "Cannot parse color: " + v);
@@ -278,8 +371,16 @@ public final class CssStyleParser {
     private static Color parseRgbFunction(String inner) {
         try {
             String[] parts = inner.split(",");
-            if (parts.length != 3) {
+            // rgb() has 3 components; rgba() adds an alpha we honour only for full
+            // transparency (alpha 0 → no colour), otherwise treat as opaque.
+            if (parts.length != 3 && parts.length != 4) {
                 return null;
+            }
+            if (parts.length == 4) {
+                double a = Double.parseDouble(parts[3].trim());
+                if (a <= 0.0) {
+                    return null;
+                }
             }
             int r = Integer.parseInt(parts[0].trim());
             int g = Integer.parseInt(parts[1].trim());

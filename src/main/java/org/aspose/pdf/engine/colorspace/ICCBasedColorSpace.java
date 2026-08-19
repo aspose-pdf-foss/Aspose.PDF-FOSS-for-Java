@@ -76,6 +76,14 @@ public class ICCBasedColorSpace extends ColorSpaceBase {
      */
     @Override
     public int toRGBInt(double[] comps) {
+        // Acrobat print-parity harness mode: Acrobat's print pipeline pushes
+        // 4-component (CMYK) ICC content through the same press-to-monitor
+        // transform as DeviceCMYK, so use the measured print lattice instead
+        // of the JDK colorimetric CMM (see CmykPrintLut).
+        if (numComponents == 4 && comps != null && comps.length >= 4
+                && CmykPrintLut.active()) {
+            return CmykPrintLut.toRGBInt(comps[0], comps[1], comps[2], comps[3]);
+        }
         if (iccColorSpace != null && comps != null && comps.length >= numComponents) {
             try {
                 float[] in = new float[numComponents];

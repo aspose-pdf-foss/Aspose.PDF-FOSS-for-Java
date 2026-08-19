@@ -116,7 +116,15 @@ public final class PDFWriter {
         if (output == null) {
             throw new IllegalArgumentException("output must not be null");
         }
-        this.output = output;
+        // Buffer raw file/socket streams: the writer emits many small chunks
+        // (xref entries are 20 bytes each), and one syscall per chunk made
+        // large-document saves I/O-bound (PDFNET_48386: minutes in
+        // writeXRefTable). All write modes flush() before returning, so
+        // wrapping is transparent to callers.
+        this.output = (output instanceof java.io.BufferedOutputStream
+                || output instanceof java.io.ByteArrayOutputStream)
+                ? output
+                : new java.io.BufferedOutputStream(output, 1 << 18);
         this.pdfVersion = pdfVersion;
     }
 
@@ -287,13 +295,44 @@ public final class PDFWriter {
                                        PdfDictionary trailer) {
         java.util.Set<PdfBase> visited =
                 java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
-        // Visit every existing indirect object so its key marks the stream as
-        // already registered (and so we walk its children).
-        for (PdfBase root : new java.util.ArrayList<>(objects.values())) {
-            collectOrphanStreams(root, visited, objects);
+        // O(1) allocation + reverse lookup for the whole registration phase.
+        // Without these, nextFreeObjectNumber() rescans the objects map for
+        // every orphan and re-registration does a linear identity search —
+        // quadratic on documents with tens of thousands of objects
+        // (PDFNET_48386 hung the writer for minutes).
+        allocCursor = getMaxObjectNumber(objects);
+        reverseIndex = new java.util.IdentityHashMap<>(objects.size() * 2);
+        for (Map.Entry<PdfObjectKey, PdfBase> e : objects.entrySet()) {
+            reverseIndex.putIfAbsent(e.getValue(), e.getKey());
         }
-        if (trailer != null) {
-            collectOrphanStreams(trailer, visited, objects);
+        try {
+            // Visit every existing indirect object so its key marks the stream as
+            // already registered (and so we walk its children).
+            for (PdfBase root : new java.util.ArrayList<>(objects.values())) {
+                collectOrphanStreams(root, visited, objects);
+            }
+            if (trailer != null) {
+                collectOrphanStreams(trailer, visited, objects);
+            }
+        } finally {
+            allocCursor = -1;
+            reverseIndex = null;
+        }
+    }
+
+    /** Monotonic allocation cursor for the orphan-registration phase; -1 outside it. */
+    private int allocCursor = -1;
+
+    /** Identity index (object → its key) for the orphan-registration phase. */
+    private java.util.IdentityHashMap<PdfBase, PdfObjectKey> reverseIndex;
+
+    /** Records that {@code obj} is now registered under {@code key} in the phase indexes. */
+    private void indexRegistered(PdfBase obj, PdfObjectKey key) {
+        if (reverseIndex != null) {
+            reverseIndex.put(obj, key);
+        }
+        if (allocCursor >= 0 && key.getObjectNumber() > allocCursor) {
+            allocCursor = key.getObjectNumber();
         }
     }
 
@@ -315,6 +354,7 @@ public final class PDFWriter {
         if (existing == null) {
             s.setObjectKey(refKey);
             objects.put(refKey, s);
+            indexRegistered(s, refKey);
             return refKey;
         }
         // Collision: another object owns refKey. Allocate fresh.
@@ -322,59 +362,69 @@ public final class PDFWriter {
         PdfObjectKey fresh = new PdfObjectKey(next, 0);
         s.setObjectKey(fresh);
         objects.put(fresh, s);
+        indexRegistered(s, fresh);
         return fresh;
     }
 
     /**
-     * Recursively walks {@code node}, registering any orphan / stale
-     * streams it encounters per the contract on
-     * {@link #registerOrphanStreams(Map, PdfDictionary)}.
+     * Walks {@code node}, registering any orphan / stale streams and
+     * reference-target dictionaries it encounters per the contract on
+     * {@link #registerOrphanStreams(Map, PdfDictionary)}. Iterative with an
+     * explicit work stack: the object graph of a large document (thousands of
+     * pages) is deeper than the JVM call stack allows (StackOverflowError in
+     * PDFNET_40631 with recursive descent).
      */
-    private void collectOrphanStreams(PdfBase node,
+    private void collectOrphanStreams(PdfBase root,
                                       java.util.Set<PdfBase> visited,
                                       Map<PdfObjectKey, PdfBase> objects) {
-        if (node == null || !visited.add(node)) return;
-
-        if (node instanceof PdfStream) {
-            PdfStream s = (PdfStream) node;
-            PdfObjectKey existing = s.getObjectKey();
-            if (existing == null) {
-                // Inline orphan — assign fresh key.
-                int next = nextFreeObjectNumber(objects);
-                PdfObjectKey fresh = new PdfObjectKey(next, 0);
-                s.setObjectKey(fresh);
-                objects.put(fresh, s);
-            } else if (objects.get(existing) != s) {
-                // Has a key from a previous save / import but not in the
-                // current objects map. Try to register under the same key,
-                // re-key on collision.
-                registerStreamUnderRefKey(s, existing, objects);
-            }
-            // fall through to descend into the stream's dict entries
+        java.util.ArrayDeque<PdfBase> work = new java.util.ArrayDeque<>();
+        if (root != null) {
+            work.push(root);
         }
+        while (!work.isEmpty()) {
+            PdfBase node = work.pop();
+            if (node == null || !visited.add(node)) continue;
 
-        if (node instanceof PdfDictionary) {
-            // Snapshot keys because we may rewrite entries when a reference
-            // collides and forces a re-key.
-            java.util.List<PdfName> keys =
-                    new java.util.ArrayList<>(((PdfDictionary) node).keySet());
-            for (PdfName k : keys) {
-                PdfBase value = ((PdfDictionary) node).get(k);
-                PdfBase recurseInto = walkReferenceForReregistration(
-                        value, objects,
-                        newRef -> ((PdfDictionary) node).set(k, newRef));
-                collectOrphanStreams(recurseInto != null ? recurseInto : value,
-                        visited, objects);
+            if (node instanceof PdfStream) {
+                PdfStream s = (PdfStream) node;
+                PdfObjectKey existing = s.getObjectKey();
+                if (existing == null) {
+                    // Inline orphan — assign fresh key.
+                    int next = nextFreeObjectNumber(objects);
+                    PdfObjectKey fresh = new PdfObjectKey(next, 0);
+                    s.setObjectKey(fresh);
+                    objects.put(fresh, s);
+                    indexRegistered(s, fresh);
+                } else if (objects.get(existing) != s) {
+                    // Has a key from a previous save / import but not in the
+                    // current objects map. Try to register under the same key,
+                    // re-key on collision.
+                    registerStreamUnderRefKey(s, existing, objects);
+                }
+                // fall through to descend into the stream's dict entries
             }
-        } else if (node instanceof PdfArray) {
-            PdfArray arr = (PdfArray) node;
-            for (int i = 0; i < arr.size(); i++) {
-                final int idx = i;
-                PdfBase value = arr.get(i);
-                PdfBase recurseInto = walkReferenceForReregistration(
-                        value, objects, newRef -> arr.set(idx, newRef));
-                collectOrphanStreams(recurseInto != null ? recurseInto : value,
-                        visited, objects);
+
+            if (node instanceof PdfDictionary) {
+                // Snapshot keys because we may rewrite entries when a reference
+                // collides and forces a re-key.
+                java.util.List<PdfName> keys =
+                        new java.util.ArrayList<>(((PdfDictionary) node).keySet());
+                for (PdfName k : keys) {
+                    PdfBase value = ((PdfDictionary) node).get(k);
+                    PdfBase descendInto = walkReferenceForReregistration(
+                            value, objects,
+                            newRef -> ((PdfDictionary) node).set(k, newRef));
+                    work.push(descendInto != null ? descendInto : value);
+                }
+            } else if (node instanceof PdfArray) {
+                PdfArray arr = (PdfArray) node;
+                for (int i = 0; i < arr.size(); i++) {
+                    final int idx = i;
+                    PdfBase value = arr.get(i);
+                    PdfBase descendInto = walkReferenceForReregistration(
+                            value, objects, newRef -> arr.set(idx, newRef));
+                    work.push(descendInto != null ? descendInto : value);
+                }
             }
         }
     }
@@ -411,6 +461,38 @@ public final class PDFWriter {
             if (!effectiveKey.equals(refKey)) {
                 // Re-keyed due to collision — rewrite the slot so the
                 // parent points at the new key.
+                slotSetter.accept(new PdfObjectReference(effectiveKey, k -> objects.get(k)));
+            }
+        } else if (target instanceof PdfDictionary || target instanceof PdfArray) {
+            // Orphan NON-stream reference target (e.g. a FontDescriptor
+            // dictionary injected by the PDF/A converter with a hand-allocated
+            // key). Same contract as streams: register under the reference's
+            // key when free; on collision, reuse the key the identical object
+            // is already registered under, else allocate fresh and rewrite the
+            // parent slot. Parser-loaded objects are already in {@code objects}
+            // under their own key (identity match) — this is a no-op for them.
+            PdfBase existing = objects.get(refKey);
+            if (existing == null) {
+                objects.put(refKey, target);
+                indexRegistered(target, refKey);
+            } else if (existing != target) {
+                // Identity lookup via the phase index (linear entrySet scan
+                // here was quadratic on large documents).
+                PdfObjectKey found = reverseIndex != null ? reverseIndex.get(target) : null;
+                if (found == null) {
+                    for (Map.Entry<PdfObjectKey, PdfBase> e : objects.entrySet()) {
+                        if (e.getValue() == target) {
+                            found = e.getKey();
+                            break;
+                        }
+                    }
+                }
+                PdfObjectKey effectiveKey = found;
+                if (effectiveKey == null) {
+                    effectiveKey = new PdfObjectKey(nextFreeObjectNumber(objects), 0);
+                    objects.put(effectiveKey, target);
+                    indexRegistered(target, effectiveKey);
+                }
                 slotSetter.accept(new PdfObjectReference(effectiveKey, k -> objects.get(k)));
             }
         }
@@ -798,6 +880,12 @@ public final class PDFWriter {
      * {@code objects}, preventing a collision with a still-live original number.
      */
     private int nextFreeObjectNumber(Map<PdfObjectKey, PdfBase> objects) {
+        if (allocCursor >= 0) {
+            // Orphan-registration phase: O(1) monotonic allocation. The cursor
+            // is kept >= every key in the map by indexRegistered().
+            allocCursor = Math.max(allocCursor + 1, objectNumberFloor);
+            return allocCursor;
+        }
         return Math.max(getMaxObjectNumber(objects) + 1, objectNumberFloor);
     }
 
@@ -842,6 +930,14 @@ public final class PDFWriter {
                                  Map<PdfObjectKey, PdfBase> objects,
                                  int maxPerStream) throws IOException {
         LOGGER.log(Level.FINE, "Writing compressed PDF 1.5+ with {0} objects", objects.size());
+
+        // 0. Promote in-graph orphan streams to indirect objects — same pass as
+        //    write() (§7.3.8.1: streams MUST be indirect). Without it an edited
+        //    page's new /Contents stream (from Page.setContents) is written
+        //    without a valid key; the fallback numbering can collide with a real
+        //    object (e.g. a page whose object number is 1), dropping that page
+        //    from the reloaded document.
+        registerOrphanStreams(objects, trailer);
 
         // 1. Write header — ensure version is at least 1.5
         float version = Math.max(pdfVersion, 1.5f);

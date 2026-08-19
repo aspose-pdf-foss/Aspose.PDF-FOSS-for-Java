@@ -46,23 +46,44 @@ public class HtmlTagParser {
         Pattern.compile("(?i)<script[^>]*>[\\s\\S]*?</script>");
     private static final Pattern STYLE_PATTERN =
         Pattern.compile("(?i)<style[^>]*>[\\s\\S]*?</style>");
+    /** Groups: (1) open tag, (2) CSS body, (3) close tag — for {@link #escapeStyleBodies}. */
+    private static final Pattern STYLE_BLOCK_PATTERN =
+        Pattern.compile("(?i)(<style[^>]*>)([\\s\\S]*?)(</style>)");
     private static final Pattern COMMENT_PATTERN =
         Pattern.compile("<!--[\\s\\S]*?-->");
     private static final Pattern XMLNS_DQ_PATTERN =
         Pattern.compile("\\s+xmlns\\s*=\\s*\"[^\"]*\"");
     private static final Pattern XMLNS_SQ_PATTERN =
         Pattern.compile("\\s+xmlns\\s*=\\s*'[^']*'");
-    /** Missing space between an attribute value's closing quote and the next attr. */
+    /**
+     * Missing space between an attribute value's closing quote and the next
+     * attr: {@code ="v"attr="v2"} &rarr; {@code ="v" attr="v2"}. The next-attr
+     * shape ({@code name=} followed by a quote) must be required — a bare
+     * quote-then-letter match also fires on the OPENING quote of every value
+     * ({@code name="x"} &rarr; {@code name=" x"}) and on quotes in plain text.
+     */
     private static final Pattern ATTR_GAP_PATTERN =
-        Pattern.compile("([\"'])([a-zA-Z])");
+        Pattern.compile("([\"'])([a-zA-Z][\\w-]*=[\"'])");
     /** Unquoted attribute values: name=value -> name="value". */
     private static final Pattern UNQUOTED_ATTR_PATTERN =
         Pattern.compile("(?<=\\s)(\\w+)=([a-zA-Z][a-zA-Z0-9_.:-]*)(?=\\s|/?>)");
+    /** Inline event-handler attributes (onclick, onchange, …). Their JavaScript
+     *  bodies frequently contain {@code <}, {@code &} and quotes that break XML;
+     *  they are never rendered, so strip them wholesale (both quote styles). */
+    private static final Pattern ON_HANDLER_PATTERN =
+        Pattern.compile("(?i)\\son[a-z]+\\s*=\\s*(\"[^\"]*\"|'[^']*')");
+    /** {@code <textarea …>} / {@code </textarea>} tags (kept content, dropped tag). */
+    private static final Pattern TEXTAREA_TAG_PATTERN =
+        Pattern.compile("(?i)</?textarea[^>]*>");
 
     /** Single alternation over all void elements: 1 pass instead of 14. */
     private static final Pattern VOID_ELEMENTS_PATTERN =
         Pattern.compile("(?i)<(" + String.join("|", VOID_ELEMENTS)
             + ")(\\s[^>]*?)?\\s*(?<!/)>");
+    /** Stray CLOSING tags of void elements (e.g. {@code </br>}, {@code </img>}) —
+     *  invalid in XML (no matching open) and a common legacy-HTML defect. */
+    private static final Pattern VOID_CLOSE_PATTERN =
+        Pattern.compile("(?i)</(" + String.join("|", VOID_ELEMENTS) + ")\\s*>");
     /** Single alternation over all boolean attributes: 1 pass instead of 21. */
     private static final Pattern BOOLEAN_ATTRS_PATTERN =
         Pattern.compile("(?i)(<[a-zA-Z][^>]*\\s)(" + String.join("|", BOOLEAN_ATTRS)
@@ -114,6 +135,30 @@ public class HtmlTagParser {
             try {
                 return parseAsXml(ensureXmlStructure(cleaned));
             } catch (Exception e2) {
+                // Retry with auto-closing of unbalanced p/li/td/tr — a more
+                // aggressive repair kept OUT of the first cleaned attempt because
+                // it is nesting-unaware and would mangle valid nested tables.
+                try {
+                    return parseAsXml(ensureXmlStructure(autoCloseAll(cleaned)));
+                } catch (Exception e2b) {
+                    // ignore; fall through
+                }
+                // Targeted repair: unwrap <textarea> to its text. Kept OUT of
+                // cleanHtml so a well-formed document keeps textarea as a real
+                // multiline form field; only markup that already failed reaches
+                // here, where legacy forms' many stray </textarea> closes abort
+                // the parse. Try with and without auto-closing.
+                String noTextarea = TEXTAREA_TAG_PATTERN.matcher(cleaned).replaceAll("");
+                try {
+                    return parseAsXml(ensureXmlStructure(noTextarea));
+                } catch (Exception e2c) {
+                    // ignore; fall through
+                }
+                try {
+                    return parseAsXml(ensureXmlStructure(autoCloseAll(noTextarea)));
+                } catch (Exception e2d) {
+                    // ignore; fall through to aggressive clean
+                }
                 // Last resort: aggressive clean
                 try {
                     return parseAsXml(ensureXmlStructure(aggressiveClean(cleaned)));
@@ -127,9 +172,13 @@ public class HtmlTagParser {
                     } catch (Exception e4) {
                         LOG.warning("HTML body-only fallback failed: " + e4.getMessage());
                     }
-                    // Ultra-fallback: strip ALL tags and wrap plain text
+                    // Ultra-fallback: strip ALL tags and wrap plain text. Remove
+                    // <style>/<script> BODIES first so their CSS/JS text is not
+                    // dumped as visible content when only tags are stripped.
                     try {
-                        String text = cleaned.replaceAll("<[^>]*>", " ")
+                        String text = STYLE_PATTERN.matcher(cleaned).replaceAll(" ");
+                        text = SCRIPT_PATTERN.matcher(text).replaceAll(" ");
+                        text = text.replaceAll("<[^>]*>", " ")
                             .replaceAll("\\s+", " ").trim();
                         return parseAsXml("<html><body><p>" + escapeXml(text) + "</p></body></html>");
                     } catch (Exception e5) {
@@ -152,9 +201,16 @@ public class HtmlTagParser {
         // Remove CDATA sections
         html = CDATA_PATTERN.matcher(html).replaceAll("");
 
-        // Remove <script> and <style> content (often contains bare < > that break XML)
+        // Remove <script> content (not rendered; often bare < > that break XML).
         html = SCRIPT_PATTERN.matcher(html).replaceAll("");
-        html = STYLE_PATTERN.matcher(html).replaceAll("");
+        // Remove inline event handlers (onclick=… etc.) — their JS bodies carry
+        // <, & and quotes that break XML attribute parsing, and are never rendered.
+        html = ON_HANDLER_PATTERN.matcher(html).replaceAll("");
+        // PRESERVE <style> blocks: the CSS is needed to style the output. Escaping
+        // the XML-significant chars inside each block lets the <style> element (and
+        // its text) survive XML parsing, instead of deleting the whole stylesheet
+        // (which dropped ALL styling for any HTML that wasn't already valid XML).
+        html = escapeStyleBodies(html);
 
         // Remove HTML comments (after IE conditionals are handled)
         html = COMMENT_PATTERN.matcher(html).replaceAll("");
@@ -169,6 +225,10 @@ public class HtmlTagParser {
 
         // Close void elements (single alternation pass): <br> -> <br/>, <BR> -> <BR/>
         html = VOID_ELEMENTS_PATTERN.matcher(html).replaceAll("<$1$2/>");
+        // Drop stray CLOSING void tags (</br>, </img>, …) — no matching open,
+        // so XML rejects them ("markup must be well-formed"); legacy forms emit
+        // </br> after tables, which otherwise collapses the whole parse.
+        html = VOID_CLOSE_PATTERN.matcher(html).replaceAll("");
 
         // Fix boolean attributes (single alternation pass): controls → controls="controls".
         // A tag may carry several (<input checked disabled>); each pass fixes the first
@@ -187,18 +247,51 @@ public class HtmlTagParser {
         // entities — all in a single forward scan (was 32+ separate passes).
         html = replaceHtmlEntitiesAndEscapeAmps(html);
 
-        // Auto-close unclosed tags (skip for very large documents)
-        if (html.length() < 500_000) {
-            html = autoCloseTag(html, "p");
-            html = autoCloseTag(html, "li");
-            html = autoCloseTag(html, "td");
-            html = autoCloseTag(html, "th");
-            html = autoCloseTag(html, "tr");
-            html = autoCloseTag(html, "dt");
-            html = autoCloseTag(html, "dd");
-        }
-
         return html;
+    }
+
+    /**
+     * Auto-closes unbalanced {@code p}/{@code li}/{@code td}/{@code th}/{@code tr}/
+     * {@code dt}/{@code dd} tags. This is a LAST-RESORT repair: the heuristic is
+     * nesting-unaware (a nested table's inner {@code <td>} looks like a sibling of
+     * the outer one), so it can mangle already-balanced nested tables. It is only
+     * applied when a plain clean-up parse fails, never on already-valid markup.
+     */
+    static String autoCloseAll(String html) {
+        // O(n) per tag, so safe on large documents.
+        if (html.length() >= 5_000_000) {
+            return html;
+        }
+        html = autoCloseTag(html, "p");
+        html = autoCloseTag(html, "li");
+        html = autoCloseTag(html, "td");
+        html = autoCloseTag(html, "th");
+        html = autoCloseTag(html, "tr");
+        html = autoCloseTag(html, "dt");
+        html = autoCloseTag(html, "dd");
+        return html;
+    }
+
+    /**
+     * Escapes the XML-significant characters inside every {@code <style>} body so
+     * the stylesheet survives XML parsing as the element's text content. CSS never
+     * contains a literal {@code <}; {@code &} would otherwise start an entity, and
+     * {@code ]]>} would close a section — both are neutralised. The child
+     * combinator {@code >} is valid in XML text and left as-is.
+     */
+    private static String escapeStyleBodies(String html) {
+        java.util.regex.Matcher m = STYLE_BLOCK_PATTERN.matcher(html);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String body = m.group(2)
+                    .replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace("]]>", "]]&gt;");
+            m.appendReplacement(sb,
+                    java.util.regex.Matcher.quoteReplacement(m.group(1) + body + m.group(3)));
+        }
+        m.appendTail(sb);
+        return sb.toString();
     }
 
     /**
@@ -293,31 +386,37 @@ public class HtmlTagParser {
      * before the next opening tag of the same name or before certain parent closes.
      */
     private static String autoCloseTag(String html, String tag) {
-        StringBuilder sb = new StringBuilder();
-        String lower = html.toLowerCase();
-        int pos = 0;
+        // O(n): scan once with charAt/regionMatches. The previous implementation
+        // called lower.substring(pos) inside the loop — O(n²), which forced a size
+        // cap that left large legacy documents (unbalanced <td>/<tr>/<p>) to fail
+        // the structured parse and fall back to plain-text-stripping.
+        StringBuilder sb = new StringBuilder(html.length() + 64);
+        int n = html.length();
+        int tagLen = tag.length();
         int openCount = 0;
-
-        while (pos < html.length()) {
-            if (pos < lower.length() - tag.length() - 1
-                    && lower.charAt(pos) == '<'
-                    && lower.substring(pos + 1).startsWith(tag)
-                    && (pos + 1 + tag.length() < lower.length())
-                    && !Character.isLetterOrDigit(lower.charAt(pos + 1 + tag.length()))) {
-                if (pos + 1 < lower.length() && lower.charAt(pos + 1) != '/') {
-                    if (openCount > 0) {
-                        sb.append("</").append(tag).append(">");
+        for (int pos = 0; pos < n; pos++) {
+            char ch = html.charAt(pos);
+            if (ch == '<') {
+                boolean isClose = pos + 1 < n && html.charAt(pos + 1) == '/';
+                int nameStart = isClose ? pos + 2 : pos + 1;
+                if (html.regionMatches(true, nameStart, tag, 0, tagLen)) {
+                    int after = nameStart + tagLen;
+                    char delim = after < n ? html.charAt(after) : ' ';
+                    if (!Character.isLetterOrDigit(delim)) {
+                        if (isClose) {
+                            if (openCount > 0) {
+                                openCount--;
+                            }
+                        } else {
+                            if (openCount > 0) {
+                                sb.append("</").append(tag).append(">");
+                            }
+                            openCount++;
+                        }
                     }
-                    openCount++;
                 }
             }
-            if (pos < lower.length() - tag.length() - 2
-                    && lower.substring(pos).startsWith("</" + tag)) {
-                if (openCount > 0) openCount--;
-            }
-
-            sb.append(html.charAt(pos));
-            pos++;
+            sb.append(ch);
         }
         if (openCount > 0) {
             sb.append("</").append(tag).append(">");
@@ -333,7 +432,12 @@ public class HtmlTagParser {
         html = html.replaceAll("(?i)<!DOCTYPE[^>]*>", "").trim();
 
         String lower = html.toLowerCase();
-        if (!lower.contains("<html")) {
+        // Wrap when the content does not START with <html>: either there is no
+        // <html> at all, or (common in legacy exports) markup precedes it — e.g.
+        // "<table>…</table><br><html>…</html>". Leaving leading markup outside the
+        // root produces "markup following the root element must be well-formed" and
+        // collapses the whole document to the plain-text fallback.
+        if (!lower.startsWith("<html")) {
             html = "<html><body>" + html + "</body></html>";
         } else {
             // Ensure </body> exists before </html>

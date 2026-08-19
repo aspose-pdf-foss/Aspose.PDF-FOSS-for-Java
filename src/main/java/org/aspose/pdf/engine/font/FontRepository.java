@@ -7,7 +7,7 @@ import org.aspose.pdf.engine.pdfobjects.PdfObjectReference;
 import org.aspose.pdf.engine.parser.PDFParser;
 
 import java.io.IOException;
-import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.logging.Logger;
 
@@ -22,12 +22,20 @@ public final class FontRepository {
 
     private static final Logger LOG = Logger.getLogger(FontRepository.class.getName());
 
-    private final Map<String, PdfFont> cache = new HashMap<>();
+    // Keyed by the IDENTITY of the resolved font dictionary, NOT the resource
+    // alias: a page and a Form XObject routinely both call their first font
+    // "F0" while binding it to DIFFERENT dictionaries (page: simple ArialMT;
+    // form: Type0 Identity-H). An alias-keyed cache returned whichever loaded
+    // first for BOTH scopes, so the other scope's text was decoded with the
+    // wrong code stride (single-byte ASCII fused into 2-byte CIDs — mojibake).
+    // Identity (not content equals) keeps the lookup O(1) — PdfDictionary's
+    // equals is deep and a font dict hangs a multi-KB FontFile stream off it.
+    private final Map<PdfDictionary, PdfFont> cache = new IdentityHashMap<>();
 
     /**
      * Returns the PdfFont for the given font name from the fonts dictionary.
      * <p>
-     * Caches fonts by name to avoid repeated parsing.
+     * Caches fonts by the resolved font dictionary to avoid repeated parsing.
      * </p>
      *
      * @param fontsDict the /Font sub-dictionary from page resources
@@ -42,13 +50,7 @@ public final class FontRepository {
             return null;
         }
 
-        // Check cache
-        PdfFont cached = cache.get(fontName);
-        if (cached != null) {
-            return cached;
-        }
-
-        // Resolve font dictionary
+        // Resolve font dictionary first — the cache key is the dictionary itself.
         PdfBase fontVal = fontsDict.get(fontName);
         if (fontVal instanceof PdfObjectReference) {
             try {
@@ -63,9 +65,15 @@ public final class FontRepository {
             LOG.warning(() -> "Font " + fontName + " is not a dictionary");
             return null;
         }
+        PdfDictionary fontDict = (PdfDictionary) fontVal;
 
-        PdfFont font = PdfFont.fromDictionary((PdfDictionary) fontVal, parser);
-        cache.put(fontName, font);
+        PdfFont cached = cache.get(fontDict);
+        if (cached != null) {
+            return cached;
+        }
+
+        PdfFont font = PdfFont.fromDictionary(fontDict, parser);
+        cache.put(fontDict, font);
         return font;
     }
 

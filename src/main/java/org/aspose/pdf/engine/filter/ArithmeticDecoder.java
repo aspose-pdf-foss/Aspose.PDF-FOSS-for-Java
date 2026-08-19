@@ -108,17 +108,20 @@ public final class ArithmeticDecoder {
     }
 
     /**
-     * INITDEC — initializes the decoder.
-     * Annex F, Figure F.1 (software conventions).
+     * INITDEC — initializes the decoder (T.88 §E.3.5, standard conventions:
+     * {@code bp} points at the CURRENT byte B).
      */
     private void initDec() {
-        // Read first byte XOR 0xFF, shift left 16
-        int b = (bp < data.length) ? (data[bp++] & 0xFF) : 0xFF;
-        C = (b ^ 0xFF) << 16;
+        C = currentByte() << 16;
         byteIn();
-        C = C << 7;
+        C <<= 7;
         CT -= 7;
         A = 0x8000;
+    }
+
+    /** The byte at the current pointer, 0xFF past the end (§E.3.4 padding). */
+    private int currentByte() {
+        return bp < data.length ? data[bp] & 0xFF : 0xFF;
     }
 
     /**
@@ -128,22 +131,48 @@ public final class ArithmeticDecoder {
      * @return the decoded symbol (0 or 1)
      */
     public int decode(int cx) {
-        int qe = QE_TABLE[contextI[cx]][0];
+        // T.88 §E.3.2 DECODE with §E.3.3 exchange procedures. Chigh is
+        // compared against Qe (standard conventions — matching INITDEC/BYTEIN
+        // above; mixing in the Annex-G complement forms desynchronises the
+        // decoder within a few dozen decisions).
+        int icx = contextI[cx];
+        int qe = QE_TABLE[icx][0];
         A -= qe;
-
-        int chigh = (C >>> 16) & 0xFFFF;
-        if (chigh < A) {
-            // MPS sub-interval
-            if ((A & 0x8000) != 0) {
-                return contextMPS[cx]; // no renormalization needed
+        int d;
+        if (((C >>> 16) & 0xFFFF) < qe) {
+            // LPS exchange (§E.3.3.2)
+            if (A < qe) {
+                d = contextMPS[cx];
+                contextI[cx] = QE_TABLE[icx][1]; // NMPS
+            } else {
+                d = 1 - contextMPS[cx];
+                if (QE_TABLE[icx][3] == 1) {
+                    contextMPS[cx] = 1 - contextMPS[cx];
+                }
+                contextI[cx] = QE_TABLE[icx][2]; // NLPS
             }
-            return mpsExchange(cx);
+            A = qe;
+            renormD();
         } else {
-            // LPS sub-interval
-            chigh -= A;
-            C = (chigh << 16) | (C & 0xFFFF);
-            return lpsExchange(cx);
+            C -= qe << 16;
+            if ((A & 0x8000) == 0) {
+                // MPS exchange (§E.3.3.1)
+                if (A < qe) {
+                    d = 1 - contextMPS[cx];
+                    if (QE_TABLE[icx][3] == 1) {
+                        contextMPS[cx] = 1 - contextMPS[cx];
+                    }
+                    contextI[cx] = QE_TABLE[icx][2]; // NLPS
+                } else {
+                    d = contextMPS[cx];
+                    contextI[cx] = QE_TABLE[icx][1]; // NMPS
+                }
+                renormD();
+            } else {
+                d = contextMPS[cx];
+            }
         }
+        return d;
     }
 
     /**
@@ -235,72 +264,27 @@ public final class ArithmeticDecoder {
      * Decodes one bit for the integer arithmetic procedure using context tree.
      */
     private int decodeBitIA(int cxBase, int prev) {
-        // Context = cxBase + prev (limited to 512 contexts)
-        int cx = cxBase + Math.min(prev, 511);
-        return decode(cx);
+        return decode(cxBase + prev);
+    }
+
+    /** §A.2 PREV update: once PREV reaches 256, keep the low 8 bits + bit 8. */
+    private static int nextPrev(int prev, int bit) {
+        int next = (prev << 1) | bit;
+        return prev < 256 ? next : (next & 511) | 256;
     }
 
     /**
-     * Decodes multiple bits for the integer arithmetic procedure.
-     * Each bit uses a fixed context offset.
+     * Decodes multiple bits for the integer arithmetic procedure,
+     * threading PREV per §A.2.
      */
     private int decodeBitsIA(int cxBase, int prev, int numBits) {
         int value = 0;
         for (int i = 0; i < numBits; i++) {
             int bit = decodeBitIA(cxBase, prev);
-            prev = (prev << 1) | bit;
-            // Clamp prev to avoid overflow
-            if (prev > 511) prev = 511;
+            prev = nextPrev(prev, bit);
             value = (value << 1) | bit;
         }
         return value;
-    }
-
-    /**
-     * MPS exchange procedure — handles conditional exchange
-     * when A < Qe after subtracting Qe in the MPS path.
-     */
-    private int mpsExchange(int cx) {
-        int qe = QE_TABLE[contextI[cx]][0];
-        if (A < qe) {
-            // Conditional exchange: return LPS instead
-            int d = 1 - contextMPS[cx];
-            if (QE_TABLE[contextI[cx]][3] == 1) {
-                contextMPS[cx] = 1 - contextMPS[cx];
-            }
-            contextI[cx] = QE_TABLE[contextI[cx]][2]; // NLPS
-            renormD();
-            return d;
-        } else {
-            int d = contextMPS[cx];
-            contextI[cx] = QE_TABLE[contextI[cx]][1]; // NMPS
-            renormD();
-            return d;
-        }
-    }
-
-    /**
-     * LPS exchange procedure — handles conditional exchange
-     * when A < Qe in the LPS path.
-     */
-    private int lpsExchange(int cx) {
-        int qe = QE_TABLE[contextI[cx]][0];
-        if (A < qe) {
-            A = qe;
-            int d = contextMPS[cx]; // MPS (conditional exchange)
-            contextI[cx] = QE_TABLE[contextI[cx]][1]; // NMPS
-            renormD();
-            return d;
-        } else {
-            A = qe;
-            int d = 1 - contextMPS[cx]; // LPS
-            if (QE_TABLE[contextI[cx]][3] == 1) {
-                contextMPS[cx] = 1 - contextMPS[cx];
-            }
-            contextI[cx] = QE_TABLE[contextI[cx]][2]; // NLPS
-            renormD();
-            return d;
-        }
     }
 
     /**
@@ -321,28 +305,38 @@ public final class ArithmeticDecoder {
      * Annex E §E.3.4: handles 0xFF byte stuffing for marker detection.
      */
     private void byteIn() {
-        if (bp < data.length) {
-            int b = data[bp++] & 0xFF;
-            if (b == 0xFF) {
-                int b1 = (bp < data.length) ? (data[bp] & 0xFF) : 0xFF;
-                if (b1 > 0x8F) {
-                    // Marker detected: don't consume next byte, pad with 1s
-                    C += 0xFF00;
-                    CT = 8;
-                } else {
-                    bp++;
-                    C += (b1 << 9);
-                    CT = 7;
-                }
-            } else {
-                C += (b << 8);
+        // §E.3.4: the stuffing test applies to the CURRENT byte; the byte
+        // consumed is the one after it.
+        if (currentByte() == 0xFF) {
+            int b1 = (bp + 1 < data.length) ? (data[bp + 1] & 0xFF) : 0xFF;
+            if (b1 > 0x8F) {
+                // Marker (or end of data): stay put, feed 1-bits.
+                C += 0xFF00;
                 CT = 8;
+            } else {
+                bp++;
+                C += b1 << 9;
+                CT = 7;
             }
         } else {
-            // Past end of data — pad with 0xFF
-            C += 0xFF00;
+            bp++;
+            C += currentByte() << 8;
             CT = 8;
         }
+    }
+
+    /**
+     * Presets a context's adaptation state. JPEG 2000 Tier-1 (ISO 15444-1
+     * Annex D — same MQ coder as T.88) starts the UNIFORM context at state 46
+     * and the run-length context at state 3 instead of the all-zeros default.
+     *
+     * @param cx       the context index
+     * @param stateIdx initial index into the Qe state table
+     * @param mpsVal   initial MPS symbol (0 or 1)
+     */
+    public void setContext(int cx, int stateIdx, int mpsVal) {
+        contextI[cx] = stateIdx;
+        contextMPS[cx] = mpsVal;
     }
 
     /**

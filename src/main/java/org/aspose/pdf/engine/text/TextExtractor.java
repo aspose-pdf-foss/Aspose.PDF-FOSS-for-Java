@@ -108,6 +108,12 @@ public class TextExtractor {
     private double currentX;
     private double currentY;
     private String currentFontName;
+    // Embedding status of the active font (from its /FontDescriptor /FontFile*),
+    // and whether its /BaseFont carries a subset prefix ("ABCDEF+"). Surfaced on
+    // the extracted fragment's Font so getFont().isEmbedded()/isSubset() reflect
+    // the document (Aspose parity).
+    private boolean currentFontEmbedded;
+    private boolean currentFontSubset;
     private Rectangle currentPageRect;
     private double[] fragmentStartTextMatrix;
     private double[] fragmentStartCtm;
@@ -374,21 +380,26 @@ public class TextExtractor {
                 }
                 break;
 
-            // -- Fill color (non-stroking). Recorded so the color active when
-            // a text run is flushed becomes the fragment's foreground color.
+            // -- Fill color (non-stroking). A pending run is flushed FIRST so
+            // its foreground color is the one that was active while its glyphs
+            // were shown — a mid-BT color change starts a new fragment (Aspose
+            // fragment boundaries include color changes).
             case "rg":
                 if (operands.size() >= 3) {
+                    flushPendingTextBeforeStateChange();
                     currentFillColor = Color.fromRgb(getNumber(operands.get(0)),
                             getNumber(operands.get(1)), getNumber(operands.get(2)));
                 }
                 break;
             case "g":
                 if (operands.size() >= 1) {
+                    flushPendingTextBeforeStateChange();
                     currentFillColor = Color.fromGray(getNumber(operands.get(0)));
                 }
                 break;
             case "k":
                 if (operands.size() >= 4) {
+                    flushPendingTextBeforeStateChange();
                     currentFillColor = Color.fromCmyk(getNumber(operands.get(0)),
                             getNumber(operands.get(1)), getNumber(operands.get(2)),
                             getNumber(operands.get(3)));
@@ -481,8 +492,11 @@ public class TextExtractor {
                     // /BaseFont entry when it is available so callers see the real
                     // font family ("CourierNew") instead of the per-page alias ("F1").
                     currentFontName = fontResourceName;
+                    currentFontEmbedded = false;
+                    currentFontSubset = false;
                     if (fontsDict != null) {
                         currentFont = fontRepo.getFont(fontsDict, fontResourceName, parser);
+                        currentFontEmbedded = isFontEmbedded(currentFont);
                         org.aspose.pdf.engine.pdfobjects.PdfBase entry = fontsDict.get(fontResourceName);
                         if (entry instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
                             try {
@@ -494,6 +508,7 @@ public class TextExtractor {
                         if (entry instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary) {
                             String baseFont = ((org.aspose.pdf.engine.pdfobjects.PdfDictionary) entry).getNameAsString("BaseFont");
                             if (baseFont != null && !baseFont.isEmpty()) {
+                                currentFontSubset = !baseFont.equals(stripSubsetPrefix(baseFont));
                                 currentFontName = stripSubsetPrefix(baseFont);
                             }
                         }
@@ -852,6 +867,18 @@ public class TextExtractor {
         textMatrix = multiplyMatrix(translate, textMatrix);
     }
 
+    /**
+     * Flushes the pending run before a text-state change (fill color, ...) so
+     * the flushed fragment keeps the state its glyphs were shown with —
+     * mirrors the {@code Tf} handling.
+     */
+    private void flushPendingTextBeforeStateChange() {
+        if (currentText != null && currentText.length() > 0) {
+            flushText();
+            currentText = new StringBuilder();
+        }
+    }
+
     private void flushText() {
         if (currentText == null || currentText.length() == 0) return;
 
@@ -875,6 +902,11 @@ public class TextExtractor {
         // Set text state on the first segment
         TextState state = fragment.getTextState();
         state.setFontName(currentFontName);
+        // Surface embedding/subset status (from the /FontDescriptor) so
+        // getFont().isEmbedded()/isSubset() reflect the document. Stored as flags
+        // rather than a Font object to avoid perturbing the rendering/layout paths
+        // that read TextState.getFont().
+        state.setFontEmbeddingInfo(currentFontEmbedded, currentFontSubset);
         // Report the EFFECTIVE font size: many producers set "/F1 1 Tf" and
         // carry the real size in the text matrix (e.g. Tm [0 14 -14 0 …] on a
         // rotated page). Aspose reports Tf × Tm-vertical-scale, so tests like
@@ -982,6 +1014,7 @@ public class TextExtractor {
         fragment.setSourceTextLength(text.length());
         fragment.setSourceOperators(currentSourceOperators);
         fragment.setSourceContentStream(currentSourceStream);
+        fragment.setSourceResources(currentResources != null ? currentResources.getPdfDictionary() : null);
         // Sprint 36: also record the source operators by identity so a
         // sibling fragment's later mutation can shift indices without
         // corrupting this fragment's reference (see TextFragment).
@@ -993,6 +1026,9 @@ public class TextExtractor {
                 fragment.setLastSourceOperator(currentSourceOperators.getAt(lastTextOpIndex));
             }
         }
+        // Route later state mutations (setFontSize) back into the source ops
+        // (PDFNEWNET-30639); a phrase-search match re-binds to itself.
+        state.bindSourceFragment(fragment);
 
         fragments.add(fragment);
         currentText = new StringBuilder();
@@ -1120,6 +1156,8 @@ public class TextExtractor {
         currentX = 0;
         currentY = 0;
         currentFontName = null;
+        currentFontEmbedded = false;
+        currentFontSubset = false;
         currentPageRect = null;
         fragmentStartTextMatrix = null;
         fragmentStartCtm = null;
@@ -1189,6 +1227,18 @@ public class TextExtractor {
      * uppercase ASCII letters followed by a single {@code '+'} when a font
      * is subset-embedded; anything else is returned unchanged.
      */
+    /**
+     * Returns whether {@code font} is embedded, i.e. its font descriptor
+     * carries a font program stream (/FontFile, /FontFile2, or /FontFile3).
+     * For Type0 fonts the descriptor is that of the descendant CIDFont.
+     */
+    private static boolean isFontEmbedded(org.aspose.pdf.engine.font.PdfFont font) {
+        if (font == null) return false;
+        org.aspose.pdf.engine.font.FontDescriptor fd = font.getFontDescriptor();
+        if (fd == null) return false;
+        return fd.getFontFile() != null || fd.getFontFile2() != null || fd.getFontFile3() != null;
+    }
+
     static String stripSubsetPrefix(String baseFont) {
         if (baseFont == null || baseFont.length() < 8) return baseFont;
         if (baseFont.charAt(6) != '+') return baseFont;

@@ -51,11 +51,30 @@ public final class TextLayoutHelper {
             int code = charToWinAnsi(ch);
             if (code >= 0 && code < 256) {
                 totalWidth += widths[code] / 1000.0 * fontSize;
+            } else if (isFullWidth(ch)) {
+                // CJK ideographs/kana/fullwidth forms advance one em — they
+                // render through an embedded Identity-H font; measuring them
+                // as zero glued whole Chinese lines into one unwrappable
+                // "word" and overlapped columns.
+                totalWidth += fontSize;
+            } else {
+                // Other non-WinAnsi scripts (Cyrillic, Greek, …): a rough
+                // proportional average keeps wrapping sane.
+                totalWidth += 0.55 * fontSize;
             }
-            // Characters outside WinAnsi range are treated as having zero width
-            // (they would be replaced by '?' during rendering)
         }
         return totalWidth;
+    }
+
+    /** True for codepoints that typeset at a full em advance (CJK ideographs,
+     *  kana, Hangul, fullwidth/vertical forms, CJK punctuation). */
+    private static boolean isFullWidth(char ch) {
+        return (ch >= 0x1100 && ch <= 0x115F)     // Hangul Jamo
+                || (ch >= 0x2E80 && ch <= 0xA4CF)  // CJK radicals … Yi
+                || (ch >= 0xAC00 && ch <= 0xD7A3)  // Hangul syllables
+                || (ch >= 0xF900 && ch <= 0xFAFF)  // CJK compat ideographs
+                || (ch >= 0xFE30 && ch <= 0xFE4F)  // CJK compat forms
+                || (ch >= 0xFF00 && ch <= 0xFF60); // fullwidth forms
     }
 
     /**

@@ -100,13 +100,16 @@ public class LineAnnotation extends MarkupAnnotation {
      * @return the start point, or null if not set
      */
     public Point getStarting() {
-        if (starting != null) return starting;
+        // The /L array in the dictionary is authoritative: it may have been
+        // rewritten externally (e.g. PdfFileEditor.resizeContents transforms the
+        // endpoints), so prefer it over any cached Point. Fall back to the cached
+        // value only when /L is not present yet.
         double[] coords = getLine();
-        if (coords != null) {
+        if (coords != null && coords.length >= 4) {
             starting = new Point(coords[0], coords[1]);
             return starting;
         }
-        return null;
+        return starting;
     }
 
     /**
@@ -125,13 +128,12 @@ public class LineAnnotation extends MarkupAnnotation {
      * @return the end point, or null if not set
      */
     public Point getEnding() {
-        if (ending != null) return ending;
         double[] coords = getLine();
-        if (coords != null) {
+        if (coords != null && coords.length >= 4) {
             ending = new Point(coords[2], coords[3]);
             return ending;
         }
-        return null;
+        return ending;
     }
 
     /**

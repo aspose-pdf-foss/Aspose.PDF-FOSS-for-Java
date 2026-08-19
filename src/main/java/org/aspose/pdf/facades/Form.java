@@ -14,6 +14,8 @@ import org.aspose.pdf.forms.CheckboxField;
 import org.aspose.pdf.forms.ComboBoxField;
 import org.aspose.pdf.forms.Field;
 import org.aspose.pdf.forms.ListBoxField;
+import org.aspose.pdf.forms.Option;
+import org.aspose.pdf.forms.OptionCollection;
 import org.aspose.pdf.forms.RadioButtonField;
 import org.aspose.pdf.forms.SignatureField;
 import org.aspose.pdf.forms.TextBoxField;
@@ -170,11 +172,16 @@ public class Form implements AutoCloseable {
             if (fields == null) {
                 return new String[0];
             }
-            String[] names = new String[fields.length];
-            for (int i = 0; i < fields.length; i++) {
-                names[i] = fields[i].getFullName();
+            // Aspose omits fields without a usable name (a widget with no /T
+            // yields an empty full name — PDFNEWNET-34179 counts 81, not 82).
+            java.util.List<String> names = new java.util.ArrayList<>(fields.length);
+            for (Field field : fields) {
+                String name = field.getFullName();
+                if (name != null && !name.isEmpty()) {
+                    names.add(name);
+                }
             }
-            return names;
+            return names.toArray(new String[0]);
         } catch (Exception e) {
             LOG.log(Level.WARNING, "Failed to get field names", e);
             return new String[0];
@@ -199,6 +206,19 @@ public class Form implements AutoCloseable {
                 LOG.warning("Field not found: " + fieldName);
                 return false;
             }
+            // Aspose semantics: a non-editable choice field rejects a value that is
+            // not one of its options — FillField returns false and the field keeps
+            // its old value (PDFNEWNET_34300).
+            if (field instanceof ComboBoxField && !((ComboBoxField) field).isEditable()
+                    && !isChoiceOption(((ComboBoxField) field).getOptions(), value)) {
+                LOG.fine("Rejected non-option value '" + value + "' for combo box '" + fieldName + "'");
+                return false;
+            }
+            if (field instanceof ListBoxField
+                    && !isChoiceOption(((ListBoxField) field).getOptions(), value)) {
+                LOG.fine("Rejected non-option value '" + value + "' for list box '" + fieldName + "'");
+                return false;
+            }
             field.setValue(value);
             LOG.fine("Set field '" + fieldName + "' to '" + value + "'");
             return true;
@@ -206,6 +226,19 @@ public class Form implements AutoCloseable {
             LOG.log(Level.WARNING, "Failed to fill field: " + fieldName, e);
             return false;
         }
+    }
+
+    /** Returns whether {@code value} matches an option's export value or display name. */
+    private static boolean isChoiceOption(OptionCollection options, String value) {
+        if (options == null || value == null) {
+            return false;
+        }
+        for (Option option : options) {
+            if (value.equals(option.getValue()) || value.equals(option.getDisplayName())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

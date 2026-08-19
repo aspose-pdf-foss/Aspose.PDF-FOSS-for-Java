@@ -18,6 +18,21 @@ public class ImageStamp extends Stamp {
 
     private String file;
     private InputStream imageStream;
+    // Bytes read from the stream/file on first application, cached so the same
+    // stamp can be applied to MULTIPLE pages: an InputStream is single-pass, so
+    // without this the second page-> addStamp() would see an exhausted stream and
+    // fail with "must carry image data" (PDFNET Verify_Zoom2).
+    private byte[] cachedBytes;
+
+    /** Returns the previously read image bytes, or {@code null} if not yet read. */
+    byte[] getCachedBytes() {
+        return cachedBytes;
+    }
+
+    /** Caches the image bytes read on first application (engine-internal). */
+    void setCachedBytes(byte[] bytes) {
+        this.cachedBytes = bytes;
+    }
 
     /**
      * Creates a new ImageStamp from a file path.

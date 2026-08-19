@@ -461,6 +461,13 @@ public class Artifact {
             this.subtype = ArtifactSubtype.None;
         }
 
+        // Parse /Contents — the artifact's text as authored by the producer
+        // (e.g. header/footer text; ISO 32000-1:2008 marked-content property).
+        PdfBase contentsVal = props.get("Contents");
+        if (contentsVal instanceof PdfString) {
+            this.text = ((PdfString) contentsVal).getString();
+        }
+
         // Parse /BBox
         PdfBase bboxVal = props.get("BBox");
         if (bboxVal instanceof PdfArray) {

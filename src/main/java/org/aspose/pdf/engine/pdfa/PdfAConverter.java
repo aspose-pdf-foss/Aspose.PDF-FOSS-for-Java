@@ -11,6 +11,7 @@ import org.aspose.pdf.engine.pdfa.fixes.FormFixes;
 import org.aspose.pdf.engine.pdfa.fixes.GraphicsFixes;
 import org.aspose.pdf.engine.pdfa.fixes.MetadataFixes;
 import org.aspose.pdf.engine.pdfa.fixes.PdfXFixes;
+import org.aspose.pdf.engine.pdfa.fixes.StructureFixes;
 import org.aspose.pdf.engine.pdfa.fixes.TransparencyFixes;
 import org.aspose.pdf.engine.parser.PDFParser;
 
@@ -113,13 +114,22 @@ public final class PdfAConverter {
             gf.fixInterpolate(parser, format, errorAction, result);
         });
 
-        // 4. Font fixes
+        // 4. Font fixes (embedding first so the ToUnicode pass sees the WinAnsi
+        // encoding the embed pass establishes for retyped fonts)
         applyFix("FontFixes", () -> {
             FontFixes ff = new FontFixes();
+            ff.embedUnembeddedFonts(parser, format, errorAction, result);
+            ff.fixCidToGidMap(parser, format, errorAction, result);
             ff.generateToUnicodeCMap(parser, format, errorAction, result);
             ff.generateCharSet(parser, format, errorAction, result);
             ff.generateCIDSet(parser, format, errorAction, result);
             ff.logUnembeddedFonts(parser, format, errorAction, result);
+        });
+
+        // 4b. Level A logical-structure requirements (MarkInfo/StructTreeRoot/Lang)
+        applyFix("StructureFixes", () -> {
+            StructureFixes sf = new StructureFixes();
+            sf.ensureLevelAStructure(parser, format, errorAction, result);
         });
 
         // 5. Transparency fixes (PDF/A-1 forbids transparency; PDF/A-2+ allows it)
