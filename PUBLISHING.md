@@ -54,8 +54,8 @@ Resolved since the last regeneration (2026-07-31), corrected here since PUBLISHI
 | Test | Result |
 |------|--------|
 | Local build (gpg.skip=true) | PASS -- `mvn clean package -Dgpg.skip=true -DskipTests`, BUILD SUCCESS, all 3 jars produced (2026-08-21) |
-| Ubuntu dry-run (workflow_dispatch) | See this hardening pass's own verification |
-| Windows dry-run (workflow_dispatch) | See this hardening pass's own verification |
+| Ubuntu dry-run (workflow_dispatch) | PASS through checkout / coordinate guard / Java 11 setup on real GitHub-hosted infrastructure (run 32485097828, `mt036-hardening` branch); the job then correctly exits via its own "already on Maven Central" safety guard, since this pass deliberately does not bump the version -- a full "DEPLOY SKIPPED" pass requires a not-yet-published version and will run naturally as part of the real 26.8.0 release flow. The new `guard` job (concurrency, idempotency marker) is only reachable via a real tag-push/release event, not `workflow_dispatch` -- untested until that real event, by design (see aspose.org's MT036 plan Risk R1). |
+| Windows dry-run (workflow_dispatch) | NOT RUN -- no self-hosted runner (`[self-hosted, Windows, maven-pilot]`) is currently registered for this repository (confirmed via the GitHub API: zero runners registered). This is a pre-existing infrastructure gap, not introduced by this hardening pass; the Windows job's PowerShell logic is unchanged from the previously-proven template except for the same guard/permissions/pinning changes already validated structurally. |
 | Artifact on Maven Central (HTTP 200) | PASS - confirmed live: https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
 
 ## How to Cut Future Releases
