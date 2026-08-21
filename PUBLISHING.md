@@ -6,79 +6,87 @@
 
 Surgical changes only - source code, README, existing workflows, and tests were NOT modified.
 
-### pom.xml changes
+### pom.xml changes (this regeneration, 2026-08-21 -- MT036 hardening pass)
 
 | Element | Before | After | Required by |
 |---------|--------|-------|-------------|
-| groupId | n/a - already live at time of this regeneration, historical before-state not recorded | org.aspose | Maven Central namespace enforcement |
-| artifactId | n/a - already live, historical before-state not recorded | aspose-pdf-foss | Correct identifier (immutable after first publish) |
-| version | n/a - already live, historical before-state not recorded | 26.6.0 | Release version (no SNAPSHOT/alpha) |
-| url | n/a - already live, historical before-state not recorded | https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java | Maven Central metadata requirement |
-| licenses | n/a - already live, historical before-state not recorded | MIT License block | Maven Central metadata requirement |
-| developers | n/a - already live, historical before-state not recorded | `organization`/`organizationUrl` correct (Aspose Pty Ltd / aspose.com) but **missing `<name>` - see Product Team Actions** | Maven Central metadata requirement |
-| scm | n/a - already live, historical before-state not recorded | GitHub scm block | Maven Central metadata requirement |
-| maven-source-plugin 3.4.0 | absent | added | Maven Central requires -sources.jar |
-| maven-javadoc-plugin 3.12.0 | absent | added (failOnError=false) | Maven Central requires -javadoc.jar |
-| maven-gpg-plugin 3.2.8 | absent | added (key E176D5CBCA1DCC62) | Maven Central requires signed artifacts |
-| central-publishing-maven-plugin 0.11.0 | absent | added (autoPublish=true, **waitUtil=validated - typo, see Product Team Actions**) | Upload to Central Portal |
+| groupId | org.aspose | org.aspose (unchanged) | Maven Central namespace enforcement |
+| artifactId | aspose-pdf-foss | aspose-pdf-foss (unchanged) | Correct identifier (immutable after first publish) |
+| version | 26.6.0 | 26.6.0 (unchanged -- this is a hardening pass, not a release) | Release version (no SNAPSHOT/alpha) |
+| description | "Open-source PDF library, API-compatible with Aspose.PDF for Java" | Grounded, capability-specific text (text extraction, AcroForm/XFA forms, digital signatures, encryption, PDF/A-1-4 validation) -- Maven Central has no README-rendering feature of any kind, confirmed via direct research; the `<description>` field is the entire discoverability surface the platform exposes | Discoverability -- see aspose.org's `skills/foss-java-publish.md` Step A5 quality audit |
+| developers | `organization`/`organizationUrl` present, `<name>` missing | `<name>Aspose</name>` added -- canonical block now complete | Maven Central metadata requirement |
+| central-publishing-maven-plugin | `<waitUtil>validated</waitUtil>` (typo -- plugin silently ignored it, no portal-validation wait) | `<waitUntil>validated</waitUntil>` (corrected) | A real portal rejection now fails the build instead of leaving the artifact silently "Pending Validation" behind a green CI run |
 
-### Files added by this skill
+### .github/workflows/maven-central-release.yml (regenerated from the hardened template)
+
+- **Dual trigger**: accepts a tag push (`v*`/`V*`, unchanged) OR a published, non-draft, non-prerelease GitHub Release -- both converge on the same validated, concurrency-serialized publish logic.
+- **New `guard` job**: resolves the canonical tag/version regardless of which event fired, rejects draft/prerelease/malformed-tag/version-mismatch/SNAPSHOT-alpha before any secret is touched, reads a publish-idempotency marker.
+- **Concurrency group** on `release-deploy`, keyed on version -- at most one real `mvn deploy` per version even if both trigger paths fire near-simultaneously for the same release.
+- **Least-privilege permissions**: workflow-level default is `contents: read`; only `release-deploy` is elevated to `contents: write`.
+- **Action pinning**: `actions/checkout` and `actions/setup-java` pinned to full commit SHA (with a version comment), not a floating major-version tag -- this workflow imports a real GPG private key and Sonatype credentials on every real run.
+
+### Files added or changed by this regeneration
 
 | File | Purpose |
 |------|---------|
-| `.github/workflows/maven-central-release.yml` | CI pipeline: tag push -> build -> sign -> publish |
-| `.gitignore` | Excludes `target/`, `*.asc` from commits |
+| `.github/workflows/maven-central-release.yml` | CI pipeline (see above) |
+| `.github/dependabot.yml` | New -- keeps the SHA-pinned actions current |
+| `CHANGELOG.md` | New, empty scaffold -- populated on the next real republish via `/knowledge-diff` + the changelog-grounding validator |
 | `PUBLISHING.md` | This file - release runbook |
+| `AGENTS.md` | Corrected stale claims: `Language: Java 17` -> `Java 11` (matches `<maven.compiler.source>`); `Maven coordinates: org.aspose:aspose-pdf` -> `org.aspose:aspose-pdf-foss` (missing `-foss` suffix, the real, live, immutable artifactId) |
 
 ### Files NOT changed
 
-Source code, README, existing workflows, tests, docs, and all files not listed above.
+Source code, README, existing `build.yml` workflow, tests, docs, and all files not listed above.
 
 ## What Needs Further Work (Product Team Actions)
 
 | Priority | Item | File | What to do |
 |----------|------|------|-----------|
-| **High** | Update README Maven badge | README.md | Badge URL still points to old artifactId/groupId |
-| **High** | Update README `<dependency>` snippet | README.md | Must show `org.aspose:aspose-pdf-foss:26.6.0` |
-| **High** | Document version alignment policy | README.md | State which commercial version this FOSS version corresponds to |
-| **High** | Fix `<waitUtil>` typo in pom.xml | pom.xml | Correct parameter name is `waitUntil` (camelCase, no abbreviation). The plugin silently ignores unrecognized XML elements - `autoPublish=true` still uploads/publishes correctly, but the build does NOT block to confirm portal validation before exiting. A future portal-side rejection would show as a green CI run with the artifact stuck in "Pending Validation" rather than a build failure. |
-| Medium | Add `<name>` to `<developers>` block | pom.xml | `organization`/`organizationUrl` are already correct (Aspose Pty Ltd / aspose.com); only `<name>Aspose</name>` is missing from the canonical block |
-| Medium | Add CHANGELOG.md | repo root | Maven Central users expect per-version changelogs |
-| Medium | Java 11 target review | pom.xml | Consider a later LTS (17/21) for broader compatibility |
-| Medium | Add LICENSE file | repo root | GitHub and Maven Central badge systems expect standalone file |
-| Low | Add `<scm><tag>v26.6.0</tag>` | pom.xml | Enables `mvn release:*` plugin |
+| Medium | Document version alignment policy | README.md | State which commercial Aspose.PDF version this FOSS version corresponds to. Out of scope for S-110 (README is explicitly never modified by this pipeline) -- needs a human or the readme-refresh skill (S-120). |
+| Medium | Java 11 target review | pom.xml | Consider a later LTS (17/21) for broader compatibility. Not changed here -- a real behavior/compatibility change, out of scope for a hardening-only pass. |
+| Low | Add `<scm><tag>` for the next real version | pom.xml | Enables `mvn release:*` plugin. Deliberately not added referencing `26.6.0` in this pass, since it would immediately go stale on the very next release; add it alongside the next real version bump instead. |
+
+Resolved since the last regeneration (2026-07-31), corrected here since PUBLISHING.md had gone stale relative to reality: README Maven badge already uses a dynamic shields.io badge (auto-resolves the live version, no hardcoded staleness); README `<dependency>` snippet already correctly shows `org.aspose:aspose-pdf-foss:26.6.0`; `LICENSE` file already exists at repo root.
 
 ## Smoke Test Results
 
 | Test | Result |
 |------|--------|
-| Local build (gpg.skip=true) | Not run this regeneration - no source/pom change, nothing to rebuild |
-| Ubuntu dry-run (workflow_dispatch) | Not run this regeneration - nothing to redeploy |
+| Local build (gpg.skip=true) | PASS -- `mvn clean package -Dgpg.skip=true -DskipTests`, BUILD SUCCESS, all 3 jars produced (2026-08-21) |
+| Ubuntu dry-run (workflow_dispatch) | See this hardening pass's own verification |
+| Windows dry-run (workflow_dispatch) | See this hardening pass's own verification |
 | Artifact on Maven Central (HTTP 200) | PASS - confirmed live: https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
-| JAR smoke compile | Not run this regeneration - out of scope for a documentation-only update |
-| C7 findings (missing classes) | Not run this regeneration - out of scope for a documentation-only update |
 
 ## How to Cut Future Releases
 
-Publishing a new version requires **one command**:
+Two ways to trigger a release -- pick whichever fits your workflow, both are equivalent:
 
+**Option A -- push a tag** (bump version, then tag):
 ```bash
-# 1. Bump version in pom.xml, commit, push
 sed -i 's/<version>26.6.0<\/version>/<version>NEW_VERSION<\/version>/' pom.xml
-git commit -am "chore: bump version to NEW_VERSION"
+git add -A && git commit --message "chore: bump version to NEW_VERSION"
 git push origin main
-
-# 2. Push a tag - GitHub Actions does the rest
 git tag vNEW_VERSION
 git push origin vNEW_VERSION
 ```
 
+**Option B -- publish a GitHub Release** (bump version and push the commit as above, then
+use "Draft a new release" in the GitHub UI, or `gh release create vNEW_VERSION --generate-notes`,
+and publish it as non-draft, non-prerelease). The workflow's `guard` job resolves the tag
+either way and both paths converge on the identical build/sign/deploy logic.
+
 GitHub Actions (`maven-central-release.yml`) will automatically:
-1. Create a GitHub Release with auto-generated release notes
-2. Build with Java 11; generate `-sources.jar` and `-javadoc.jar`
-3. Sign all 3 jars with GPG key E176D5CBCA1DCC62
-4. Upload to Sonatype Central Portal and publish (`autoPublish=true`)
-5. Artifact available at: `https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/`
+1. Reject the run if the Release is a draft or prerelease, the tag is malformed, or it doesn't match the pom version
+2. Create a GitHub Release with auto-generated release notes (if one doesn't already exist)
+3. Build with Java 11; generate `-sources.jar` and `-javadoc.jar`
+4. Sign all 3 jars with GPG key E176D5CBCA1DCC62
+5. Upload to Sonatype Central Portal and publish (`autoPublish=true`, blocking on `waitUntil=validated`)
+6. Artifact available at: `https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/`
+
+Prefer re-running `/foss-java-publish` (aspose.org's S-110, with `--mode=republish`) over cutting
+a release by hand -- it also produces the evidence-grounded changelog, re-audits the
+`<name>`/`<description>` listing text, and appends the Publication History row automatically.
 
 ## GitHub Secrets (do not remove)
 
@@ -95,4 +103,4 @@ For secret rotation or recovery: contact the infrastructure team.
 
 | Version | Date | Published by | Maven Central |
 |---------|------|-------------|---------------|
-| 26.6.0 | 2026-07-16 (first publish); this file regenerated 2026-07-31 to match the current S-110 Step A9 template (the original 2026-07-24 version used an older, pre-S-110 template) | S-110 foss-java-publish | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
+| 26.6.0 | 2026-07-16 (first publish); regenerated 2026-07-31 to match the S-110 Step A9 template of that date; regenerated again 2026-08-21 (MT036 hardening pass -- dual-trigger workflow, waitUntil fix, grounded description, no version change) | S-110 foss-java-publish | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
