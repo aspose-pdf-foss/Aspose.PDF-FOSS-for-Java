@@ -428,7 +428,23 @@ jobs:
         if: needs.guard.outputs.already_published != 'true'
         run: |
           TAG="${{ needs.guard.outputs.tag }}"
-          MARKER="$(mktemp)"
+          # `gh release upload FILE#LABEL` sets a display LABEL, not the actual
+          # asset filename -- the asset name is always the local file's own
+          # basename. The prior version of this step used `mktemp` (a random
+          # basename) with a `#maven-central-published.marker` label suffix,
+          # which uploaded successfully but under the WRONG asset name -- the
+          # guard job's `Check publish idempotency marker` step (which greps
+          # for the literal name `maven-central-published.marker`) could never
+          # find it. Confirmed live 2026-08-21 (26.8.0 release): a redundant
+          # second trigger for the same version correctly reached this point
+          # undetected and re-attempted `mvn deploy`, which failed only because
+          # Sonatype Central Portal's own server-side duplicate-coordinate
+          # rejection caught it -- a real safety net, but not the graceful,
+          # silent no-op this marker was designed to provide. Fix: create the
+          # marker file in a temp DIRECTORY with the exact desired basename, so
+          # no `#label` rename trick is needed.
+          MARKER_DIR="$(mktemp -d)"
+          MARKER="$MARKER_DIR/maven-central-published.marker"
           {
             echo "version=${{ needs.guard.outputs.version }}"
             echo "tag=$TAG"
@@ -436,7 +452,7 @@ jobs:
             echo "published_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > "$MARKER"
           for i in 1 2 3; do
-            gh release upload "$TAG" "$MARKER#maven-central-published.marker" \
+            gh release upload "$TAG" "$MARKER" \
               --repo "${{ github.repository }}" --clobber && break
             echo "gh release upload attempt $i failed, retrying..."; sleep 5
           done
