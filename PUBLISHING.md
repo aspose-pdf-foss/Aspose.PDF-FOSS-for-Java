@@ -6,7 +6,24 @@
 
 Surgical changes only - source code, README, existing workflows, and tests were NOT modified.
 
-### pom.xml changes (this regeneration, 2026-08-21 -- MT036 hardening pass)
+### Version bump: 26.6.0 -> 26.8.0 (2026-08-21, real republication)
+
+`--mode=republish` (MT036-2026-08-21-PDF-JAVA-MAVEN-PUBLISH-HARDENING, Track C). Real
+`/knowledge-diff` + `/knowledge-update` executed against the confirmed new upstream
+commit ("Version 26.8: PDF to HTML conversion, fixed work with graphics, fonts") --
+HIGH impact per S-12 (943 source files changed). Evidence-grounded changelog built
+from `semantic_diff.py`'s typed change objects and validated by
+`changelog_grounding.py` before being written to `CHANGELOG.md`: 122 new public
+classes (a new Structured Document Model subsystem for PDF<->HTML/DOCX round-trip
+conversion), 65 modified classes (no breaking-change types detected by the
+available tooling), 2 removed capability claims (not API classes). Full detail:
+`CHANGELOG.md`'s `## 26.8.0` entry in this repo.
+
+Only `pom.xml`'s `<version>` element changed as part of this bump -- groupId,
+artifactId, and all other pom.xml elements are unchanged from the 2026-08-21
+hardening pass above.
+
+### pom.xml changes (2026-08-21 hardening pass, MT036 Track B)
 
 | Element | Before | After | Required by |
 |---------|--------|-------|-------------|
