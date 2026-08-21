@@ -6,7 +6,7 @@
     <version>26.6.0</version>
     <packaging>jar</packaging>
     <name>Aspose.PDF FOSS</name>
-    <description>Open-source PDF library, API-compatible with Aspose.PDF for Java</description>
+    <description>Open-source, pure-Java PDF library for creating, editing, and converting PDF documents — text extraction, AcroForm/XFA forms, digital signatures, encryption, and PDF/A-1-4 validation, with zero third-party dependencies.</description>
     <url>https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java</url>
     <licenses>
         <license>
@@ -18,6 +18,7 @@
 
     <developers>
         <developer>
+            <name>Aspose</name>
             <organization>Aspose Pty Ltd</organization>
             <organizationUrl>https://www.aspose.com/</organizationUrl>
         </developer>
@@ -122,7 +123,7 @@
                 <configuration>
                     <publishingServerId>central</publishingServerId>
                     <autoPublish>true</autoPublish>
-                    <waitUtil>validated</waitUtil>
+                    <waitUntil>validated</waitUntil>
                 </configuration>
             </plugin>
         </plugins>

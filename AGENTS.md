@@ -4,11 +4,11 @@ Instructions for AI coding agents (Claude Code, Cursor, Aider, etc.) working on 
 
 ## Project at a glance
 
-- **Language**: Java 17
+- **Language**: Java 11
 - **Build**: Maven 3
 - **Module layout**: single-module on GitHub (root `pom.xml` builds the library)
 - **Java package root**: `org.aspose.pdf`
-- **Maven coordinates**: `org.aspose:aspose-pdf`
+- **Maven coordinates**: `org.aspose:aspose-pdf-foss`
 - **License**: MIT
 - **Test framework**: JUnit 5 (Jupiter)
 - **Third-party dependencies**: **none**, by design
