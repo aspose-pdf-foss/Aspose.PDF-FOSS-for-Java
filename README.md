@@ -142,6 +142,11 @@ mvn clean install
 
 No required third-party package dependencies.
 
+### Native and System Requirements
+
+- Java 11 or later (`maven.compiler.source`/`maven.compiler.target` are both pinned to `11` in
+  `pom.xml`).
+
 ### Development Dependencies
 
 - `org.junit.jupiter:junit-jupiter` 5.10.2 — test runner used by the Maven `test` phase; not
@@ -1591,7 +1596,8 @@ public API surface spans 1026 public types across the module-grouped tables belo
 - **[Full API reference](https://reference.aspose.org/pdf/java/)** — the complete, browsable reference for the public API surface (the [API reference](#api-reference) section above covers the essentials).
 - **[Contributor guide](AGENTS.md)** — architecture notes and conventions for contributors, including guidance for AI coding assistants.
 - **[Publishing guide](PUBLISHING.md)** — the maintainers' release process for publishing this package to Maven Central.
-- **In-repo topic guides**: [Getting Started](docs/getting-started.md), [Text Extraction](docs/text-extraction.md), [Annotations](docs/annotations.md), [Forms](docs/forms.md), [Metadata](docs/metadata.md), [PDF/A](docs/pdfa.md), [Rasterization](docs/rasterization.md), [Security](docs/security.md), and [Limitations and Out-of-Scope Features](docs/limitations.md).
+- **[Changelog](CHANGELOG.md)** — release history and notable changes.
+- **In-repo topic guides**: [Getting Started](docs/getting-started.md), [Text Extraction](docs/text-extraction.md), [Annotations](docs/annotations.md), [Attachments](docs/attachments.md), [Forms](docs/forms.md), [XFA Forms](docs/xfa.md), [Metadata](docs/metadata.md), [PDF/A](docs/pdfa.md), [Document Conversion](docs/conversion.md), [Generating PDFs from Scratch](docs/document-generation.md), [Drawing API](docs/drawing.md), [Facades API](docs/facades.md), [Navigation (Bookmarks, Destinations, Links)](docs/navigation.md), [Page Operations](docs/page-operations.md), [Rasterization](docs/rasterization.md), [Resource Optimization](docs/optimization.md), [Digital Signatures](docs/signatures.md), [Security](docs/security.md), and [Limitations and Out-of-Scope Features](docs/limitations.md).
 - Found a bug or have a feature request? [Open an issue](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/issues) on GitHub.
 
 ## Scope and Limitations
@@ -1605,8 +1611,7 @@ Out of scope (not planned for this edition):
   PostScript, EPS, and SVG as input are not supported.
 - **Full XFA form rendering** — XFA data is exposed and can be flattened to AcroForm, but the
   dynamic XFA layout/rendering layer itself is not reproduced.
-- **3D annotations and PRC/U3D streams**, and **PDF/X** (the print-production family; PDF/A is
-  supported) are out of scope.
+- **3D annotations and PRC/U3D streams** are out of scope.
 
 Partially implemented today:
 
@@ -1618,6 +1623,10 @@ Partially implemented today:
   downsampling profiles, font merging across resources) are limited.
 - **Tagged PDF / logical structure** — readable, and programmatic construction of structure trees
   is supported, but coverage for building fully well-formed structure trees is partial.
+- **PDF/X validation and conversion** — `PdfFormat.PDF_X_1A`, `PDF_X_1A_2001`, and `PDF_X_3` are
+  supported through the same `Document.validate`/`Document.convert` API used for PDF/A (ISO
+  15930-1/-3 checks: info dictionary, output intents, the `/Trapped` key, embedded fonts), but
+  this path has no dedicated test coverage yet.
 - **Public-key-encrypted PDFs** are supported through the `ICustomSecurityHandler` interface, but
   no out-of-the-box helper for the common cases is provided yet.
 
