@@ -488,7 +488,7 @@ jobs:
 
       - name: Open or update incident issue on stuck publish
         if: failure() && steps.verify.outcome == 'failure'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const version = '${{ needs.guard.outputs.version }}';
