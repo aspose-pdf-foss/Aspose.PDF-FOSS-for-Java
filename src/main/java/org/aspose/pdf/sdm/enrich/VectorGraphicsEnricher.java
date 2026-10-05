@@ -464,6 +464,15 @@ public final class VectorGraphicsEnricher {
                                           List<PgmRect> out) {
         for (SdmBlock b : blocks) {
             if (b instanceof Table) {
+                // Prefer the geometry the heuristic builder recorded (the
+                // synthesized cells' run ids often do not resolve in the PGM, so
+                // accumulateTableBounds alone yields nothing and the ruled area
+                // would be rasterized on top of the structural <table>).
+                PgmRect stored = storedTableRect((Table) b, page0);
+                if (stored != null) {
+                    out.add(stored);
+                    continue;
+                }
                 double[] acc = {Double.MAX_VALUE, Double.MAX_VALUE, -Double.MAX_VALUE, -Double.MAX_VALUE};
                 accumulateTableBounds((Table) b, pgm, page0, acc);
                 if (acc[2] > acc[0] && acc[3] > acc[1]) {
@@ -477,6 +486,26 @@ public final class VectorGraphicsEnricher {
                 collectTableRects(((Footnote) b).getChildren(), pgm, page0, out);
             }
         }
+    }
+
+    /**
+     * The table rectangle recorded by the heuristic builder for this page, or null.
+     * Inflated by a small margin: the recorded bounds come from the cell content
+     * rectangles, which sit just inside the ruled border lines — without the margin
+     * those outermost rules fall outside the rect and get rasterized as a thin
+     * strip figure over the structural table's own borders.
+     */
+    private static PgmRect storedTableRect(Table t, int page0) {
+        Object bounds = t.getAttributes().get("table-bounds");
+        Object pg = t.getAttributes().get("table-page");
+        if (bounds instanceof double[] && pg instanceof Integer && (Integer) pg == page0) {
+            double[] r = (double[]) bounds;
+            if (r.length == 4 && r[2] > r[0] && r[3] > r[1]) {
+                double m = 4.0;
+                return PgmRect.fromCorners(r[0] - m, r[1] - m, r[2] + m, r[3] + m);
+            }
+        }
+        return null;
     }
 
     private static void accumulateTableBounds(Table t, PgmModel pgm, int page0, double[] acc) {

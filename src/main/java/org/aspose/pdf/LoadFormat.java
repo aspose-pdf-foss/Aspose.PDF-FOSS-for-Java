@@ -10,5 +10,9 @@ public enum LoadFormat {
     /** HTML — converted to PDF on load. */
     HTML,
     /** Office Open XML word-processing ({@code .docx}) — converted to PDF on load. */
-    DocX
+    DocX,
+    /** Office Open XML spreadsheet ({@code .xlsx}) — converted to PDF on load. */
+    Xlsx,
+    /** Markdown ({@code .md}) — converted to PDF on load. */
+    Markdown
 }

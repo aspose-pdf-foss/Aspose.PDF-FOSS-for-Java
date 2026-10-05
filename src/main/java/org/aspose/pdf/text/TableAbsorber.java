@@ -677,16 +677,54 @@ public class TableAbsorber {
             vLevels.sort(Comparator.naturalOrder());   // left → right
         }
 
+        // Classify the actual painted rule segments (in pageRotation space) into
+        // vertical and horizontal, so a MERGED cell — a grid rectangle whose
+        // internal dividing rule was never drawn — can be detected and emitted as
+        // one spanning cell instead of being split into empty sub-cells.
+        List<double[]> vSegs = new ArrayList<>(); // {x, yLo, yHi}
+        List<double[]> hSegs = new ArrayList<>(); // {y, xLo, xHi}
+        for (double[] raw : cluster) {
+            double[] p0 = pageRotation.transformPoint(raw[0], raw[1]);
+            double[] p1 = pageRotation.transformPoint(raw[2], raw[3]);
+            if (Math.abs(p0[1] - p1[1]) <= AXIS_DRIFT) {
+                hSegs.add(new double[]{(p0[1] + p1[1]) / 2, Math.min(p0[0], p1[0]), Math.max(p0[0], p1[0])});
+            } else if (Math.abs(p0[0] - p1[0]) <= AXIS_DRIFT) {
+                vSegs.add(new double[]{(p0[0] + p1[0]) / 2, Math.min(p0[1], p1[1]), Math.max(p0[1], p1[1])});
+            }
+        }
+
+        int nR = hLevels.size() - 1;
+        int nC = vLevels.size() - 1;
+        boolean[][] occupied = new boolean[nR][nC];
         AbsorbedTable table = new AbsorbedTable();
-        for (int r = 0; r + 1 < hLevels.size(); r++) {
-            // Levels may be sorted either way (see reading-order flip above);
-            // derive geometric top/bottom so the cell rectangle stays valid.
-            double top = Math.max(hLevels.get(r), hLevels.get(r + 1));
-            double bottom = Math.min(hLevels.get(r), hLevels.get(r + 1));
+        for (int r = 0; r < nR; r++) {
             AbsorbedRow row = new AbsorbedRow();
-            for (int c = 0; c + 1 < vLevels.size(); c++) {
-                double left = Math.min(vLevels.get(c), vLevels.get(c + 1));
-                double right = Math.max(vLevels.get(c), vLevels.get(c + 1));
+            for (int c = 0; c < nC; c++) {
+                if (occupied[r][c]) {
+                    continue; // part of a merged cell anchored above/left
+                }
+                double cellTop = Math.max(hLevels.get(r), hLevels.get(r + 1));
+                double cellBottom = Math.min(hLevels.get(r), hLevels.get(r + 1));
+                double cellLeft = Math.min(vLevels.get(c), vLevels.get(c + 1));
+                double cellRight = Math.max(vLevels.get(c), vLevels.get(c + 1));
+                // colSpan: extend right while the internal vertical boundary was
+                // NOT drawn across this row band (a merged header cell).
+                int colSpan = 1;
+                while (c + colSpan < nC
+                        && !hasRule(vSegs, vLevels.get(c + colSpan), cellBottom, cellTop)) {
+                    colSpan++;
+                }
+                // rowSpan: extend down while the internal horizontal boundary was
+                // NOT drawn across this column band (a merged category cell).
+                int rowSpan = 1;
+                while (r + rowSpan < nR
+                        && !hasRule(hSegs, hLevels.get(r + rowSpan), cellLeft, cellRight)) {
+                    rowSpan++;
+                }
+                double left = Math.min(vLevels.get(c), vLevels.get(c + colSpan));
+                double right = Math.max(vLevels.get(c), vLevels.get(c + colSpan));
+                double top = Math.max(hLevels.get(r), hLevels.get(r + rowSpan));
+                double bottom = Math.min(hLevels.get(r), hLevels.get(r + rowSpan));
                 AbsorbedCell cell = new AbsorbedCell();
                 cell.setRectangle(new Rectangle(left, bottom, right, top));
                 for (TextFragment f : fragments) {
@@ -698,6 +736,11 @@ public class TableAbsorber {
                     }
                 }
                 row.addCell(cell);
+                for (int rr = r; rr < r + rowSpan; rr++) {
+                    for (int cc = c; cc < c + colSpan; cc++) {
+                        occupied[rr][cc] = true;
+                    }
+                }
             }
             table.addRow(row);
         }
@@ -707,6 +750,29 @@ public class TableAbsorber {
         double tblMaxY = Math.max(hLevels.get(0), hLevels.get(hLevels.size() - 1));
         table.setRectangle(new Rectangle(tblMinX, tblMinY, tblMaxX, tblMaxY));
         return table;
+    }
+
+    /**
+     * True when a painted rule segment lies at coordinate {@code level} (within
+     * {@link #RULE_TOLERANCE}) and covers at least half of the band
+     * {@code [lo, hi]}. Each segment is {@code {level, bandLo, bandHi}}. Used to
+     * tell a real cell boundary from a merged cell's missing internal rule.
+     */
+    private static boolean hasRule(List<double[]> segs, double level, double lo, double hi) {
+        double band = hi - lo;
+        if (band <= 0) {
+            return true; // degenerate band — treat as bounded
+        }
+        for (double[] s : segs) {
+            if (Math.abs(s[0] - level) > RULE_TOLERANCE) {
+                continue;
+            }
+            double overlap = Math.min(s[2], hi) - Math.max(s[1], lo);
+            if (overlap >= 0.5 * band) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Merges {@code value} into the level list within {@link #LEVEL_MERGE}. */

@@ -32,6 +32,7 @@ import org.aspose.pdf.sdm.Figure;
 import org.aspose.pdf.sdm.SdmBlock;
 import org.aspose.pdf.sdm.ObjectRef;
 import org.aspose.pdf.sdm.Opaque;
+import org.aspose.pdf.sdm.BlockStyle;
 import org.aspose.pdf.sdm.Paragraph;
 import org.aspose.pdf.sdm.Resource;
 import org.aspose.pdf.sdm.ResourceRef;
@@ -262,13 +263,71 @@ public final class PdfSdmReader {
         java.util.Set<PdfObjectKey> pageStreamKeys = pageContentStreamKeys(page);
 
         PageMarkup markup = markups.get(markups.size() - 1);
+        // The page's overall text column (leftmost/rightmost painted glyph x)
+        // approximates the content box, so a paragraph's alignment can be read
+        // from where it sits inside it (centred title vs left body). Computed
+        // once per page and passed down; only fragments with a real width count.
+        double pMinX = Double.MAX_VALUE;
+        double pMaxX = -Double.MAX_VALUE;
+        for (MarkupSection section : markup.getSections()) {
+            for (MarkupParagraph mp : section.getParagraphs()) {
+                for (TextFragment f : mp.getFragments()) {
+                    Rectangle fr = f.getRectangle();
+                    if (fr == null || fr.getURX() - fr.getLLX() <= 0.5) {
+                        continue;
+                    }
+                    pMinX = Math.min(pMinX, fr.getLLX());
+                    pMaxX = Math.max(pMaxX, fr.getURX());
+                }
+            }
+        }
         int readingIndex = 0;
         for (MarkupSection section : markup.getSections()) {
             for (MarkupParagraph mp : section.getParagraphs()) {
                 readingIndex = projectParagraph(mp, pageIndex, pageObjNum, pageStreamKeys,
-                        ns, sdm, entries, readingIndex);
+                        ns, sdm, entries, readingIndex, pMinX, pMaxX);
             }
         }
+    }
+
+    /**
+     * Infers a paragraph's alignment from where its (single-line) box sits inside
+     * the page text column [{@code pMinX}, {@code pMaxX}]. Returns {@code null}
+     * (keep default LEFT) unless the paragraph is a short single line clearly
+     * centred or hugging the right edge — the PDF->SDM structural pipeline
+     * otherwise loses every heading's alignment (a centred title reflows to the
+     * left in the exported DOCX/HTML). Deliberately conservative: full-width and
+     * multi-line paragraphs stay LEFT so column body text is never disturbed.
+     */
+    private static BlockStyle.Align inferAlign(double minX, double maxX,
+                                               double minY, double maxY,
+                                               double pMinX, double pMaxX,
+                                               double maxFontSize) {
+        double textW = pMaxX - pMinX;
+        if (textW < 80) {
+            return null; // too little text on the page to judge a column
+        }
+        double w = maxX - minX;
+        if (w <= 0 || w >= textW * 0.85) {
+            return null; // ~full width -> left/justify
+        }
+        // Only judge a single visual line: a wrapped multi-line block that is
+        // narrower than the column is a normal left paragraph, not a heading.
+        if (maxY - minY > Math.max(1.0, maxFontSize) * 1.6) {
+            return null;
+        }
+        double leftGap = minX - pMinX;
+        double rightGap = pMaxX - maxX;
+        double tol = Math.max(textW * 0.05, 6);
+        if (leftGap > textW * 0.12 && rightGap > textW * 0.12
+                && Math.abs(leftGap - rightGap) <= tol) {
+            return BlockStyle.Align.CENTER;
+        }
+        // Right-aligned: right edge on the column edge, pushed well past centre.
+        if (rightGap <= tol && leftGap >= textW * 0.45) {
+            return BlockStyle.Align.RIGHT;
+        }
+        return null;
     }
 
     /** Object keys of the page's own content stream(s) (/Contents scalar or array). */
@@ -321,12 +380,24 @@ public final class PdfSdmReader {
     private int projectParagraph(MarkupParagraph mp, int pageIndex, int pageObjNum,
                                  java.util.Set<PdfObjectKey> pageStreamKeys,
                                  UUID ns, SdmDocument sdm, List<Entry> entries,
-                                 int readingIndex) {
+                                 int readingIndex, double pMinX, double pMaxX) {
         List<TextFragment> frags = new ArrayList<>();
         for (TextFragment f : mp.getFragments()) {
-            if (f.getRectangle() != null) {
-                frags.add(f);
+            Rectangle fr = f.getRectangle();
+            if (fr == null) {
+                continue;
             }
+            // Drop fragments with a collapsed (zero-width) rectangle: they have no
+            // resolved on-page X position, so the renderer culls them and they never
+            // appear in the page image. Some PDFs carry such ghost fragments — e.g.
+            // p2.pdf holds a 61pt "Get more out of wrox.com" at x=0..0 that is
+            // invisible in the render — and surfacing them into the reflow pollutes
+            // the flow with huge phantom text, exploding the page count. Keeping the
+            // SDM in step with what is actually painted also keeps HTML honest.
+            if (fr.getURX() - fr.getLLX() <= 0.5) {
+                continue;
+            }
+            frags.add(f);
         }
         if (frags.isEmpty()) {
             return readingIndex;
@@ -370,6 +441,11 @@ public final class PdfSdmReader {
         sdm.getChildren().add(para);
 
         int n = frags.size();
+        double aMinX = Double.MAX_VALUE;
+        double aMaxX = -Double.MAX_VALUE;
+        double aMinY = Double.MAX_VALUE;
+        double aMaxY = -Double.MAX_VALUE;
+        double aMaxFont = 0;
         for (int i = 0; i < n; i++) {
             TextFragment f = frags.get(i);
             Run run = new Run(f.getText(), toTextStyle(f));
@@ -377,6 +453,11 @@ public final class PdfSdmReader {
             para.getInline().add(run);
 
             Rectangle fr = f.getRectangle();
+            aMinX = Math.min(aMinX, fr.getLLX());
+            aMaxX = Math.max(aMaxX, fr.getURX());
+            aMinY = Math.min(aMinY, fr.getLLY());
+            aMaxY = Math.max(aMaxY, fr.getURY());
+            aMaxFont = Math.max(aMaxFont, fr.getURY() - fr.getLLY());
             PgmRect r = PgmRect.fromCorners(fr.getLLX(), fr.getLLY(), fr.getURX(), fr.getURY());
             boolean inPage = isPageStreamFragment(f, pageStreamKeys);
             int s = f.getSourceOperatorIndex();
@@ -403,6 +484,21 @@ public final class PdfSdmReader {
                     ts != null ? ts.getFontSize() : 0,
                     f.getText(), f.getRotation()));
             entries.add(new Entry(inPage && s >= 0 ? s : Integer.MAX_VALUE, box));
+        }
+        // Preserve a centred / right-aligned heading's alignment (the structural
+        // pipeline otherwise defaults every paragraph to left, so a centred title
+        // reflows to the left margin in the exported DOCX/HTML).
+        if (aMaxX > aMinX) {
+            BlockStyle.Align align = inferAlign(aMinX, aMaxX, aMinY, aMaxY,
+                    pMinX, pMaxX, aMaxFont);
+            if (align != null) {
+                BlockStyle bs = para.getStyle();
+                if (bs == null) {
+                    bs = new BlockStyle();
+                    para.setStyle(bs);
+                }
+                bs.setAlign(align);
+            }
         }
         return readingIndex;
     }

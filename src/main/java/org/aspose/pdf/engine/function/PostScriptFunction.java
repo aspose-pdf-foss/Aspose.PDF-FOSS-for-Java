@@ -214,6 +214,34 @@ public final class PostScriptFunction extends PdfFunction {
         }
     }
 
+    /**
+     * Evaluates a standalone PostScript calculator program against an optional
+     * seed stack and returns the FULL result stack, bottom element first.
+     *
+     * <p>Unlike {@link #evaluate(double[])} (which maps a function domain to its
+     * range and returns outputs top-first), this exposes the raw stack machine for
+     * the calculator API ({@code Evaluator.eval}). The outer {@code {...}} braces,
+     * if present, are stripped by {@link #compile(String)}.</p>
+     *
+     * @param program the program text (with or without outer braces)
+     * @param seed    values pre-pushed onto the stack (bottom first), or {@code null}
+     * @return the resulting stack, index 0 = bottom
+     */
+    static double[] evalToStack(String program, double[] seed) {
+        Token[] toks = compile(program);
+        int seedLen = seed == null ? 0 : seed.length;
+        int cap = Math.max(256, toks.length * 2 + seedLen + 16);
+        double[] stack = new double[cap];
+        int sp = 0;
+        if (seed != null) {
+            for (double s : seed) stack[sp++] = s;
+        }
+        sp = execute(toks, 0, toks.length, stack, sp);
+        double[] out = new double[sp];
+        System.arraycopy(stack, 0, out, 0, sp);
+        return out;
+    }
+
     @Override
     public double[] evaluate(double[] input) {
         // Primitive stack — no boxing in the hot loop.

@@ -72,6 +72,10 @@ public class TextExtractor {
     // foreground color (PDFNEWNET_48777). Null until the first color op.
     private Color currentFillColor;
     private final Deque<Color> fillColorStack = new ArrayDeque<>();
+    /** Fill colour space selected by `cs` — needed to interpret `sc`/`scn`. */
+    private org.aspose.pdf.engine.colorspace.ColorSpaceBase currentFillColorSpace;
+    private final Deque<org.aspose.pdf.engine.colorspace.ColorSpaceBase> fillCsStack =
+            new ArrayDeque<>();
 
     // Results
     private final List<TextFragment> fragments = new ArrayList<>();
@@ -370,6 +374,7 @@ public class TextExtractor {
             case "q":
                 ctmStack.push(ctm.clone());
                 fillColorStack.push(currentFillColor);
+                fillCsStack.push(currentFillColorSpace);
                 break;
             case "Q":
                 if (!ctmStack.isEmpty()) {
@@ -377,6 +382,9 @@ public class TextExtractor {
                 }
                 if (!fillColorStack.isEmpty()) {
                     currentFillColor = fillColorStack.pop();
+                }
+                if (!fillCsStack.isEmpty()) {
+                    currentFillColorSpace = fillCsStack.pop();
                 }
                 break;
 
@@ -404,6 +412,27 @@ public class TextExtractor {
                             getNumber(operands.get(1)), getNumber(operands.get(2)),
                             getNumber(operands.get(3)));
                 }
+                break;
+            case "cs":
+                // Fill colour space selection (§8.6.8): remember it so a following
+                // `sc`/`scn` can be interpreted. Text coloured via `/CS0 cs …
+                // scn` (the common producer idiom — this file paints every
+                // heading/link colour this way) was otherwise left black because
+                // only rg/g/k were tracked (corpus 35469 blue "AcroTeX.Net"
+                // title lost its colour on PDF->HTML/DOCX).
+                if (!operands.isEmpty()) {
+                    try {
+                        currentFillColorSpace =
+                                org.aspose.pdf.engine.colorspace.ColorSpaceBase.resolve(
+                                        operands.get(0), currentResources, parser);
+                    } catch (RuntimeException e) {
+                        currentFillColorSpace = null;
+                    }
+                }
+                break;
+            case "sc":
+            case "scn":
+                applyScnFillColor(operands);
                 break;
             case "cm":
                 if (operands.size() >= 6) {
@@ -717,6 +746,23 @@ public class TextExtractor {
                 Resources savedResources = this.currentResources;
                 OperatorCollection savedSourceOperators = this.currentSourceOperators;
                 PdfStream savedSourceStream = this.currentSourceStream;
+                // ISO 32000-1 §8.10.1: painting a form XObject with `Do` is
+                // equivalent to  q / cm(form /Matrix) / clip(/BBox) / content / Q.
+                // The form's /Matrix maps form space into the coordinate system
+                // in effect at the Do, so it MUST be concatenated onto the CTM.
+                // Ignoring it collapses every glyph the form draws to raw form
+                // space and loses its page placement — e.g. a form whose /Matrix
+                // translates +773 in Y (51V13971 static-text layer) sinks all
+                // its text off the bottom of the page. Save/restore the CTM and
+                // text matrices so the form is isolated from the caller.
+                double[] savedCtm = ctm != null ? ctm.clone() : null;
+                double[] savedTextMatrix = textMatrix;
+                double[] savedTextLineMatrix = textLineMatrix;
+                double[] formMatrix = readMatrix(formStream.get("Matrix"));
+                if (formMatrix != null) {
+                    ctm = multiplyMatrix(formMatrix,
+                            ctm != null ? ctm : new double[]{1, 0, 0, 1, 0, 0});
+                }
                 this.currentResources = formResources;
                 this.currentSourceOperators = formOps;
                 this.currentSourceStream = formStream;
@@ -724,6 +770,9 @@ public class TextExtractor {
                 this.currentSourceOperators = savedSourceOperators;
                 this.currentSourceStream = savedSourceStream;
                 this.currentResources = savedResources;
+                ctm = savedCtm;
+                textMatrix = savedTextMatrix;
+                textLineMatrix = savedTextLineMatrix;
             } finally {
                 activeFormXObjects.remove(formStream);
             }
@@ -909,15 +958,26 @@ public class TextExtractor {
         state.setFontEmbeddingInfo(currentFontEmbedded, currentFontSubset);
         // Report the EFFECTIVE font size: many producers set "/F1 1 Tf" and
         // carry the real size in the text matrix (e.g. Tm [0 14 -14 0 …] on a
-        // rotated page). Aspose reports Tf × Tm-vertical-scale, so tests like
-        // PDFNEWNET_30639 assert 14, not the raw 1. The glyph height direction
-        // (0,1) maps through Tm to (c,d), hence the scale is hypot(c,d).
+        // rotated page) AND/OR a scaling CTM (e.g. "0.24 0 0 0.24 cm" then
+        // "58 0 0 58 Tm /F1 1 Tf", real size 1×58×0.24 = 13.9pt — corpus 46005,
+        // where ignoring the CTM blew every glyph up ~4×). Aspose reports the
+        // visual size, i.e. Tf × vertical scale of the full text→device map.
+        // The glyph height direction (0,1) maps through Tm to (c,d), then through
+        // the CTM linear part; the scale is the magnitude of that final vector.
         double effectiveFontSize = fontSize;
         double[] tmForScale = fragmentStartTextMatrix != null ? fragmentStartTextMatrix : textMatrix;
+        double[] ctmForScale = fragmentStartCtm != null ? fragmentStartCtm : ctm;
         if (tmForScale != null) {
-            double tmScale = Math.hypot(tmForScale[2], tmForScale[3]);
-            if (tmScale > 1e-9 && Math.abs(tmScale - 1.0) > 1e-9) {
-                effectiveFontSize = fontSize * tmScale;
+            double vx = tmForScale[2];   // (0,1) through Tm -> (c,d)
+            double vy = tmForScale[3];
+            if (ctmForScale != null) {   // then through the CTM linear part
+                double nx = ctmForScale[0] * vx + ctmForScale[2] * vy;
+                double ny = ctmForScale[1] * vx + ctmForScale[3] * vy;
+                vx = nx; vy = ny;
+            }
+            double combinedScale = Math.hypot(vx, vy);
+            if (combinedScale > 1e-9 && Math.abs(combinedScale - 1.0) > 1e-9) {
+                effectiveFontSize = fontSize * combinedScale;
             }
         }
         state.setFontSize(effectiveFontSize);
@@ -1165,6 +1225,8 @@ public class TextExtractor {
         fragmentEndCtm = null;
         currentFillColor = null;
         fillColorStack.clear();
+        currentFillColorSpace = null;
+        fillCsStack.clear();
         decorations.clear();
         pendingPathRects.clear();
         pendingPathLines.clear();
@@ -1218,6 +1280,82 @@ public class TextExtractor {
         if (val instanceof PdfInteger) return ((PdfInteger) val).intValue();
         if (val instanceof PdfFloat) return ((PdfFloat) val).doubleValue();
         return 0;
+    }
+
+    /**
+     * Applies an {@code sc}/{@code scn} fill colour to {@link #currentFillColor},
+     * mirroring the renderer's {@code applyAdvancedColor}: the numeric operands
+     * are run through the colour space chosen by {@code cs} (a Separation/DeviceN
+     * tint or ICC/Device components), falling back to a by-count interpretation
+     * (3=RGB, 4=CMYK, 1=gray). A pattern name operand carries no solid colour and
+     * leaves the current colour unchanged.
+     */
+    private void applyScnFillColor(List<PdfBase> operands) {
+        if (operands.isEmpty()) {
+            return;
+        }
+        if (operands.get(operands.size() - 1) instanceof PdfName) {
+            return; // pattern fill — no solid text colour
+        }
+        int n = 0;
+        for (PdfBase b : operands) {
+            if (b instanceof PdfInteger || b instanceof PdfFloat) {
+                n++;
+            }
+        }
+        if (n == 0) {
+            return;
+        }
+        double[] comps = new double[n];
+        int ci = 0;
+        for (PdfBase b : operands) {
+            if (b instanceof PdfInteger || b instanceof PdfFloat) {
+                comps[ci++] = getNumber(b);
+            }
+        }
+        flushPendingTextBeforeStateChange();
+        if (currentFillColorSpace != null
+                && n == currentFillColorSpace.getNumberOfComponents()) {
+            try {
+                int rgb = currentFillColorSpace.toRGBInt(comps);
+                currentFillColor = Color.fromArgb((rgb >> 16) & 0xFF,
+                        (rgb >> 8) & 0xFF, rgb & 0xFF);
+                return;
+            } catch (RuntimeException ignore) {
+                // fall through to by-count interpretation
+            }
+        }
+        if (n == 3) {
+            currentFillColor = Color.fromRgb(comps[0], comps[1], comps[2]);
+        } else if (n == 4) {
+            currentFillColor = Color.fromCmyk(comps[0], comps[1], comps[2], comps[3]);
+        } else if (n == 1) {
+            currentFillColor = Color.fromGray(comps[0]);
+        }
+    }
+
+    /**
+     * Reads a 6-element PDF transformation matrix [a b c d e f] from a
+     * dictionary value (e.g. a form XObject's {@code /Matrix}). Dereferences an
+     * indirect array and its elements. Returns {@code null} when the value is
+     * absent or not a well-formed 6-number array, so callers can treat a
+     * missing /Matrix as identity (per ISO 32000-1 §8.10.1 the default is the
+     * identity matrix).
+     */
+    private static double[] readMatrix(PdfBase val) throws IOException {
+        if (val instanceof PdfObjectReference) {
+            val = ((PdfObjectReference) val).dereference();
+        }
+        if (!(val instanceof PdfArray)) return null;
+        PdfArray arr = (PdfArray) val;
+        if (arr.size() < 6) return null;
+        double[] m = new double[6];
+        for (int i = 0; i < 6; i++) {
+            PdfBase e = arr.get(i);
+            if (e instanceof PdfObjectReference) e = ((PdfObjectReference) e).dereference();
+            m[i] = getNumber(e);
+        }
+        return m;
     }
 
     /**

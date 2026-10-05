@@ -137,18 +137,30 @@ public class Arc extends Shape {
      */
     @Override
     public void checkBounds(double width, double height) {
-        // startAngle and endAngle are absolute angles in degrees.
-        // The arc goes from startAngle to endAngle counter-clockwise.
-        // If startAngle > endAngle, the arc wraps through 360°.
-        // We need to find the bounding box by checking endpoints and axis extrema.
+        // The arc is drawn starting at startAngle and sweeping by
+        // (endAngle - startAngle) degrees. The sign of that difference selects
+        // the direction (positive = counter-clockwise, negative = clockwise),
+        // and only the actually-swept angular range contributes to the bounding
+        // box — NOT the full circle.
+        //
+        // The swept amount is reduced modulo 360 so that e.g. Arc(...,-90,360)
+        // (raw span 450°) is the same 90° arc as Arc(...,270,360), rather than a
+        // full circle. A raw difference that is a non-zero multiple of 360 means
+        // a complete circle. Absolute angles are used when sampling cos/sin, so
+        // negative or >360 values are fine (trigonometric functions are periodic).
+        double rawSweep = endAngle - startAngle;
+        double sweep = rawSweep % 360.0;
+        boolean fullCircle = rawSweep != 0.0 && sweep == 0.0;
 
-        // Arc covers an angular range. We interpret as:
-        // - The arc sweeps from min(startAngle,endAngle) to max(startAngle,endAngle)
-        // This covers all angles in between, regardless of direction.
-        double lo = Math.min(startAngle, endAngle);
-        double hi = Math.max(startAngle, endAngle);
-        double angBegin = lo;
-        double angEnd = hi;
+        double angBegin;
+        double angEnd;
+        if (fullCircle) {
+            angBegin = startAngle;
+            angEnd = startAngle + 360.0;
+        } else {
+            angBegin = Math.min(startAngle, startAngle + sweep);
+            angEnd = Math.max(startAngle, startAngle + sweep);
+        }
 
         // Evaluate endpoints
         double begRad = Math.toRadians(angBegin);
@@ -159,9 +171,9 @@ public class Arc extends Shape {
         double minY = Math.min(Math.sin(begRad), Math.sin(endRad));
         double maxY = Math.max(Math.sin(begRad), Math.sin(endRad));
 
-        // Check axis-aligned extrema (multiples of 90°) within the swept range
-        double first90 = Math.ceil(angBegin / 90.0) * 90.0;
-        for (double a = first90; a <= angEnd; a += 90.0) {
+        // Check axis-aligned extrema (multiples of 90°) strictly inside the range
+        double first90 = Math.floor(angBegin / 90.0 + 1.0) * 90.0;
+        for (double a = first90; a < angEnd - 1e-9; a += 90.0) {
             double rad = Math.toRadians(a);
             minX = Math.min(minX, Math.cos(rad));
             maxX = Math.max(maxX, Math.cos(rad));

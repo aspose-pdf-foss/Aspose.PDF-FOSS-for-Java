@@ -364,6 +364,10 @@ public final class SdmHtmlWriter {
                 if (cell.getColSpan() > 1) {
                     target.append(" colspan=\"").append(cell.getColSpan()).append('"');
                 }
+                if (cell.getStyle() != null && cell.getStyle().getBackground() != 0) {
+                    target.append(" style=\"background-color:")
+                          .append(hexColor(cell.getStyle().getBackground())).append('"');
+                }
                 target.append('>');
                 emitBlocksCompact(target, cell.getChildren());
                 // Newline after each cell so text extraction of the HTML does not

@@ -293,7 +293,36 @@ public final class DocxSdmReader {
             inline.clear();
         }
         if (inline.isEmpty() && drawings.size() == 1) {
-            return drawings.get(0); // picture paragraph → block figure
+            SdmBlock only = drawings.get(0);
+            // A page-anchored background that opens a new page (fixed-layout
+            // export: each page = a backdrop drawing + a group of framePr labels)
+            // carries the page break on its own paragraph. The figure never marks
+            // the page as drawn, so the break must ride along or every page's
+            // frames collapse onto the first.
+            if (pPr != null && toggleOn(firstChildElement(pPr, "pageBreakBefore"))) {
+                // A full-page backdrop is out-of-flow: it never marks the page
+                // "drawn", so a plain page-break-before (which SdmPdfLayout gates
+                // on !pageIsEmpty) is swallowed and every page's underlay piles
+                // onto the first — the multi-page fixed-layout DOCX collapses to
+                // one page. Promote it to an UNCONDITIONAL force-new-page (the
+                // same mechanism the HTML fixed-layout round-trip uses), carrying
+                // the page size so heterogeneous pages keep their dimensions.
+                boolean pageBackdrop =
+                        Boolean.TRUE.equals(only.getAttributes().get("background"))
+                        || Boolean.TRUE.equals(only.getAttributes().get("pos-page-anchored"));
+                if (pageBackdrop) {
+                    only.getAttributes().put("force-new-page", Boolean.TRUE);
+                    Object dw = only.getAttributes().get("display-width");
+                    Object dh = only.getAttributes().get("display-height");
+                    if (dw instanceof Number && dh instanceof Number) {
+                        only.getAttributes().put("page-w-pt", ((Number) dw).doubleValue());
+                        only.getAttributes().put("page-h-pt", ((Number) dh).doubleValue());
+                    }
+                } else {
+                    only.getAttributes().put("page-break-before", Boolean.TRUE);
+                }
+            }
+            return only; // picture paragraph → block figure
         }
         if (inline.isEmpty() && drawings.isEmpty() && !inList) {
             // An empty paragraph is a real blank line in Word: it advances one
@@ -322,6 +351,31 @@ public final class DocxSdmReader {
         applyParagraphStyle(pPr, block);
         if (pPr != null && toggleOn(firstChildElement(pPr, "pageBreakBefore"))) {
             block.getAttributes().put("page-break-before", Boolean.TRUE);
+        }
+        // Absolutely-positioned frame (w:framePr with a page anchor): the
+        // paragraph paints at its (x, y) on the current page and does NOT consume
+        // flow — the same contract as the legacy .doc positioned-frame path that
+        // SdmPdfLayout already honors via frame-*-pt. Our PDF->DOCX fixed-layout
+        // export places every form label this way over a page-anchored backdrop;
+        // without honoring it the labels reflow as prose and explode the page
+        // count (Word positions them; our reader used to stack them). frame-y-pt
+        // is the trigger the layout keys on; x/w are optional.
+        if (pPr != null) {
+            Element framePr = firstChildElement(pPr, "framePr");
+            if (framePr != null) {
+                String fy = attrNS(framePr, "y");
+                if (fy != null) {
+                    block.getAttributes().put("frame-y-pt", parseLong(fy) * PT_PER_TWIP);
+                    String fx = attrNS(framePr, "x");
+                    if (fx != null) {
+                        block.getAttributes().put("frame-x-pt", parseLong(fx) * PT_PER_TWIP);
+                    }
+                    String fw = attrNS(framePr, "w");
+                    if (fw != null) {
+                        block.getAttributes().put("frame-w-pt", parseLong(fw) * PT_PER_TWIP);
+                    }
+                }
+            }
         }
         // A drawing sharing a text paragraph degrades to a following figure.
         if (!drawings.isEmpty()) {
@@ -705,7 +759,48 @@ public final class DocxSdmReader {
                 fig.getAttributes().put("display-height", h);
             }
         }
+        // A wp:anchor (vs wp:inline) positioned relativeFrom="page" is a
+        // page-anchored backdrop — our fixed-layout PDF->DOCX export emits the
+        // whole-page vector underlay this way (behindDoc, positionH/V
+        // relativeFrom="page", posOffset in EMU from the page corner). Mark it as
+        // a full-page background pinned to the page corner, so the layout paints
+        // it at its true page position instead of flowing it inside the (often
+        // large) text margins, which shrank the form's box artwork into a small
+        // inset rectangle and dropped the field grid (corpus 39156).
+        Element anchor = firstDescendant(drawing, "anchor");
+        if (anchor != null) {
+            Element posH = firstDescendant(anchor, "positionH");
+            Element posV = firstDescendant(anchor, "positionV");
+            boolean pageH = posH != null && "page".equals(posH.getAttribute("relativeFrom"));
+            boolean pageV = posV != null && "page".equals(posV.getAttribute("relativeFrom"));
+            boolean behind = "1".equals(anchor.getAttribute("behindDoc"))
+                    || "true".equalsIgnoreCase(anchor.getAttribute("behindDoc"));
+            if (behind || (pageH && pageV)) {
+                fig.getAttributes().put("background", Boolean.TRUE);
+                fig.getAttributes().put("background-opacity", 1.0);
+                if (pageH && pageV) {
+                    fig.getAttributes().put("pos-x-pt", anchorOffsetPt(posH));
+                    fig.getAttributes().put("pos-y-pt", anchorOffsetPt(posV));
+                    fig.getAttributes().put("pos-page-anchored", Boolean.TRUE);
+                    fig.getAttributes().put("pos-from-page-corner", Boolean.TRUE);
+                }
+            }
+        }
         return fig;
+    }
+
+    /** The {@code wp:posOffset} (EMU, measured from the page corner) of a
+     *  DrawingML {@code wp:positionH}/{@code wp:positionV} element, in points. */
+    private double anchorOffsetPt(Element pos) {
+        Element off = firstDescendant(pos, "posOffset");
+        if (off == null) {
+            return 0;
+        }
+        try {
+            return Long.parseLong(off.getTextContent().trim()) * PT_PER_EMU;
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     /** VML picture ({@code v:imagedata r:id}); display size from the shape's CSS style. */

@@ -85,6 +85,12 @@ public class PdfPageRenderer {
     /** With {@link #suppressText}: keep NON-HORIZONTAL text painted (fixed-layout
      *  targets re-emit only horizontal text as positioned frames). */
     private boolean suppressTextKeepRotated;
+    /** With {@link #suppressText}: keep TYPE 3 text painted. Type 3 glyphs are
+     *  drawn by content-stream procedures (§9.6.5) — they are graphics, and when
+     *  the font has no /ToUnicode their codes cannot be recovered as text, so the
+     *  HTML export renders them into the vector underlay instead of emitting
+     *  garbage text spans. */
+    private boolean suppressTextKeepType3;
     /** When true, raster images (Image XObjects and inline BI images) are
      *  skipped; vector paths, shadings and Form-XObject recursion still paint. */
     private boolean suppressRasterImages;
@@ -113,6 +119,37 @@ public class PdfPageRenderer {
      */
     public void setSuppressTextKeepRotated(boolean keep) {
         this.suppressTextKeepRotated = keep;
+    }
+
+    /**
+     * With {@link #setSuppressText}: keeps Type 3 text painted so the HTML
+     * vector underlay carries glyphs whose codes have no Unicode mapping.
+     *
+     * @param keep true to keep Type 3 text
+     */
+    public void setSuppressTextKeepType3(boolean keep) {
+        this.suppressTextKeepType3 = keep;
+    }
+
+    /** True when the resource-named current font is a Type 3 font. Cheap dict
+     *  lookup (Subtype only), no glyph-program loading. */
+    private static boolean isType3Font(GraphicsState state, Resources resources) {
+        if (resources == null) return false;
+        String fn = state.getFontName();
+        if (fn == null) return false;
+        org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts = resources.getFonts();
+        if (fonts == null) return false;
+        try {
+            org.aspose.pdf.engine.pdfobjects.PdfBase f = fonts.get(fn);
+            if (f instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+                f = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) f).dereference();
+            }
+            return f instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary
+                && "Type3".equals(((org.aspose.pdf.engine.pdfobjects.PdfDictionary) f)
+                        .getNameAsString("Subtype"));
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** True when the current combined text transform (Tm x CTM) is not horizontal. */
@@ -678,18 +715,48 @@ public class PdfPageRenderer {
         }
         if (bbox == null) bbox = annotRect;
 
-        double bboxW = bbox.getWidth();
-        double bboxH = bbox.getHeight();
-        if (bboxW == 0 || bboxH == 0) return;
+        // §12.5.5: the appearance /Matrix maps form space to the annotation's
+        // coordinate space; the fit to /Rect is computed against the BBox AFTER
+        // it is transformed by that matrix. Ignoring /Matrix mapped an unrotated
+        // BBox onto a rotated /Rect, so a 90°-rotated field appearance (corpus
+        // 43484 KozGoPr6N text fields, /Matrix [0 1 -1 0]) was fitted with an
+        // extreme non-uniform scale and its text collapsed into a smear.
+        Matrix apMatrix = new Matrix(1, 0, 0, 1, 0, 0);
+        org.aspose.pdf.engine.pdfobjects.PdfBase mVal = resolveRef(apStream.get("Matrix"));
+        if (mVal instanceof org.aspose.pdf.engine.pdfobjects.PdfArray
+                && ((org.aspose.pdf.engine.pdfobjects.PdfArray) mVal).size() == 6) {
+            org.aspose.pdf.engine.pdfobjects.PdfArray ma =
+                    (org.aspose.pdf.engine.pdfobjects.PdfArray) mVal;
+            apMatrix = new Matrix(ma.getFloat(0, 1), ma.getFloat(1, 0), ma.getFloat(2, 0),
+                    ma.getFloat(3, 1), ma.getFloat(4, 0), ma.getFloat(5, 0));
+        }
 
-        double sx = annotRect.getWidth() / bboxW;
-        double sy = annotRect.getHeight() / bboxH;
-        double tx = annotRect.getLLX() - bbox.getLLX() * sx;
-        double ty = annotRect.getLLY() - bbox.getLLY() * sy;
+        // Transform the four BBox corners by /Matrix and take the enclosing box.
+        double[][] corners = {
+            {bbox.getLLX(), bbox.getLLY()}, {bbox.getURX(), bbox.getLLY()},
+            {bbox.getURX(), bbox.getURY()}, {bbox.getLLX(), bbox.getURY()}
+        };
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
+        double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+        for (double[] c : corners) {
+            double tx0 = apMatrix.getA() * c[0] + apMatrix.getC() * c[1] + apMatrix.getE();
+            double ty0 = apMatrix.getB() * c[0] + apMatrix.getD() * c[1] + apMatrix.getF();
+            minX = Math.min(minX, tx0); maxX = Math.max(maxX, tx0);
+            minY = Math.min(minY, ty0); maxY = Math.max(maxY, ty0);
+        }
+        double tbW = maxX - minX;
+        double tbH = maxY - minY;
+        if (tbW == 0 || tbH == 0) return;
+
+        double sx = annotRect.getWidth() / tbW;
+        double sy = annotRect.getHeight() / tbH;
+        double tx = annotRect.getLLX() - minX * sx;
+        double ty = annotRect.getLLY() - minY * sy;
 
         // The appearance stream is a Form XObject. Wrap it via XForm so we
         // get an OperatorCollection and the form's /Resources. Render in a
-        // pushed graphics state with the BBox→Rect CTM applied.
+        // pushed graphics state with the fit matrix A THEN the form /Matrix
+        // applied (content coords -> /Matrix -> A -> page).
         try {
             XForm form = new XForm(apStream, "AP", null);
             OperatorCollection formOps = form.getContents();
@@ -699,6 +766,7 @@ public class PdfPageRenderer {
 
             GraphicsState state = new GraphicsState();
             state.concatMatrix(new Matrix(sx, 0, 0, sy, tx, ty));
+            state.concatMatrix(apMatrix);
 
             Deque<GraphicsState> stack = new ArrayDeque<>();
             GraphicsState apInitial = state.clone();
@@ -843,7 +911,8 @@ public class PdfPageRenderer {
         // In keep-rotated mode, non-horizontal text stays painted: a fixed-layout
         // target re-emits only HORIZONTAL text as positioned frames (Word cannot
         // place diagonal text), so rotated labels must survive in the pixels.
-        if (suppressText && !(suppressTextKeepRotated && isRotatedText(state))) {
+        if (suppressText && !(suppressTextKeepRotated && isRotatedText(state))
+                && !(suppressTextKeepType3 && isType3Font(state, resources))) {
             switch (name) {
                 case "Tj":
                 case "TJ":
@@ -2478,7 +2547,8 @@ public class PdfPageRenderer {
         }
         if (!(val instanceof PdfDictionary)) return;
 
-        ExtGState gs = new ExtGState((PdfDictionary) val);
+        PdfDictionary gsd = (PdfDictionary) val;
+        ExtGState gs = new ExtGState(gsd);
         double lw = gs.getLineWidth();
         if (lw >= 0) state.setLineWidth(lw);
         int lc = gs.getLineCap();
@@ -2488,9 +2558,20 @@ public class PdfPageRenderer {
         double ml = gs.getMiterLimit();
         if (ml >= 0) state.setMiterLimit(ml);
 
-        state.setStrokingAlpha((float) gs.getStrokingAlpha());
-        state.setNonStrokingAlpha((float) gs.getNonStrokingAlpha());
-        state.setBlendMode(gs.getBlendMode());
+        // §8.4.5 / Table 58: a `gs` ExtGState modifies ONLY the parameters it
+        // actually declares; keys that are absent must leave the current
+        // graphics state untouched. Re-reading a missing key and writing back
+        // its DEFAULT clobbers state set by an earlier `gs`. Corpus 45870
+        // (zoning map) does exactly this: `/GSF_alpha_0000 gs` (<</ca 0>>)
+        // makes the fill fully transparent so a zone's teal wash is invisible
+        // and only its dashed outline paints — but the next op is a
+        // stroke-only `/GSS_alpha_FFFF gs` (<</CA 1>>) with no /ca. Applying a
+        // default ca=1 there reset the fill alpha to opaque, so we painted a
+        // solid teal polygon over the whole map and hid every coloured region
+        // beneath it. Guard each parameter on its key's presence.
+        if (gsd.get("CA") != null) state.setStrokingAlpha((float) gs.getStrokingAlpha());
+        if (gsd.get("ca") != null) state.setNonStrokingAlpha((float) gs.getNonStrokingAlpha());
+        if (gsd.get("BM") != null) state.setBlendMode(gs.getBlendMode());
 
         // /SMask (§11.6.5.1): a dictionary installs a soft mask, /None clears it.
         PdfBase sm = resolveRef(((PdfDictionary) val).get("SMask"));

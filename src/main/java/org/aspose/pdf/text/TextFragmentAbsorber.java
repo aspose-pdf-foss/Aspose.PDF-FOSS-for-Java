@@ -227,6 +227,11 @@ public class TextFragmentAbsorber extends TextAbsorber {
      * @return the text fragment collection
      */
     public TextFragmentCollection getTextFragments() {
+        // Propagate the edit options (e.g. FontReplace.RemoveUnusedFonts) to each
+        // fragment so a later getTextState().setFont(...) can honour them.
+        for (int i = 1; i <= textFragments.size(); i++) {
+            textFragments.get(i).setEditOptions(textEditOptions);
+        }
         return textFragments;
     }
 

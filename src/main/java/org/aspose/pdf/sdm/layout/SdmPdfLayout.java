@@ -111,9 +111,76 @@ public final class SdmPdfLayout {
         return false;
     }
 
+    /**
+     * A live-spreadsheet form field recorded during layout for creation on the
+     * FINAL document. Fields are NOT created in the layout document: adopting its
+     * pages (save + reparse + import) duplicates every widget and desynchronises
+     * {@code /AcroForm/Fields} from the page {@code /Annots}. Recording the
+     * placement and creating the field once on the adopting document keeps the
+     * clean one-object-per-field structure Acrobat needs.
+     */
+    public static final class XlsxFieldPlacement {
+        /** 1-based page number in the produced document. */
+        public final int pageNumber;
+        /** Widget rectangle in page user space. */
+        public final double llx;
+        /** Widget rectangle in page user space. */
+        public final double lly;
+        /** Widget rectangle in page user space. */
+        public final double urx;
+        /** Widget rectangle in page user space. */
+        public final double ury;
+        /** Field name (/T). */
+        public final String name;
+        /** Initial value (/V). */
+        public final String value;
+        /** Whether the field is read-only. */
+        public final boolean readOnly;
+        /** Text quadding (0 left, 1 centre, 2 right). */
+        public final int quadding;
+        /** Number-format action JavaScript, or {@code null}. */
+        public final String formatJs;
+        /** Calculate action JavaScript (right-hand side), or {@code null}. */
+        public final String calcJs;
+
+        XlsxFieldPlacement(int pageNumber, double llx, double lly, double urx, double ury,
+                           String name, String value, boolean readOnly, int quadding,
+                           String formatJs, String calcJs) {
+            this.pageNumber = pageNumber;
+            this.llx = llx;
+            this.lly = lly;
+            this.urx = urx;
+            this.ury = ury;
+            this.name = name;
+            this.value = value;
+            this.readOnly = readOnly;
+            this.quadding = quadding;
+            this.formatJs = formatJs;
+            this.calcJs = calcJs;
+        }
+    }
+
+    private final java.util.List<XlsxFieldPlacement> xlsxPlacements = new java.util.ArrayList<>();
+
+    /**
+     * Live-spreadsheet field placements collected during the final render pass.
+     * The caller creates the AcroForm fields from these on the adopting document.
+     *
+     * @return the placements (empty unless interactive XLSX cells were laid out)
+     */
+    public java.util.List<XlsxFieldPlacement> getXlsxPlacements() {
+        return xlsxPlacements;
+    }
+
     private Result renderPass(SdmDocument sdm, PageSetup setup, int totalPages) {
         if (sdm == null) {
             throw new IllegalArgumentException("sdm must not be null");
+        }
+        // Collected fresh each pass; render() may run two passes (NUMPAGES) and the
+        // last pass's placements are the ones the caller uses.
+        xlsxPlacements.clear();
+        if (setup == null) {
+            setup = PageSetup.letter();
         }
         if (setup == null) {
             setup = PageSetup.letter();
@@ -153,6 +220,38 @@ public final class SdmPdfLayout {
 
     private void layoutBlock(SdmBlock b, LayoutState st, double x, double width,
                              List<SdmBlock> siblings, int index) {
+        // Fixed-layout page boundary (PDF->HTML->PDF round-trip): the block that
+        // opens a new source page forces a fresh PDF page UNCONDITIONALLY — its
+        // content is absolutely positioned (backdrop + framed spans) and never
+        // marks the page as "drawn", so the flow-empty guard on page-break-before
+        // would otherwise collapse every page onto the first. Each page may carry
+        // its own size (heterogeneous / rotated originals).
+        if (Boolean.TRUE.equals(b.getAttributes().get("force-new-page")) && !st.suppressNewPage) {
+            Object pw = b.getAttributes().get("page-w-pt");
+            Object ph = b.getAttributes().get("page-h-pt");
+            if (pw instanceof Number && ph instanceof Number) {
+                st.setup.setPageWidth(((Number) pw).doubleValue());
+                st.setup.setPageHeight(((Number) ph).doubleValue());
+            }
+            st.newPage();
+            // Each fixed-layout page maps 1:1 to a source page — keep it even when
+            // its only ink is a backdrop underlay (which never sets drewOnPage),
+            // so the trailing-empty-page cleanup can't drop it and misalign a
+            // page-by-page comparison.
+            st.drewOnPage = true;
+        }
+        // A fixed-layout page rebuilt from a /Rotate original carries its
+        // rotation on the first block: apply it to the current page so the viewer
+        // turns the unrotated content (matching the source PDF). Handles the very
+        // first page too (opened by renderPass before any block ran).
+        Object rotate = b.getAttributes().get("page-rotate");
+        if (rotate instanceof Number && st.page != null) {
+            try {
+                st.page.setRotation(((Number) rotate).intValue());
+            } catch (RuntimeException ignore) {
+                // non-quadrant rotation -> leave the page upright
+            }
+        }
         // Explicit page break (DOCX w:br type="page" / w:pageBreakBefore): the
         // block starts a fresh page unless the current one is still empty.
         if (Boolean.TRUE.equals(b.getAttributes().get("page-break-before"))
@@ -228,9 +327,21 @@ public final class SdmPdfLayout {
                     st.cursorY = st.frameCursorY - spaceBefore;
                     boolean prevSup = st.suppressNewPage;
                     st.suppressNewPage = true; // a frame never paginates
+                    // A form field carries its box height (frame-h-pt): clip the
+                    // value to the lines that fit, so an overfull field does not
+                    // wrap down over following content or run off the page.
+                    Object fhAttr = b.getAttributes().get("frame-h-pt");
+                    int frameMaxLines = Integer.MAX_VALUE;
+                    if (fhAttr instanceof Double) {
+                        double flh = TextLayoutHelper.getLineHeight(
+                                st.resolveFont(f.family, f.bold, f.italic), f.size);
+                        if (flh > 0) {
+                            frameMaxLines = Math.max(1, (int) Math.floor((Double) fhAttr / flh));
+                        }
+                    }
                     drawInlineBlock(inlineText(p.getInline()), st, fx, fw, f.family,
                             f.size, f.bold, f.italic, f.color, bs,
-                            forcedLineOf(b), lineRuleOf(b));
+                            forcedLineOf(b), lineRuleOf(b), frameMaxLines);
                     st.suppressNewPage = prevSup;
                     st.frameCursorY = st.cursorY;
                     // +spaceAfter: the common tail subtracts it — a frame must
@@ -271,8 +382,16 @@ public final class SdmPdfLayout {
                     }
                 }
                 if (!tabbed) {
-                    drawInlineBlock(inlineText(p.getInline()), st, bx, bw, f.family, f.size,
-                            f.bold, f.italic, f.color, bs, forcedLineOf(b), lineRuleOf(b));
+                    // Mixed inline styling (bold + italic + strike + code + link in
+                    // one paragraph) needs per-run fonts; the single-font block
+                    // path can only pick one. Route only the mixed, plain-flow case
+                    // here so uniform paragraphs keep the tuned single-font path.
+                    if (!"exact".equals(lineRuleOf(b)) && hasMixedInlineStyles(p.getInline())) {
+                        drawStyledInlineBlock(p.getInline(), st, bx, bw, f, bs);
+                    } else {
+                        drawInlineBlock(inlineText(p.getInline()), st, bx, bw, f.family, f.size,
+                                f.bold, f.italic, f.color, bs, forcedLineOf(b), lineRuleOf(b));
+                    }
                 }
                 addLinkAnnotations(p.getInline(), st, bx, bw, pLinkTop);
                 break;
@@ -413,19 +532,251 @@ public final class SdmPdfLayout {
         return v instanceof String ? (String) v : null;
     }
 
+    /** Default link colour (a mid blue, ~Word/CSS hyperlink) for rendered links. */
+    private static final int LINK_COLOR = 0x0563C1;
+
+    /** One styled token of inline flow: a word, a run of spaces, or a hard break. */
+    private static final class StyledTok {
+        String text;
+        boolean space;
+        boolean hardBreak;
+        String font;
+        double size;
+        int color;
+        boolean strike;
+        boolean underline;
+    }
+
+    /**
+     * True when a paragraph's inline flow carries MORE THAN ONE distinct visual
+     * style (bold/italic/strike/mono/link) — the only case the single-font block
+     * renderer ({@link #blockFont}) cannot reproduce. Uniform paragraphs (all
+     * plain, all bold, …) return false and keep the original, tuned path.
+     */
+    private static boolean hasMixedInlineStyles(List<SdmInline> inlines) {
+        java.util.Set<String> sigs = new java.util.HashSet<>();
+        collectStyleSignatures(inlines, sigs, false);
+        return sigs.size() > 1;
+    }
+
+    private static void collectStyleSignatures(List<SdmInline> inlines,
+            java.util.Set<String> sigs, boolean link) {
+        for (SdmInline in : inlines) {
+            if (in instanceof Run) {
+                TextStyle s = ((Run) in).getStyle();
+                String t = ((Run) in).getText();
+                if (t == null || t.isEmpty()) {
+                    continue;
+                }
+                boolean b = s != null && s.isBold();
+                boolean i = s != null && s.isItalic();
+                boolean st = s != null && s.isStrikethrough();
+                boolean m = s != null && "monospace".equals(s.getFontFamily());
+                sigs.add(b + "|" + i + "|" + st + "|" + m + "|" + link);
+            } else if (in instanceof LinkInline) {
+                collectStyleSignatures(((LinkInline) in).getChildren(), sigs, true);
+            }
+        }
+    }
+
+    /** Flattens inline flow into styled word/space/break tokens for {@link
+     *  #drawStyledInlineBlock}. Links inherit a blue underline unless the child
+     *  run already sets a colour. */
+    private void buildStyledTokens(List<SdmInline> inlines, LayoutState st,
+            double blockSize, int blockColor, List<StyledTok> out, boolean link) {
+        for (SdmInline in : inlines) {
+            if (in instanceof Run) {
+                Run r = (Run) in;
+                String text = r.getText();
+                if (text == null || text.isEmpty()) {
+                    continue;
+                }
+                TextStyle s = r.getStyle();
+                boolean bold = s != null && s.isBold();
+                boolean italic = s != null && s.isItalic();
+                String family = s != null && s.getFontFamily() != null
+                        ? s.getFontFamily() : DEFAULT_FONT;
+                double size = s != null && s.getFontSize() > 0 ? s.getFontSize() : blockSize;
+                int color = s != null && s.getColor() != 0 ? s.getColor()
+                        : (link ? LINK_COLOR : blockColor);
+                String font = st.resolveFont(family, bold, italic);
+                boolean strike = s != null && s.isStrikethrough();
+                tokenize(text, font, size, color, strike, link, out);
+            } else if (in instanceof LinkInline) {
+                buildStyledTokens(((LinkInline) in).getChildren(), st, blockSize,
+                        blockColor, out, true);
+            } else if (in.getType() == org.aspose.pdf.sdm.SdmNodeType.LINE_BREAK) {
+                StyledTok t = new StyledTok();
+                t.hardBreak = true;
+                out.add(t);
+            }
+        }
+    }
+
+    /** True when two tokens share every visual attribute — so they can be drawn
+     *  as one text run. Hard breaks never coalesce. */
+    private static boolean sameStyle(StyledTok a, StyledTok b) {
+        return !a.hardBreak && !b.hardBreak
+                && a.font.equals(b.font) && a.size == b.size && a.color == b.color
+                && a.strike == b.strike && a.underline == b.underline;
+    }
+
+    /** Splits one run's text into alternating word / whitespace tokens. */
+    private static void tokenize(String text, String font, double size, int color,
+            boolean strike, boolean underline, List<StyledTok> out) {
+        int i = 0, n = text.length();
+        while (i < n) {
+            char c = text.charAt(i);
+            if (c == '\n') {
+                StyledTok t = new StyledTok();
+                t.hardBreak = true;
+                out.add(t);
+                i++;
+                continue;
+            }
+            boolean space = Character.isWhitespace(c);
+            int j = i;
+            while (j < n && text.charAt(j) != '\n'
+                    && Character.isWhitespace(text.charAt(j)) == space) {
+                j++;
+            }
+            StyledTok t = new StyledTok();
+            t.text = space ? " " : text.substring(i, j);
+            t.space = space;
+            t.font = font;
+            t.size = size;
+            t.color = color;
+            t.strike = strike;
+            t.underline = underline;
+            out.add(t);
+            i = j;
+        }
+    }
+
+    /**
+     * Renders a paragraph's inline flow RUN BY RUN, so mixed bold/italic/strike/
+     * mono/link spans keep their own font, colour and decorations — the per-run
+     * analogue of {@link #drawInlineBlock}. Greedy word wrap across runs of
+     * differing metrics; alignment, first-line indent and line-by-line
+     * pagination mirror the single-font path. Used only for mixed-style
+     * paragraphs in the plain flow case (no frame / tabs / exact line rule).
+     */
+    private void drawStyledInlineBlock(List<SdmInline> inlines, LayoutState st,
+            double x, double width, RunFont blockF, BlockStyle bs) {
+        List<StyledTok> toks = new ArrayList<>();
+        buildStyledTokens(inlines, st, blockF.size,
+                blockF.color != 0 ? blockF.color : 0, toks, false);
+        double firstIndent = bs != null ? bs.getIndentFirstLine() : 0;
+        BlockStyle.Align align = bs != null && bs.getAlign() != null
+                ? bs.getAlign() : BlockStyle.Align.LEFT;
+        // Greedy wrap into lines.
+        List<List<StyledTok>> lines = new ArrayList<>();
+        List<StyledTok> cur = new ArrayList<>();
+        double curW = 0;
+        double avail = width - firstIndent;
+        for (StyledTok t : toks) {
+            if (t.hardBreak) {
+                lines.add(cur);
+                cur = new ArrayList<>();
+                curW = 0;
+                avail = width - (lines.isEmpty() ? firstIndent : 0);
+                continue;
+            }
+            double w = TextLayoutHelper.measureTextWidth(t.text, t.font, t.size);
+            boolean lineHasWord = cur.stream().anyMatch(k -> !k.space);
+            if (!t.space && lineHasWord && curW + w > avail) {
+                lines.add(cur);
+                cur = new ArrayList<>();
+                curW = 0;
+                avail = width;
+                lineHasWord = false;
+            }
+            if (t.space && !lineHasWord) {
+                continue; // drop leading spaces on a line
+            }
+            cur.add(t);
+            curW += w;
+        }
+        lines.add(cur);
+        // Draw.
+        boolean firstLine = true;
+        for (List<StyledTok> line : lines) {
+            // Trim trailing spaces for width/alignment.
+            int end = line.size();
+            while (end > 0 && line.get(end - 1).space) {
+                end--;
+            }
+            double lineWidth = 0, maxSize = blockF.size;
+            for (int k = 0; k < end; k++) {
+                StyledTok t = line.get(k);
+                lineWidth += TextLayoutHelper.measureTextWidth(t.text, t.font, t.size);
+                maxSize = Math.max(maxSize, t.size);
+            }
+            double lineHeight = TextLayoutHelper.getLineHeight(
+                    st.resolveFont(blockF.family, blockF.bold, blockF.italic), maxSize);
+            ensureSpace(st, lineHeight);
+            double indent = firstLine ? firstIndent : 0;
+            double lx = x + indent;
+            if (align == BlockStyle.Align.CENTER) {
+                lx = x + indent + Math.max(0, (width - indent - lineWidth) / 2);
+            } else if (align == BlockStyle.Align.RIGHT) {
+                lx = x + Math.max(0, width - lineWidth);
+            }
+            double baseY = st.cursorY - maxSize;
+            // Coalesce adjacent tokens sharing the same style into ONE drawText, so
+            // a styled span renders as a single text box (not one box per word) —
+            // per-word boxes fragment the page and trip the fixed-layout/form
+            // heuristics on the return trip.
+            int k = 0;
+            while (k < end) {
+                StyledTok t0 = line.get(k);
+                StringBuilder seg = new StringBuilder(t0.text);
+                int j = k + 1;
+                while (j < end && sameStyle(line.get(j), t0)) {
+                    seg.append(line.get(j).text);
+                    j++;
+                }
+                String text = seg.toString();
+                double w = TextLayoutHelper.measureTextWidth(text, t0.font, t0.size);
+                st.drawText(text, lx, baseY, t0.font, t0.size, t0.color);
+                if (t0.strike) {
+                    st.fillRect(lx, baseY + t0.size * 0.28, w, Math.max(0.5, t0.size * 0.06), t0.color);
+                }
+                if (t0.underline) {
+                    st.fillRect(lx, baseY - t0.size * 0.10, w, Math.max(0.5, t0.size * 0.05), t0.color);
+                }
+                lx += w;
+                k = j;
+            }
+            st.cursorY -= lineHeight;
+            firstLine = false;
+        }
+    }
+
     private void drawInlineBlock(String text, LayoutState st, double x, double width,
                                  String family, double size, boolean bold, boolean italic,
                                  int color, BlockStyle bs) {
         drawInlineBlock(text, st, x, width, family, size, bold, italic, color, bs, -1, null);
     }
 
-    /** Wraps text to the content width (REUSE TextLayoutHelper.wrapText) and draws
-     *  each line with alignment/indent, paginating line-by-line. A DOCX
-     *  {@code lineRule="exact"} height REPLACES the natural line height (0 is a
-     *  legal zero-advance overlay); {@code atLeast} only raises it. */
     private void drawInlineBlock(String text, LayoutState st, double x, double width,
                                  String family, double size, boolean bold, boolean italic,
                                  int color, BlockStyle bs, double forcedLine, String lineRule) {
+        drawInlineBlock(text, st, x, width, family, size, bold, italic, color, bs,
+                forcedLine, lineRule, Integer.MAX_VALUE);
+    }
+
+    /** Wraps text to the content width (REUSE TextLayoutHelper.wrapText) and draws
+     *  each line with alignment/indent, paginating line-by-line. A DOCX
+     *  {@code lineRule="exact"} height REPLACES the natural line height (0 is a
+     *  legal zero-advance overlay); {@code atLeast} only raises it. {@code maxLines}
+     *  clips the block to at most that many lines — a fixed-layout form field
+     *  paints only the lines that fit its box, dropping the rest the way a PDF
+     *  viewer clips an overfull field. */
+    private void drawInlineBlock(String text, LayoutState st, double x, double width,
+                                 String family, double size, boolean bold, boolean italic,
+                                 int color, BlockStyle bs, double forcedLine, String lineRule,
+                                 int maxLines) {
         String font = st.resolveFont(family, bold, italic);
         double lineHeight = TextLayoutHelper.getLineHeight(font, size);
         double baselineDrop = size;
@@ -480,6 +831,10 @@ public final class SdmPdfLayout {
         if (lines.isEmpty()) {
             lines = new ArrayList<>();
             lines.add("");
+        }
+        // Clip to the field box: keep only the lines that fit its height.
+        if (maxLines > 0 && lines.size() > maxLines) {
+            lines = new ArrayList<>(lines.subList(0, maxLines));
         }
         // Paint the block background (e.g. the green "Portfolio composition"
         // header bar) behind the text when it fits on the current page.
@@ -567,6 +922,9 @@ public final class SdmPdfLayout {
                 headers.add(r);
             }
         }
+        // Per-column rowspan carry (how many more rows each column stays occupied
+        // by a cell anchored above), threaded through every body row.
+        int[] carry = new int[colCount];
         for (TableRow r : t.getRows()) {
             double rowH = effectiveRowHeight(r, colX, st, cellPad);
             if (!st.suppressNewPage
@@ -574,12 +932,13 @@ public final class SdmPdfLayout {
                     && !st.pageIsEmpty()) {
                 debugBreak("table-row", st, rowH);
                 st.newPage();
+                int[] headerCarry = new int[colCount];
                 for (TableRow h : headers) {
                     drawRow(h, st, colX, effectiveRowHeight(h, colX, st, cellPad),
-                            ruled, ruleColor, cellPad);
+                            ruled, ruleColor, cellPad, headerCarry);
                 }
             }
-            drawRow(r, st, colX, rowH, ruled, ruleColor, cellPad);
+            drawRow(r, st, colX, rowH, ruled, ruleColor, cellPad, carry);
         }
     }
 
@@ -882,15 +1241,36 @@ public final class SdmPdfLayout {
     }
 
     private void drawRow(TableRow r, LayoutState st, double[] colX, double rowH,
-                         boolean ruled, int ruleColor, double cellPad) {
+                         boolean ruled, int ruleColor, double cellPad, int[] carry) {
         double top = st.cursorY;
+        int colCount = colX.length - 1;
         int col = 0;
-        for (TableCell cell : r.getCells()) {
+        int ci = 0;
+        List<TableCell> cells = r.getCells();
+        while (col < colCount) {
+            // A column still occupied by a rowSpan cell anchored above is skipped
+            // so this row's cells land in the correct (non-overlapping) columns.
+            if (carry != null && carry[col] > 0) {
+                carry[col]--;
+                col++;
+                continue;
+            }
+            if (ci >= cells.size()) {
+                break;
+            }
+            TableCell cell = cells.get(ci++);
+            int span = Math.max(1, cell.getColSpan());
+            int rspan = Math.max(1, cell.getRowSpan());
             int startCol = Math.min(colX.length - 1, col);
-            int endCol = Math.min(colX.length - 1, col + cell.getColSpan());
+            int endCol = Math.min(colX.length - 1, col + span);
             double cx = colX[startCol];
             double cw = colX[endCol] - cx;
-            double ch = rowH * cell.getRowSpan();
+            double ch = rowH * rspan;
+            if (carry != null && rspan > 1) {
+                for (int i = col; i < col + span && i < carry.length; i++) {
+                    carry[i] = rspan - 1;
+                }
+            }
             // Paint the cell background (e.g. green column headers) before the
             // border and text so the tint sits behind the content.
             int cellBg = cell.getStyle() != null ? cell.getStyle().getBackground() : 0;
@@ -913,7 +1293,17 @@ public final class SdmPdfLayout {
                 layoutChildren(cell.getChildren(), st, cx + cellPad, cw - 2 * cellPad);
                 st.suppressNewPage = savedSuppress;
                 st.cursorY = savedCursor;
-                col += cell.getColSpan();
+                col += span;
+                continue;
+            }
+            // Live-spreadsheet cell: emit an AcroForm field (its /AP shows the value
+            // and its /AA /C recalculates the formula) instead of static text. The
+            // ruled rect above stays as the grid line; text is not drawn.
+            Object xlsxField = cell.getAttributes() != null
+                    ? cell.getAttributes().get("xlsx-field-name") : null;
+            if (xlsxField instanceof String && !st.measuring) {
+                emitXlsxCellField(cell, st, cx, top - ch, cw, ch, (String) xlsxField);
+                col += span;
                 continue;
             }
             // HTML tables are borderless unless CSS asks otherwise; a full grid on
@@ -943,9 +1333,33 @@ public final class SdmPdfLayout {
                 st.drawText(line, lx, ty, font, size, color);
                 ty -= TextLayoutHelper.getLineHeight(font, size);
             }
-            col += cell.getColSpan();
+            col += span;
         }
         st.cursorY = top - rowH;
+    }
+
+    /**
+     * Records a live-spreadsheet cell's field placement (rectangle, value, flags,
+     * format/calculate scripts). The field itself is created later on the adopting
+     * document (see {@link #getXlsxPlacements()}), not here — creating it in the
+     * layout document would be duplicated by page import.
+     */
+    private void emitXlsxCellField(TableCell cell, LayoutState st, double x, double y,
+                                   double w, double h, String fieldName) {
+        java.util.Map<String, Object> a = cell.getAttributes();
+        Object q = a.get("xlsx-field-quadding");
+        Object val = a.get("xlsx-field-value");
+        Object fmt = a.get("xlsx-field-format-js");
+        Object calc = a.get("xlsx-field-calc-js");
+        // Inset by 0.5pt so the widget sits inside the ruled cell border.
+        xlsxPlacements.add(new XlsxFieldPlacement(
+                st.pages.getCount(), x + 0.5, y + 0.5, x + w - 0.5, y + h - 0.5,
+                fieldName,
+                val instanceof String ? (String) val : "",
+                Boolean.TRUE.equals(a.get("xlsx-field-readonly")),
+                q instanceof Integer ? (Integer) q : 0,
+                fmt instanceof String ? (String) fmt : null,
+                calc instanceof String ? (String) calc : null));
     }
 
     // ---- figures -----------------------------------------------------------
@@ -1228,7 +1642,14 @@ public final class SdmPdfLayout {
             double pageH = st.setup.getPageHeight();
             double bx;
             double by;
-            if (Boolean.TRUE.equals(fig.getAttributes().get("pos-page-anchored"))) {
+            if (Boolean.TRUE.equals(fig.getAttributes().get("pos-from-page-corner"))) {
+                // DrawingML wp:anchor relativeFrom="page": the offset is measured
+                // from the page's top-left corner (0,0 = a full-page underlay), so
+                // paint it there WITHOUT re-adding the text margins — otherwise a
+                // full-page form underlay shifts in by the margins and shrinks.
+                bx = displayPt(fig, "pos-x-pt");
+                by = pageH - displayPt(fig, "pos-y-pt") - dh;
+            } else if (Boolean.TRUE.equals(fig.getAttributes().get("pos-page-anchored"))) {
                 // Page-anchored VML shape: paint at its recorded offset. Word
                 // measures the offset from the text-margin origin (empirically —
                 // a "-5.75pt / -7.7pt" backdrop lands just outside the margins,

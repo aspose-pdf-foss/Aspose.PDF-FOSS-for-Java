@@ -319,6 +319,12 @@ public class Document implements Closeable {
         } else if (options instanceof DocLoadOptions) {
             initFromDocx(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
                     (DocLoadOptions) options);
+        } else if (options instanceof ExcelLoadOptions) {
+            initFromXlsx(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
+                    (ExcelLoadOptions) options);
+        } else if (options instanceof MarkdownLoadOptions) {
+            initFromMarkdown(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(filePath)),
+                    (MarkdownLoadOptions) options);
         } else {
             throw new IllegalArgumentException("Unsupported LoadOptions type: "
                     + (options == null ? "null" : options.getClass().getName())
@@ -343,6 +349,10 @@ public class Document implements Closeable {
             initFromHtmlStream(stream, (HtmlLoadOptions) options, true);
         } else if (options instanceof DocLoadOptions) {
             initFromDocx(readAllBytes(stream), (DocLoadOptions) options);
+        } else if (options instanceof ExcelLoadOptions) {
+            initFromXlsx(readAllBytes(stream), (ExcelLoadOptions) options);
+        } else if (options instanceof MarkdownLoadOptions) {
+            initFromMarkdown(readAllBytes(stream), (MarkdownLoadOptions) options);
         } else {
             throw new IllegalArgumentException("Unsupported LoadOptions type: "
                     + (options == null ? "null" : options.getClass().getName())
@@ -397,6 +407,171 @@ public class Document implements Closeable {
         org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
                 new org.aspose.pdf.sdm.layout.SdmPdfLayout().render(sdm, setup);
         adoptSdmPages(result.getDocument());
+    }
+
+    /**
+     * Loads (converts) an {@code .xlsx} spreadsheet: XLSX &rarr; SDM via
+     * {@code XlsxSdmReader} (one table per worksheet), then the shared
+     * {@code SdmPdfLayout} paginates the model &mdash; the same second half the
+     * HTML and DOCX loaders use. An explicit {@link ExcelLoadOptions#getPageInfo()}
+     * fixes the page geometry; otherwise a default page is used and wide tables
+     * wrap into it.
+     */
+    private void initFromXlsx(byte[] xlsx, ExcelLoadOptions options) throws IOException {
+        boolean interactive = options != null && options.isInteractiveForms();
+        org.aspose.pdf.sdm.xlsx.XlsxSdmReader reader = new org.aspose.pdf.sdm.xlsx.XlsxSdmReader();
+        reader.setInteractiveForms(interactive);
+        org.aspose.pdf.sdm.SdmDocument sdm = reader.read(xlsx);
+        PageInfo pi = options != null ? options.getPageInfo() : null;
+        org.aspose.pdf.sdm.layout.PageSetup setup = pageSetupFrom(pi);
+        // A spreadsheet has its own column widths; keep the page fixed so a wide
+        // table wraps/scales into it rather than stretching the sheet.
+        setup.setFixedSize(true);
+        org.aspose.pdf.sdm.layout.SdmPdfLayout layout = new org.aspose.pdf.sdm.layout.SdmPdfLayout();
+        org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result = layout.render(sdm, setup);
+        adoptSdmPages(result.getDocument());
+        if (interactive) {
+            // Create the form fields ONCE on this (adopting) document from the
+            // placements recorded during layout — NOT in the layout document.
+            // Adopting a document that already has fields imports each widget twice
+            // (page import + form re-registration), leaving /AcroForm/Fields pointing
+            // at different objects than the /Annots widgets, which makes Acrobat hide
+            // values until a field gains focus. One clean creation pass avoids that.
+            createLiveFormFields(layout.getXlsxPlacements());
+            installLiveFormRuntime(
+                    (String) sdm.getAttributes().get("xlsx-doc-js"),
+                    asStringList(sdm.getAttributes().get("xlsx-calc-order")));
+        }
+    }
+
+    /**
+     * Loads (converts) a Markdown document: Markdown &rarr; SDM via
+     * {@code MarkdownSdmReader}, then the shared {@code SdmPdfLayout} paginates
+     * the model &mdash; the same second half the HTML, DOCX and XLSX loaders use.
+     * An explicit {@link MarkdownLoadOptions#getPageInfo()} fixes the page
+     * geometry; otherwise a default page is used and content reflows into it.
+     */
+    private void initFromMarkdown(byte[] md, MarkdownLoadOptions options) throws IOException {
+        org.aspose.pdf.sdm.markdown.MarkdownSdmReader reader =
+                new org.aspose.pdf.sdm.markdown.MarkdownSdmReader();
+        org.aspose.pdf.sdm.SdmDocument sdm = reader.read(md);
+        PageInfo pi = options != null ? options.getPageInfo() : null;
+        org.aspose.pdf.sdm.layout.PageSetup setup = pageSetupFrom(pi);
+        // Markdown carries no page geometry; keep the page fixed so wide tables
+        // wrap into it rather than stretching the page.
+        setup.setFixedSize(true);
+        org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
+                new org.aspose.pdf.sdm.layout.SdmPdfLayout().render(sdm, setup);
+        adoptSdmPages(result.getDocument());
+    }
+
+    /**
+     * Creates one AcroForm text field per recorded placement on this document's
+     * already-paginated pages. Each field is a single merged field+widget object
+     * referenced from both {@code /AcroForm/Fields} and its page {@code /Annots}.
+     */
+    private void createLiveFormFields(java.util.List<org.aspose.pdf.sdm.layout.SdmPdfLayout.XlsxFieldPlacement> placements)
+            throws IOException {
+        if (placements == null || placements.isEmpty()) {
+            return;
+        }
+        Form form = getForm();
+        PageCollection pages = getPages();
+        int pageCount = pages.getCount();
+        for (org.aspose.pdf.sdm.layout.SdmPdfLayout.XlsxFieldPlacement p : placements) {
+            if (p.pageNumber < 1 || p.pageNumber > pageCount) {
+                continue;
+            }
+            Page page = pages.get(p.pageNumber);
+            Rectangle rect = new Rectangle(p.llx, p.lly, p.urx, p.ury);
+            org.aspose.pdf.forms.TextBoxField tb = new org.aspose.pdf.forms.TextBoxField(page, rect);
+            tb.setPartialName(p.name);
+            tb.setQuadding(p.quadding);
+            if (p.value != null) {
+                tb.setValue(p.value);
+            }
+            if (p.readOnly) {
+                tb.setFieldFlags(tb.getFieldFlags() | 1); // /Ff bit 1 = ReadOnly
+            }
+            PdfDictionary aa = new PdfDictionary();
+            if (p.formatJs != null) {
+                aa.set(PdfName.of("F"), jsActionDict(p.formatJs));
+            }
+            if (p.calcJs != null) {
+                // Wrap so a runtime error leaves the cached value + baked /AP intact
+                // instead of blanking the field.
+                aa.set(PdfName.of("C"), jsActionDict("try{event.value = " + p.calcJs + ";}catch(_e){}"));
+            }
+            if (aa.size() > 0) {
+                tb.getPdfDictionary().set(PdfName.of("AA"), aa);
+            }
+            form.add(tb);
+        }
+    }
+
+    /** Builds a {@code /S /JavaScript} action dictionary with the given script. */
+    private static PdfDictionary jsActionDict(String js) {
+        PdfDictionary d = new PdfDictionary();
+        d.set(PdfName.of("S"), PdfName.of("JavaScript"));
+        d.set(PdfName.of("JS"), new org.aspose.pdf.engine.pdfobjects.PdfString(js));
+        return d;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.List<String> asStringList(Object o) {
+        return o instanceof java.util.List ? (java.util.List<String>) o : java.util.Collections.emptyList();
+    }
+
+    /**
+     * Wires the "live spreadsheet" pieces onto this document after pagination:
+     * the {@code AXL} JavaScript runtime as document-level JS
+     * ({@code /Names /JavaScript}), and the AcroForm calculation order
+     * ({@code /CO}) so Acrobat recomputes formula fields in dependency order.
+     * The per-field calculate/format actions were baked into the widgets during
+     * layout and carried over by the page import.
+     */
+    private void installLiveFormRuntime(String docJs, java.util.List<String> calcOrder)
+            throws IOException {
+        PdfDictionary catalog = getCatalog();
+        Form form = getForm();
+        PdfDictionary acro = form.getPdfDictionary();
+        // Ensure the AcroForm is reachable from the catalog even on a parser-less
+        // (freshly built) document, so the writer serialises it. When the catalog
+        // already links it (parser-backed doc), leave the existing reference alone.
+        if (catalog.get(PdfName.of("AcroForm")) == null) {
+            catalog.set(PdfName.of("AcroForm"), acro);
+        }
+
+        if (docJs != null && !docJs.isEmpty()) {
+            PdfDictionary jsAction = new PdfDictionary();
+            jsAction.set(PdfName.of("S"), PdfName.of("JavaScript"));
+            jsAction.set(PdfName.of("JS"), new org.aspose.pdf.engine.pdfobjects.PdfString(docJs));
+            org.aspose.pdf.engine.pdfobjects.PdfArray namesArr =
+                    new org.aspose.pdf.engine.pdfobjects.PdfArray();
+            namesArr.add(new org.aspose.pdf.engine.pdfobjects.PdfString("AXLRuntime"));
+            namesArr.add(jsAction);
+            PdfDictionary jsTree = new PdfDictionary();
+            jsTree.set(PdfName.of("Names"), namesArr);
+            PdfBase namesVal = catalog.get(PdfName.of("Names"));
+            PdfDictionary names = namesVal instanceof PdfDictionary
+                    ? (PdfDictionary) namesVal : new PdfDictionary();
+            names.set(PdfName.of("JavaScript"), jsTree);
+            catalog.set(PdfName.of("Names"), names);
+        }
+
+        if (calcOrder != null && !calcOrder.isEmpty()) {
+            org.aspose.pdf.engine.pdfobjects.PdfArray co =
+                    new org.aspose.pdf.engine.pdfobjects.PdfArray();
+            for (String name : calcOrder) {
+                org.aspose.pdf.forms.Field f = form.get(name);
+                if (f != null) {
+                    co.add(f.getPdfDictionary());
+                }
+            }
+            if (co.size() > 0) {
+                acro.set(PdfName.of("CO"), co);
+            }
+        }
     }
 
     /**
@@ -528,6 +703,18 @@ public class Document implements Closeable {
         // the writer recorded (PDF->HTML->PDF), so a wide/landscape original is not
         // reflowed into portrait (which explodes page counts and clips text).
         if (!callerGeometry) {
+            applySdmPageSize(setup, sdm);
+        }
+        // A fixed-layout export (PDF->HTML->PDF) carries absolutely positioned
+        // content sized to its own page; never auto-widen it for "wide tables".
+        // Its embedded page size is a pixel-exact reproduction of the source, so
+        // it is AUTHORITATIVE even when the caller passed options: an empty
+        // HtmlLoadOptions eagerly seeds a default A4 PageInfo, so the
+        // callerGeometry guard above would otherwise clamp every landscape /
+        // odd-size fixed page to A4 and crush it. Only OUR own exporter sets this
+        // flag, so honouring the SDM size here cannot hijack a genuine caller size.
+        if ("1".equals(sdm.getMetadata().getCustom().get("fixed-layout"))) {
+            setup.setFixedSize(true);
             applySdmPageSize(setup, sdm);
         }
         org.aspose.pdf.sdm.layout.SdmPdfLayout.Result result =
@@ -1255,8 +1442,12 @@ public class Document implements Closeable {
     }
 
     public PageMode getPageMode() throws IOException {
-        if (parser == null) return PageMode.UseNone;
-        String mode = parser.getCatalog().getNameAsString("PageMode");
+        // Use the effective catalog: for documents created with new Document()
+        // the catalog lives in inMemoryCatalog (parser is null), and setPageMode
+        // writes there too — reading parser.getCatalog() would miss it.
+        PdfDictionary catalog = getCatalog();
+        if (catalog == null) return PageMode.UseNone;
+        String mode = catalog.getNameAsString("PageMode");
         if (mode == null) return PageMode.UseNone;
         try {
             return PageMode.valueOf(mode);
@@ -1272,8 +1463,12 @@ public class Document implements Closeable {
      * @throws IOException if writing to the catalog fails
      */
     public void setPageMode(PageMode mode) throws IOException {
-        if (parser != null) {
-            parser.getCatalog().set(PdfName.of("PageMode"), PdfName.of(mode.name()));
+        // Write to the effective catalog so it works for both parsed documents
+        // and ones created with new Document() (whose catalog is inMemoryCatalog;
+        // save() syncs those keys into the written catalog).
+        PdfDictionary catalog = getCatalog();
+        if (catalog != null) {
+            catalog.set(PdfName.of("PageMode"), PdfName.of(mode.name()));
         }
     }
 
@@ -1461,21 +1656,7 @@ public class Document implements Closeable {
         // via TextFragment.setText (and other mutations to the cached ops)
         // would silently disappear on save.
         flushDirtyPages();
-        // PDFNET-38279: render any header/footer applied to the pages of a
-        // loaded document as a Form XObject overlay. The new-document path
-        // (saveNewDocument -> LayoutEngine.layout) already renders header/footer
-        // from paragraphs, so this only runs for parser-backed documents to
-        // avoid double rendering.
-        if (parser != null && pages != null) {
-            int totalPages = pages.size();
-            int pageNum = 0;
-            for (Page page : pages) {
-                pageNum++;
-                if (page.getHeader() != null || page.getFooter() != null) {
-                    page.applyHeaderFooterOverlay(pageNum, totalPages);
-                }
-            }
-        }
+        renderPendingPageOverlays();
         boolean repairedPageTree = false;
         if (parser != null) {
             PageCollection documentPages = getPages();
@@ -1777,6 +1958,24 @@ public class Document implements Closeable {
     }
 
     /**
+     * Removes the given objects from the underlying parser so they are not
+     * written on the next full rewrite. Used to drop object subtrees that became
+     * orphaned by an in-memory edit (e.g. embedded font programs left unreferenced
+     * by {@code FontReplace.RemoveUnusedFonts}). Safe to call with keys that are
+     * unknown or already removed.
+     *
+     * @param keys the object keys to drop
+     */
+    public void removeParserObjects(java.util.Collection<PdfObjectKey> keys) {
+        if (parser == null || keys == null) {
+            return;
+        }
+        for (PdfObjectKey key : keys) {
+            parser.removeObject(key);
+        }
+    }
+
+    /**
      * Returns whether the current document is linearized for fast web view.
      * <p>
      * For documents opened from a file or byte array this inspects the source bytes
@@ -1937,6 +2136,10 @@ public class Document implements Closeable {
             save(filePath, new HtmlSaveOptions());
         } else if (format == SaveFormat.DocX || format == SaveFormat.Doc) {
             save(filePath, new DocSaveOptions());
+        } else if (format == SaveFormat.Xlsx || format == SaveFormat.Excel) {
+            save(filePath, new ExcelSaveOptions());
+        } else if (format == SaveFormat.Markdown) {
+            save(filePath, new MarkdownSaveOptions());
         } else {
             save(filePath);
         }
@@ -1957,6 +2160,10 @@ public class Document implements Closeable {
             save(outputStream, new HtmlSaveOptions());
         } else if (format == SaveFormat.DocX || format == SaveFormat.Doc) {
             save(outputStream, new DocSaveOptions());
+        } else if (format == SaveFormat.Xlsx || format == SaveFormat.Excel) {
+            save(outputStream, new ExcelSaveOptions());
+        } else if (format == SaveFormat.Markdown) {
+            save(outputStream, new MarkdownSaveOptions());
         } else {
             save(outputStream);
         }
@@ -1980,12 +2187,21 @@ public class Document implements Closeable {
             save(filePath, (HtmlSaveOptions) options);
         } else if (options instanceof DocSaveOptions) {
             save(filePath, (DocSaveOptions) options);
+        } else if (options instanceof ExcelSaveOptions) {
+            save(filePath, (ExcelSaveOptions) options);
+        } else if (options instanceof MarkdownSaveOptions) {
+            save(filePath, (MarkdownSaveOptions) options);
         } else if (options instanceof PdfSaveOptions) {
             save(filePath, (PdfSaveOptions) options);
         } else if (options.getSaveFormat() == SaveFormat.Html) {
             save(filePath, new HtmlSaveOptions());
         } else if (options.getSaveFormat() == SaveFormat.DocX) {
             save(filePath, new DocSaveOptions());
+        } else if (options.getSaveFormat() == SaveFormat.Xlsx
+                || options.getSaveFormat() == SaveFormat.Excel) {
+            save(filePath, new ExcelSaveOptions());
+        } else if (options.getSaveFormat() == SaveFormat.Markdown) {
+            save(filePath, new MarkdownSaveOptions());
         } else {
             save(filePath);
         }
@@ -2005,6 +2221,11 @@ public class Document implements Closeable {
             throw new IllegalArgumentException("File path must not be null");
         }
         flushDirtyPages();
+        // Materialize paragraphs / header-footer added to the pages of a loaded
+        // document. The linearized and compressed writers below serialise straight
+        // from the parser and never route through save(OutputStream), so without
+        // this the authored text of a newly appended page would be dropped.
+        renderPendingPageOverlays();
         // Linearize / compressed writers re-read from the parser's reader while
         // building the output, so opening a FileOutputStream on the same path
         // first (which truncates on Windows) would yank the parser's bytes out
@@ -2016,31 +2237,73 @@ public class Document implements Closeable {
             if (parser == null) {
                 throw new IOException("Cannot linearize a new (unparsed) document");
             }
-            if (sameFile) {
-                saveToSameFileWith(filePath, fos -> {
-                    LinearizedPDFWriter writer = new LinearizedPDFWriter();
-                    writer.write(fos, parser, parser.getTrailer());
-                });
-            } else {
-                try (FileOutputStream fos = new FileOutputStream(filePath)) {
-                    LinearizedPDFWriter writer = new LinearizedPDFWriter();
-                    writer.write(fos, parser, parser.getTrailer());
+            // The overlay above registers its Form XObject in pendingImports, which
+            // the linearized writer (reading purely from the parser) cannot see.
+            // Bake pending edits into a concrete object graph and linearize that.
+            Document baked = bakedForStructuralWrite();
+            final PDFParser writeParser = baked != null ? baked.getParser() : parser;
+            try {
+                if (sameFile) {
+                    saveToSameFileWith(filePath, fos -> {
+                        LinearizedPDFWriter writer = new LinearizedPDFWriter();
+                        writer.write(fos, writeParser, writeParser.getTrailer());
+                    });
+                } else {
+                    try (FileOutputStream fos = new FileOutputStream(filePath)) {
+                        LinearizedPDFWriter writer = new LinearizedPDFWriter();
+                        writer.write(fos, writeParser, writeParser.getTrailer());
+                    }
                 }
+            } finally {
+                if (baked != null) baked.close();
             }
         } else if (options != null && (options.isUseObjectStreams() || options.isUseXRefStream())) {
             if (parser == null) {
                 throw new IOException("Cannot write compressed: no parser (new document)");
             }
-            if (sameFile) {
-                saveToSameFileWith(filePath, fos -> saveCompressed(fos, options));
-            } else {
-                try (FileOutputStream fos = new FileOutputStream(filePath)) {
-                    saveCompressed(fos, options);
+            // Same pendingImports concern as the linearize path: bake first when
+            // there are in-memory overlays, then write from the reparsed graph.
+            Document baked = bakedForStructuralWrite();
+            final Document writeDoc = baked != null ? baked : this;
+            try {
+                if (sameFile) {
+                    saveToSameFileWith(filePath, fos -> writeDoc.saveCompressed(fos, options));
+                } else {
+                    try (FileOutputStream fos = new FileOutputStream(filePath)) {
+                        writeDoc.saveCompressed(fos, options);
+                    }
                 }
+            } finally {
+                if (baked != null) baked.close();
             }
         } else {
             save(filePath);
         }
+    }
+
+    /**
+     * Bakes any in-memory edits held in {@link #pendingImports} (paragraph and
+     * header/footer overlays applied to the pages of a loaded document) into a
+     * concrete object graph, by performing an in-memory full rewrite and
+     * reparsing the result. Returned so the linearized / compressed writers —
+     * which serialise straight from a {@link PDFParser} and cannot see
+     * pendingImports — can write from a self-contained parser.
+     * <p>
+     * Callers must {@link #close()} the returned document. Returns {@code null}
+     * when there is nothing to bake, in which case the writer should use this
+     * document's own parser directly.
+     * </p>
+     *
+     * @return a reparsed document carrying the baked edits, or {@code null}
+     * @throws IOException if the intermediate rewrite or reparse fails
+     */
+    private Document bakedForStructuralWrite() throws IOException {
+        if (pendingImports.isEmpty()) {
+            return null;
+        }
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        saveFullRewrite(buf);
+        return new Document(new java.io.ByteArrayInputStream(buf.toByteArray()));
     }
 
     /**
@@ -2127,10 +2390,63 @@ public class Document implements Closeable {
         if (options == null) {
             options = new HtmlSaveOptions();
         }
-        if (options.getOutputMode() == HtmlOutputMode.STRUCTURAL) {
-            return org.aspose.pdf.sdm.html.StructuralHtmlPipeline.toHtml(this, options);
+        Document renderDoc = materializeDynamicXfaForHtml();
+        try {
+            if (options.getOutputMode() == HtmlOutputMode.STRUCTURAL) {
+                return org.aspose.pdf.sdm.html.StructuralHtmlPipeline.toHtml(renderDoc, options);
+            }
+            return new PdfToHtmlConverter().convert(renderDoc, options);
+        } finally {
+            if (renderDoc != this) {
+                try {
+                    renderDoc.close();
+                } catch (IOException ignore) {
+                    // best-effort cleanup of the transient painted document
+                }
+            }
         }
-        return new PdfToHtmlConverter().convert(this, options);
+    }
+
+    /**
+     * Returns the document whose pages the HTML export should convert.
+     *
+     * <p>A <em>dynamic</em> XFA form (ISO 32000-1:2008 §12.7.8) ships only a
+     * static "Please wait…" placeholder page in the PDF body — the real form
+     * lives in the XFA XML and is laid out by the viewer at open time. The
+     * catalog's {@code /NeedsRendering} flag marks such documents. Converting
+     * the placeholder to HTML would lose the entire form, so here we paint the
+     * paginated XFA (binding + load scripts) into a fresh document and convert
+     * THAT instead, giving the user the actual form. Any failure — no template,
+     * paint produced nothing, or an engine error — falls back to converting the
+     * original page(s) unchanged, so non-XFA and hybrid/static-XFA documents are
+     * never disturbed.</p>
+     *
+     * @return a transient painted document (caller must close it) when the XFA
+     *         was materialized, otherwise {@code this}
+     */
+    private Document materializeDynamicXfaForHtml() {
+        try {
+            if (!getCatalog().getBoolean("NeedsRendering", false)) {
+                return this;
+            }
+            Form form = getForm();
+            org.aspose.pdf.forms.xfa.XfaForm xfa = form != null ? form.getXFA() : null;
+            if (xfa == null || xfa.getTemplate() == null) {
+                return this;
+            }
+            Document painted = new Document();
+            org.aspose.pdf.engine.xfa.flatten.layout.XfaPaginator.Result r =
+                    xfa.paintPaginatedContent(painted);
+            if (r == null || r.pages <= 0 || painted.getPages().getCount() == 0) {
+                painted.close();
+                return this;
+            }
+            LOG.fine(() -> "Materialized dynamic XFA into " + r.pages + " page(s) for HTML export");
+            return painted;
+        } catch (Throwable t) {
+            LOG.fine(() -> "Dynamic-XFA materialization for HTML skipped: " + t);
+            return this;
+        }
     }
 
     /**
@@ -2165,6 +2481,113 @@ public class Document implements Closeable {
         flushDirtyPages();
         org.aspose.pdf.sdm.docx.StructuralDocxPipeline.toDocx(this, options, outputStream);
         outputStream.flush();
+    }
+
+    /**
+     * Saves the document as an Office Open XML spreadsheet ({@code .xlsx}) with
+     * the specified options (IR structural pipeline). Recognised tables become
+     * worksheets of typed cells (number / date / boolean / text).
+     *
+     * @param filePath the output {@code .xlsx} file path
+     * @param options  Excel save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(String filePath, ExcelSaveOptions options) throws IOException {
+        if (filePath == null) {
+            throw new IllegalArgumentException("File path must not be null");
+        }
+        flushDirtyPages();
+        try (FileOutputStream fos = new FileOutputStream(filePath)) {
+            org.aspose.pdf.sdm.xlsx.StructuralXlsxPipeline.toXlsx(this, options, fos);
+        }
+    }
+
+    /**
+     * Converts the document to {@code .xlsx} and writes it to a stream.
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      Excel save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(OutputStream outputStream, ExcelSaveOptions options) throws IOException {
+        if (outputStream == null) {
+            throw new IllegalArgumentException("Output stream must not be null");
+        }
+        flushDirtyPages();
+        org.aspose.pdf.sdm.xlsx.StructuralXlsxPipeline.toXlsx(this, options, outputStream);
+        outputStream.flush();
+    }
+
+    /**
+     * Saves the document as Markdown ({@code .md}) with the specified options
+     * (IR structural pipeline). Headings, paragraphs, recognised tables, lists,
+     * emphasis, links and images are serialized as CommonMark / GitHub-Flavored
+     * Markdown. Referenced images are written into a sub-directory next to the
+     * output file (see {@link MarkdownSaveOptions#getResourcesDirectoryName()})
+     * unless inline embedding is requested.
+     *
+     * @param filePath the output {@code .md} file path
+     * @param options  Markdown save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(String filePath, MarkdownSaveOptions options) throws IOException {
+        if (filePath == null) {
+            throw new IllegalArgumentException("File path must not be null");
+        }
+        java.nio.file.Path path = java.nio.file.Path.of(filePath);
+        java.nio.file.Path dir = path.toAbsolutePath().getParent();
+        java.nio.file.Files.writeString(path, markdownText(options, dir), StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Converts the document to Markdown and writes it to a stream. A stream
+     * target has no folder for external image files, so images are embedded as
+     * {@code data:} URIs.
+     *
+     * @param outputStream the output stream (not closed by this method)
+     * @param options      Markdown save options; {@code null} means defaults
+     * @throws IOException if conversion or writing fails
+     */
+    public void save(OutputStream outputStream, MarkdownSaveOptions options) throws IOException {
+        if (outputStream == null) {
+            throw new IllegalArgumentException("Output stream must not be null");
+        }
+        outputStream.write(markdownText(options, null).getBytes(StandardCharsets.UTF_8));
+        outputStream.flush();
+    }
+
+    /**
+     * Converts the document to Markdown markup, embedding every image as a
+     * {@code data:} URI (Aspose.PDF has no {@code MarkdownText} accessor; this is
+     * the FOSS convenience mirror of {@link #htmlText(HtmlSaveOptions)}).
+     *
+     * @param options Markdown save options; {@code null} means defaults
+     * @return the Markdown text
+     * @throws IOException if conversion fails
+     */
+    public String markdownText(MarkdownSaveOptions options) throws IOException {
+        return markdownText(options, null);
+    }
+
+    private String markdownText(MarkdownSaveOptions options, java.nio.file.Path baseDir)
+            throws IOException {
+        flushDirtyPages();
+        if (options == null) {
+            options = new MarkdownSaveOptions();
+        }
+        Document renderDoc = materializeDynamicXfaForHtml();
+        try {
+            return org.aspose.pdf.sdm.markdown.StructuralMarkdownPipeline.toMarkdown(
+                    renderDoc, options, baseDir);
+        } finally {
+            if (renderDoc != this) {
+                try {
+                    renderDoc.close();
+                } catch (IOException ignore) {
+                    // best-effort cleanup of the transient painted document
+                }
+            }
+        }
     }
 
     /**
@@ -2231,12 +2654,17 @@ public class Document implements Closeable {
             save(outputStream, (HtmlSaveOptions) options);
         } else if (options instanceof DocSaveOptions) {
             save(outputStream, (DocSaveOptions) options);
+        } else if (options instanceof ExcelSaveOptions) {
+            save(outputStream, (ExcelSaveOptions) options);
         } else if (options instanceof PdfSaveOptions) {
             save(outputStream, (PdfSaveOptions) options);
         } else if (options.getSaveFormat() == SaveFormat.Html) {
             save(outputStream, new HtmlSaveOptions());
         } else if (options.getSaveFormat() == SaveFormat.DocX) {
             save(outputStream, new DocSaveOptions());
+        } else if (options.getSaveFormat() == SaveFormat.Xlsx
+                || options.getSaveFormat() == SaveFormat.Excel) {
+            save(outputStream, new ExcelSaveOptions());
         } else {
             save(outputStream);
         }
@@ -2935,7 +3363,14 @@ public class Document implements Closeable {
                         boolean replaced = false;
                         for (int i = 0; i < annots.size(); i++) {
                             PdfBase item = annots.get(i);
-                            if (item == fieldDict) {
+                            // The widget may already be in /Annots as the dict itself
+                            // OR as an indirect reference to it (AnnotationCollection.add
+                            // stores a reference — see PDFNET_42398). Match both, else a
+                            // field added via the form ends up listed in /Annots twice.
+                            boolean match = item == fieldDict
+                                    || (item instanceof PdfObjectReference
+                                        && fieldKey.equals(((PdfObjectReference) item).getKey()));
+                            if (match) {
                                 annots.set(i, fieldRef);
                                 replaced = true;
                                 break;
@@ -4653,6 +5088,42 @@ public void decrypt() throws IOException {
                 editedPageContentsThisSave = true;
             }
             p.flushContentsIfDirty();
+        }
+    }
+
+    /**
+     * Renders paragraph and header/footer overlays for the pages of a loaded
+     * document. The new-document path ({@code saveNewDocument} ->
+     * {@link org.aspose.pdf.engine.layout.LayoutEngine#layout}) already renders
+     * these from the paragraph list, so this only runs for parser-backed
+     * documents (to avoid double rendering). Each overlay is a Form XObject
+     * appended to the page's existing content, registered in
+     * {@link #pendingImports}.
+     * <p>
+     * PDFNET-38279 (header/footer) and the paragraph counterpart: a page that
+     * the caller built via {@code getParagraphs().add(...)} — most commonly a
+     * page freshly appended to a loaded document — would otherwise be written
+     * with no content, silently dropping the authored text.
+     * </p>
+     *
+     * @throws IOException if content-stream generation fails
+     */
+    private void renderPendingPageOverlays() throws IOException {
+        if (parser == null || pages == null) {
+            return;
+        }
+        int totalPages = pages.size();
+        int pageNum = 0;
+        for (Page page : pages) {
+            pageNum++;
+            // Runs before the header/footer overlay so page-numbering furniture
+            // sits on top of the body.
+            if (page.getParagraphs() != null && !page.getParagraphs().isEmpty()) {
+                page.applyParagraphOverlay();
+            }
+            if (page.getHeader() != null || page.getFooter() != null) {
+                page.applyHeaderFooterOverlay(pageNum, totalPages);
+            }
         }
     }
 

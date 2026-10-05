@@ -622,13 +622,28 @@ public class XImage {
 
     private BufferedImage createMaskImage(byte[] data, int w, int h) {
         BufferedImage img = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY);
+        // ISO 32000-1:2008 §8.9.6.2: in an image mask, sample value 0 marks the
+        // pixels that ARE painted (with the current fill colour — black in the
+        // typical scanned-ink case); sample value 1 leaves the background
+        // showing. The default /Decode is [0 1]; /Decode [1 0] swaps which
+        // sample paints. This method has no graphics context (it feeds image
+        // extraction and HTML embedding), so we render an opaque black-on-white
+        // preview: painted → black (0), unpainted → white (255).
+        //
+        // The previous mapping (bit 0 → 255 white, bit 1 → 0 black) was the
+        // photometric inverse: every full-page bilevel scan stored as an
+        // /ImageMask (e.g. CCITTFax fax pages) came out as a black sheet with
+        // white text. The on-page renderer uses buildStencilMaskImage instead,
+        // so only extraction/HTML consumers were affected.
+        boolean reversed = isDecodeReversed1Bit();
         int rowBytes = (w + 7) / 8;
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 int byteIndex = y * rowBytes + x / 8;
                 if (byteIndex < data.length) {
                     int bit = (data[byteIndex] >> (7 - (x % 8))) & 1;
-                    img.getRaster().setSample(x, y, 0, bit == 0 ? 255 : 0);
+                    boolean paint = reversed ? (bit == 1) : (bit == 0);
+                    img.getRaster().setSample(x, y, 0, paint ? 0 : 255);
                 }
             }
         }

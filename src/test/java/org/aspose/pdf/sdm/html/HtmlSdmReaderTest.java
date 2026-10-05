@@ -246,6 +246,89 @@ public class HtmlSdmReaderTest {
         throw new AssertionError("no run with text '" + text + "' in " + inlines);
     }
 
+    // ---- fixed-layout (PDF->HTML export) round-trip ------------------------
+
+    /** 1x1 PNG, used as a stand-in full-page underlay. */
+    private static final String PNG_1PX =
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+            + "AAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    @Test
+    public void fixedLayoutSpansBecomeFramedParagraphs() {
+        String html = "<html><body>"
+                + "<div class=\"page\" id=\"p1\" style=\"width:612px;height:792px;\">"
+                + "  <img class=\"v\" style=\"width:612px;height:792px;\" src=\"" + PNG_1PX + "\"/>"
+                + "  <span class=\"t\" style=\"left:72.0px;top:100.0px;font-size:10.0px;"
+                + "color:rgb(0,0,255);\">Hello</span>"
+                + "  <span class=\"t\" style=\"left:72.0px;top:120.0px;font-size:10.0px;\">World</span>"
+                + "</div>"
+                + "<div class=\"page\" id=\"p2\" style=\"width:612px;height:792px;\">"
+                + "  <span class=\"t\" style=\"left:50.0px;top:60.0px;font-size:12.0px;\">Page2</span>"
+                + "</div>"
+                + "</body></html>";
+        SdmDocument d = new HtmlSdmReader().read(html, null, null);
+
+        // Page geometry seeded from the first .page, zero margins, fixed flag.
+        assertEquals("612", d.getMetadata().getCustom().get("page-width"));
+        assertEquals("792", d.getMetadata().getCustom().get("page-height"));
+        assertEquals("0", d.getMetadata().getCustom().get("margin-left"));
+        assertEquals("1", d.getMetadata().getCustom().get("fixed-layout"));
+
+        // A framed paragraph per positioned span, at its exact page coordinate.
+        Paragraph hello = frameWithText(d, "Hello");
+        assertEquals(72.0, (Double) hello.getAttributes().get("frame-x-pt"), 0.01);
+        assertEquals(100.0, (Double) hello.getAttributes().get("frame-y-pt"), 0.01);
+        assertEquals(0xFF0000FF, ((Run) hello.getInline().get(0)).getStyle().getColor());
+        assertEquals(10.0, ((Run) hello.getInline().get(0)).getStyle().getFontSize(), 0.01);
+
+        // The full-page underlay is an out-of-flow, full-opacity backdrop figure.
+        boolean underlay = false;
+        for (SdmBlock b : d.getChildren()) {
+            if (b instanceof org.aspose.pdf.sdm.Figure
+                    && Boolean.TRUE.equals(b.getAttributes().get("background"))) {
+                underlay = true;
+                assertEquals(1.0, (Double) b.getAttributes().get("background-opacity"), 0.01);
+            }
+        }
+        assertTrue(underlay, "full-page underlay figure present");
+
+        // The first block of page 2 forces a fresh page (out-of-flow content
+        // never marks a page 'drawn', so page-break-before alone would collapse).
+        Paragraph page2 = frameWithText(d, "Page2");
+        assertEquals(Boolean.TRUE, page2.getAttributes().get("force-new-page"));
+    }
+
+    @Test
+    public void fixedLayoutRotatedPageSwapsSizeAndSetsRotate() {
+        String html = "<html><body>"
+                + "<div class=\"page\" id=\"p1\" style=\"width:792px;height:612px;\">"
+                + "  <div style=\"position:absolute;left:0;top:0;transform:translate(792px,0) rotate(90deg);\">"
+                + "    <span class=\"t\" style=\"left:20.0px;top:700.0px;font-size:8.0px;\">Rot</span>"
+                + "  </div>"
+                + "</div>"
+                + "</body></html>";
+        SdmDocument d = new HtmlSdmReader().read(html, null, null);
+        // Unrotated geometry: displayed 792x612 -> stored 612x792, /Rotate 90.
+        assertEquals("612", d.getMetadata().getCustom().get("page-width"));
+        assertEquals("792", d.getMetadata().getCustom().get("page-height"));
+        Paragraph rot = frameWithText(d, "Rot");
+        assertEquals(90, rot.getAttributes().get("page-rotate"));
+        // top=700 is only valid against the 792-tall unrotated page.
+        assertEquals(700.0, (Double) rot.getAttributes().get("frame-y-pt"), 0.01);
+    }
+
+    private static Paragraph frameWithText(SdmDocument d, String text) {
+        for (SdmBlock b : d.getChildren()) {
+            if (b instanceof Paragraph && !((Paragraph) b).getInline().isEmpty()) {
+                SdmInline in = ((Paragraph) b).getInline().get(0);
+                if (in instanceof Run && text.equals(((Run) in).getText())) {
+                    return (Paragraph) b;
+                }
+            }
+        }
+        throw new AssertionError("no framed paragraph with text '" + text + "'");
+    }
+
     private static Element bodyOf(String html) throws Exception {
         org.w3c.dom.Document dom = HtmlTagParser.parse(html);
         return (Element) dom.getElementsByTagName("body").item(0);

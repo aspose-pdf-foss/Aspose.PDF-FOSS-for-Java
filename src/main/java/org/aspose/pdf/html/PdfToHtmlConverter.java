@@ -87,9 +87,22 @@ public class PdfToHtmlConverter {
         double w = box.getWidth() * options.getScale();
         double h = box.getHeight() * options.getScale();
 
+        // A page's /Rotate (ISO 32000-1 §7.7.3.3, a multiple of 90 applied
+        // clockwise when displaying) swaps the visible dimensions for 90/270
+        // and turns the whole page. The vector underlay is rasterised by the
+        // renderer, which already applies /Rotate, so it is emitted at the
+        // DISPLAYED size. The positioned text/image/field layers, however,
+        // carry raw (unrotated) PDF coordinates, so they are wrapped in a
+        // container that CSS-rotates them into the displayed frame. Without
+        // this a landscape-authored /Rotate 270 form (41736) rendered sideways.
+        int rotate = ((page.getRotate() % 360) + 360) % 360;
+        boolean swap = rotate == 90 || rotate == 270;
+        double dispW = swap ? h : w;
+        double dispH = swap ? w : h;
+
         html.append(String.format(
             "<div class=\"page\" id=\"p%d\" style=\"width:%.0fpx;height:%.0fpx;\">\n",
-            pageNum, w, h));
+            pageNum, dispW, dispH));
 
         if (options.isFixedLayout()) {
             // Vector graphics first (DOM order matters little — .v carries
@@ -101,12 +114,21 @@ public class PdfToHtmlConverter {
             int underlayCap = Integer.getInteger("html.vectorUnderlayMaxPages", 200);
             if (options.isRasterizeVectorGraphics() && options.isEmbedImages()) {
                 if (pageNum <= underlayCap) {
-                    appendVectorUnderlay(html, page, options, w, h);
+                    // Underlay is already rasterised in the DISPLAYED orientation
+                    // (the renderer applies /Rotate), so it fills the .page box.
+                    appendVectorUnderlay(html, page, options, dispW, dispH);
                 } else if (pageNum == underlayCap + 1) {
                     LOG.warning("Vector underlay capped at " + underlayCap
                             + " pages — later pages omit vector graphics"
                             + " (-Dhtml.vectorUnderlayMaxPages to raise)");
                 }
+            }
+            // Positioned layers (text/images/fields) carry unrotated PDF
+            // coordinates; wrap them so a page /Rotate turns them as a unit.
+            boolean wrap = rotate != 0;
+            if (wrap) {
+                html.append("  <div style=\"")
+                    .append(rotationWrapperStyle(rotate, w, h)).append("\">\n");
             }
             // Fixed layout is a pixel-faithful visual copy: every glyph run keeps
             // its absolute PDF coordinate. Emitting detected tables as normal-flow
@@ -117,17 +139,44 @@ public class PdfToHtmlConverter {
             appendFixedLayoutContent(html, page, options, box,
                     java.util.Collections.<Rectangle>emptyList());
             appendFormFields(html, page, options, box);
+            appendImages(html, page, options, box);
+            if (wrap) {
+                html.append("  </div>\n");
+            }
         } else {
             // Reflowable layout: ruled tables render as real <table> markup
             // (PDFNET-39027); their text is excluded from the paragraph flow to
             // avoid duplicates.
             List<Rectangle> tableRects = appendTables(html, page, options, box);
             appendReflowableContent(html, page, options, box, tableRects);
+            appendImages(html, page, options, box);
         }
 
-        appendImages(html, page, options, box);
-
         html.append("</div>\n");
+    }
+
+    /**
+     * CSS for the wrapper that rotates the positioned (text/image/field) layers
+     * of a page whose /Rotate is non-zero. The wrapper keeps the UNROTATED
+     * content dimensions {@code w×h} and is turned about its top-left corner,
+     * then translated back into the visible quadrant so it exactly overlays the
+     * displayed .page box. /Rotate is clockwise (ISO 32000-1 §7.7.3.3).
+     */
+    private static String rotationWrapperStyle(int rotate, double w, double h) {
+        String base = "position:absolute;left:0;top:0;transform-origin:0 0;";
+        switch (rotate) {
+            case 90:
+                return base + String.format(Locale.US,
+                    "width:%.0fpx;height:%.0fpx;transform:translate(%.0fpx,0) rotate(90deg);", w, h, h);
+            case 180:
+                return base + String.format(Locale.US,
+                    "width:%.0fpx;height:%.0fpx;transform:translate(%.0fpx,%.0fpx) rotate(180deg);", w, h, w, h);
+            case 270:
+                return base + String.format(Locale.US,
+                    "width:%.0fpx;height:%.0fpx;transform:translate(0,%.0fpx) rotate(270deg);", w, h, w);
+            default:
+                return base + String.format(Locale.US, "width:%.0fpx;height:%.0fpx;", w, h);
+        }
     }
 
     /**
@@ -194,6 +243,12 @@ public class PdfToHtmlConverter {
         double scale = options.getScale();
         double pageH = box.getHeight();
 
+        // Type 3 fonts with no /ToUnicode yield non-recoverable text (their glyph
+        // codes map only to drawing procedures). Emitting them as spans prints
+        // the raw codes as garbage over the page; the vector underlay renders the
+        // real glyphs instead (see appendVectorUnderlay). Skip such fragments.
+        java.util.Set<String> type3NoUni = type3NoUnicodeFontNames(page);
+
         TextFragmentAbsorber absorber = new TextFragmentAbsorber();
         try {
             page.accept(absorber);
@@ -206,29 +261,41 @@ public class PdfToHtmlConverter {
             if (insideAny(tableRects, tf.getPosition())) {
                 continue;   // already rendered inside a <table>
             }
+            if (tf.getTextState() != null
+                    && type3NoUni.contains(tf.getTextState().getFontName())) {
+                continue;   // non-extractable Type 3 — carried by the vector underlay
+            }
             List<TextSegment> segments = tf.getSegments();
             if (segments == null || segments.isEmpty()) {
                 // Use fragment-level data
                 appendTextSpan(html, tf.getText(), tf.getPosition(), tf.getTextState(),
-                               scale, pageH, box.getLLX(), box.getLLY(), options);
+                               scale, pageH, options);
                 continue;
             }
             for (TextSegment seg : segments) {
                 appendTextSpan(html, seg.getText(), seg.getPosition(), seg.getTextState(),
-                               scale, pageH, box.getLLX(), box.getLLY(), options);
+                               scale, pageH, options);
             }
         }
     }
 
     private void appendTextSpan(StringBuilder html, String text, Position pos,
                                  TextState ts, double scale, double pageH,
-                                 double llx, double lly, HtmlSaveOptions options) {
+                                 HtmlSaveOptions options) {
         if (text == null || text.trim().isEmpty()) return;
         if (pos == null) return;
 
-        double x = (pos.getXIndent() - llx) * scale;
+        // TextExtractor already normalises every Position to the page box's
+        // lower-left origin (it subtracts page.getRect()'s LLX/LLY — see
+        // TextExtractor#flushText). The page box used here (getCropBox() with a
+        // MediaBox fallback) is the SAME box, so the coordinates are already
+        // box-relative; subtracting the origin again shifts the whole text
+        // layer off-page. A page with a non-zero-origin CropBox (e.g. p2:
+        // CropBox LLX 716 inside a wide MediaBox) rendered completely blank
+        // because every span landed at a large negative left.
+        double x = pos.getXIndent() * scale;
         double fontSize = (ts != null && ts.getFontSize() > 0) ? ts.getFontSize() * scale : 12 * scale;
-        double y = (pageH - (pos.getYIndent() - lly)) * scale - fontSize * 0.8;
+        double y = (pageH - pos.getYIndent()) * scale - fontSize * 0.8;
 
         StringBuilder style = new StringBuilder();
         style.append(String.format(Locale.US, "left:%.1fpx;top:%.1fpx;font-size:%.1fpx;", x, y, fontSize));
@@ -385,13 +452,121 @@ public class PdfToHtmlConverter {
      * text and image layers. This is what keeps charts, filled shapes, rules
      * and gradients visible in fixed-layout HTML.
      */
+    /**
+     * Resource names of this page's Type 3 fonts whose text is UNRECOVERABLE —
+     * a Type 3 font with no /ToUnicode AND whose /Encoding /Differences glyph
+     * names do not resolve to Unicode via the Adobe Glyph List (e.g. the custom
+     * {@code /1 /2 /3 …} names of 43255). Those fragments extract as raw byte
+     * codes (garbage), so they are dropped from the positioned text layer and
+     * rendered as graphics by the vector underlay instead.
+     *
+     * <p>A Type 3 font whose Differences use standard glyph names ({@code /t
+     * /r /u …}) extracts as real text and is LEFT as spans — dropping it would
+     * lose readable, correctly-positioned content (regression on
+     * 3362589-trustsecurityworkshop, a Type 3 font with AGL-mappable names).
+     * Empty set when the page has no such font. Never throws.</p>
+     */
+    public static java.util.Set<String> type3NoUnicodeFontNames(Page page) {
+        java.util.Set<String> out = java.util.Collections.emptySet();
+        try {
+            org.aspose.pdf.Resources res = page.getResources();
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts =
+                    res != null ? res.getFonts() : null;
+            if (fonts == null) return out;
+            for (org.aspose.pdf.engine.pdfobjects.PdfName key : fonts.keySet()) {
+                org.aspose.pdf.engine.pdfobjects.PdfBase f = fonts.get(key.getName());
+                if (f instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+                    f = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) f).dereference();
+                }
+                if (!(f instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary)) continue;
+                org.aspose.pdf.engine.pdfobjects.PdfDictionary fd =
+                        (org.aspose.pdf.engine.pdfobjects.PdfDictionary) f;
+                if ("Type3".equals(fd.getNameAsString("Subtype"))
+                        && fd.get("ToUnicode") == null
+                        && !encodingNamesResolveToUnicode(fd)) {
+                    if (out.isEmpty()) out = new java.util.HashSet<>();
+                    out.add(key.getName());
+                }
+            }
+        } catch (Exception e) {
+            LOG.fine("Type3 font scan failed: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * True when the font's {@code /Encoding /Differences} maps the majority of
+     * its glyph names to Unicode via the Adobe Glyph List — i.e. text extraction
+     * yields real characters. Absent Differences (a base encoding only) also
+     * counts as resolvable (standard encoding). Used to tell an extractable
+     * Type 3 font from one whose custom names produce garbage.
+     */
+    private static boolean encodingNamesResolveToUnicode(
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fontDict) {
+        try {
+            org.aspose.pdf.engine.pdfobjects.PdfBase enc = fontDict.get("Encoding");
+            if (enc instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+                enc = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) enc).dereference();
+            }
+            if (!(enc instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary)) {
+                return true; // named/base encoding → standard glyph names
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfBase diff =
+                    ((org.aspose.pdf.engine.pdfobjects.PdfDictionary) enc).get("Differences");
+            if (diff instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+                diff = ((org.aspose.pdf.engine.pdfobjects.PdfObjectReference) diff).dereference();
+            }
+            if (!(diff instanceof org.aspose.pdf.engine.pdfobjects.PdfArray)) {
+                return true; // no Differences → base encoding
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfArray da =
+                    (org.aspose.pdf.engine.pdfobjects.PdfArray) diff;
+            int total = 0, mapped = 0;
+            for (int i = 0; i < da.size(); i++) {
+                org.aspose.pdf.engine.pdfobjects.PdfBase e = da.get(i);
+                if (!(e instanceof org.aspose.pdf.engine.pdfobjects.PdfName)) continue;
+                String gn = ((org.aspose.pdf.engine.pdfobjects.PdfName) e).getName();
+                if (".notdef".equals(gn)) continue;
+                total++;
+                if (org.aspose.pdf.engine.font.AdobeGlyphList.getUnicode(gn) >= 0) mapped++;
+            }
+            if (total == 0) return true;
+            return mapped * 2 >= total; // majority resolvable → treat as text
+        } catch (Exception e) {
+            return true; // on any doubt, keep as text (never drop readable content)
+        }
+    }
+
     private void appendVectorUnderlay(StringBuilder html, Page page,
                                       HtmlSaveOptions options, double wPx, double hPx) {
         try {
+            // The .i image layer carries rasters that ImagePlacementAbsorber
+            // surfaces (images painted with Do). But a page can also paint
+            // rasters through mechanisms the absorber does not report — an
+            // image-based tiling/shading pattern (a PowerPoint slide's photo
+            // background is a pattern fill) or an inline BI/ID/EI image. Those
+            // land in NO layer: not text, not .i, and normally not the underlay
+            // either (it suppresses rasters). So when the page has no discrete
+            // image placements, let the underlay keep raster content so the
+            // pattern/inline background survives; when placements do exist we
+            // still suppress to avoid painting the .i rasters twice.
+            boolean hasPlacements = false;
+            try {
+                ImagePlacementAbsorber probe = new ImagePlacementAbsorber();
+                page.accept(probe);
+                hasPlacements = !probe.getImagePlacements().isEmpty();
+            } catch (Exception ignore) {
+                // absorber failure → default to suppressing (safe: current behavior)
+                hasPlacements = true;
+            }
             org.aspose.pdf.engine.render.PdfPageRenderer renderer =
                     new org.aspose.pdf.engine.render.PdfPageRenderer();
             renderer.setSuppressText(true);
-            renderer.setSuppressRasterImages(true);
+            renderer.setSuppressRasterImages(hasPlacements);
+            // Non-extractable Type 3 glyphs are dropped from the text layer
+            // (they would print as garbage codes); keep them painted here so the
+            // underlay carries them as the graphics they actually are.
+            renderer.setSuppressTextKeepType3(!type3NoUnicodeFontNames(page).isEmpty());
             // 2x the CSS pixel density so the underlay stays crisp when the
             // browser composites it under the text.
             double dpi = 144.0 * options.getScale();
@@ -596,11 +771,39 @@ public class PdfToHtmlConverter {
 
     public static String escapeHtml(String text) {
         if (text == null) return "";
-        return text.replace("&", "&amp;")
+        return stripInvalidXmlChars(text)
+                   .replace("&", "&amp;")
                    .replace("<", "&lt;")
                    .replace(">", "&gt;")
                    .replace("\"", "&quot;")
                    .replace("'", "&#39;");
+    }
+
+    /**
+     * Drops characters that are illegal in XML 1.0 (§2.2): the C0 control range
+     * except tab/LF/CR, plus the non-characters U+FFFE/U+FFFF. PDF text extracted
+     * from non-Unicode/symbol fonts frequently carries such control bytes; left in
+     * place they render as garbage and — because the HTML export is parsed back by
+     * a strict XML reader on the HTML->PDF return leg — abort the whole parse.
+     */
+    private static String stripInvalidXmlChars(String text) {
+        boolean clean = true;
+        for (int i = 0; i < text.length(); i++) {
+            if (!isValidXmlChar(text.charAt(i))) { clean = false; break; }
+        }
+        if (clean) return text;
+        StringBuilder sb = new StringBuilder(text.length());
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (isValidXmlChar(c)) sb.append(c);
+        }
+        return sb.toString();
+    }
+
+    private static boolean isValidXmlChar(char c) {
+        return c == 0x09 || c == 0x0A || c == 0x0D
+                || (c >= 0x20 && c <= 0xD7FF)
+                || (c >= 0xE000 && c <= 0xFFFD);
     }
 
     private static int clamp255(double v) {

@@ -75,6 +75,12 @@ public final class FillBackgroundEnricher {
             return bx >= x - SLACK && by >= y - SLACK
                     && bx + bw <= x + w + SLACK && by + bh <= y + h + SLACK;
         }
+        /** Overlap area with the rectangle (bx,by,bw,bh). */
+        double overlap(double bx, double by, double bw, double bh) {
+            double ix = Math.max(0, Math.min(x + w, bx + bw) - Math.max(x, bx));
+            double iy = Math.max(0, Math.min(y + h, by + bh) - Math.max(y, by));
+            return ix * iy;
+        }
     }
 
     /**
@@ -132,13 +138,86 @@ public final class FillBackgroundEnricher {
                     walk(li.getChildren(), pgm, fills);
                 }
             } else if (b instanceof Table) {
-                for (TableRow r : ((Table) b).getRows()) {
+                Table t = (Table) b;
+                Object pg = t.getAttributes().get("table-page");
+                int tablePage = pg instanceof Integer ? (Integer) pg : -1;
+                for (TableRow r : t.getRows()) {
                     for (TableCell c : r.getCells()) {
+                        // Prefer the recorded cell rectangle (the synthesized cell's
+                        // paragraph ids rarely resolve in the PGM, so the id-based
+                        // applyBackground below would miss the shading).
+                        applyCellBackground(c, tablePage, fills);
                         walk(c.getChildren(), pgm, fills);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Assigns a background colour to a table cell from a coloured fill covering
+     * its recorded rectangle ({@code cell-bounds}). Unlike {@link #applyBackground},
+     * this does not need the cell's runs to resolve in the PGM — the heuristic
+     * table builder records the cell geometry directly. Picks the smallest fill
+     * covering at least 60% of the cell, skips near-white "erase" fills and fills
+     * that do not contrast with the cell text.
+     */
+    private static void applyCellBackground(TableCell cell, int page, List<Fill> fills) {
+        if (cell.getStyle() != null && cell.getStyle().getBackground() != 0) {
+            return; // already set
+        }
+        Object bounds = cell.getAttributes().get("cell-bounds");
+        if (!(bounds instanceof double[]) || page < 0) {
+            return;
+        }
+        double[] r = (double[]) bounds;
+        if (r.length != 4) {
+            return;
+        }
+        double cx = Math.min(r[0], r[2]);
+        double cy = Math.min(r[1], r[3]);
+        double cw = Math.abs(r[2] - r[0]);
+        double ch = Math.abs(r[3] - r[1]);
+        double cellArea = cw * ch;
+        if (cellArea <= 0) {
+            return;
+        }
+        Fill best = null;
+        for (Fill f : fills) {
+            if (f.page != page || isNearWhite(f.color)) {
+                continue;
+            }
+            if (f.overlap(cx, cy, cw, ch) < 0.6 * cellArea) {
+                continue;
+            }
+            if (best == null || f.area() < best.area()) {
+                best = f;
+            }
+        }
+        if (best == null) {
+            return;
+        }
+        if (Math.abs(luminance(best.color) - luminance(cellTextColor(cell))) < 0.25) {
+            return; // no contrast — burying the text under a solid block, skip
+        }
+        BlockStyle st = cell.getStyle();
+        if (st == null) {
+            st = new BlockStyle();
+            cell.setStyle(st);
+        }
+        st.setBackground(best.color);
+        best.source.setConsumedAsBackground(true);
+    }
+
+    /** Dominant text colour of a table cell (first explicit run colour; default black). */
+    private static int cellTextColor(TableCell cell) {
+        for (SdmBlock child : cell.getChildren()) {
+            int c = blockTextColor(child);
+            if (c != 0xFF000000) {
+                return c;
+            }
+        }
+        return 0xFF000000;
     }
 
     private static void applyBackground(SdmBlock b, PgmModel pgm, List<Fill> fills) {

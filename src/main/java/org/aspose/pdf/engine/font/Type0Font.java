@@ -24,6 +24,8 @@ public class Type0Font extends PdfFont {
     private CIDFont descendantFont;
     private String encodingName;
     private boolean isIdentity;
+    /** True for a predefined {@code *-UTF16-*} CMap whose codes ARE UTF-16BE. */
+    private boolean isUtf16;
 
     /**
      * Creates a Type0Font from a font dictionary.
@@ -54,6 +56,16 @@ public class Type0Font extends PdfFont {
     @Override
     public String decode(byte[] charCodes) throws IOException {
         StringBuilder sb = new StringBuilder();
+
+        if (isUtf16) {
+            // Codes ARE UTF-16BE code units — decode straight to Unicode.
+            // Without this the non-identity path below (no ToUnicode for this
+            // font) split every 2-byte code into two Latin-1 characters, so the
+            // renderer drew stray glyphs (corpus 43484 KozGoPr6N-Medium /
+            // UniJIS-UTF16-H came out as an unreadable smear) and extraction
+            // produced raw-byte garbage.
+            return new String(charCodes, java.nio.charset.StandardCharsets.UTF_16BE);
+        }
 
         if (isIdentity) {
             // Identity-H/V: each 2 bytes = one CID
@@ -192,5 +204,9 @@ public class Type0Font extends PdfFont {
             this.encodingName = "Identity-H";
         }
         this.isIdentity = "Identity-H".equals(encodingName) || "Identity-V".equals(encodingName);
+        // Predefined Adobe CMaps whose name carries "UTF16" (UniJIS-UTF16-H,
+        // UniGB-UTF16-H, UniKS-UTF16-H, UniCNS-UTF16-H, …) encode each character
+        // as a UTF-16BE code unit — the code IS the Unicode. §9.7.5.2.
+        this.isUtf16 = encodingName != null && encodingName.contains("UTF16");
     }
 }

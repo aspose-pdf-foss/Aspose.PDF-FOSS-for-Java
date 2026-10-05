@@ -595,6 +595,112 @@ public class Form implements AutoCloseable {
     }
 
     /**
+     * Exports all form fields to a JSON array (indented), one object per named field
+     * with {@code Name}, {@code Flags} and {@code Value}.
+     *
+     * @param jsonStream destination stream; must not be {@code null}
+     */
+    public void exportJson(OutputStream jsonStream) {
+        exportJson(jsonStream, true);
+    }
+
+    /**
+     * Exports all form fields to a JSON array.
+     *
+     * @param jsonStream destination stream; must not be {@code null}
+     * @param indented   whether to pretty-print (multi-line) or emit a single line
+     */
+    public void exportJson(OutputStream jsonStream, boolean indented) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        java.util.List<org.aspose.pdf.forms.FormJsonSupport.FieldEntry> entries =
+                new java.util.ArrayList<>();
+        try {
+            org.aspose.pdf.forms.Form form = document != null ? document.getForm() : null;
+            if (form != null) {
+                Field[] fields = form.getFields();
+                if (fields != null) {
+                    for (Field field : fields) {
+                        String name = field.getPartialName();
+                        if (name == null || name.isEmpty()) {
+                            name = field.getFullName();
+                        }
+                        if (name == null || name.isEmpty()) {
+                            continue;
+                        }
+                        String value = field.getValue();
+                        entries.add(new org.aspose.pdf.forms.FormJsonSupport.FieldEntry(
+                                name, field.getFieldFlags(), value == null ? "" : value));
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.warning("exportJson: failed to enumerate fields: " + e.getMessage());
+        }
+        String json = org.aspose.pdf.forms.FormJsonSupport.toJson(entries, indented);
+        try {
+            jsonStream.write(json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            jsonStream.flush();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to write JSON form data", e);
+        }
+    }
+
+    /**
+     * Imports form field values from a JSON array previously produced by
+     * {@link #exportJson(OutputStream)}. Each object's {@code Value} is applied to the
+     * field whose name matches {@code Name}. Unknown fields are ignored.
+     *
+     * @param jsonStream the JSON input stream
+     */
+    @SuppressWarnings("unchecked")
+    public void importJson(InputStream jsonStream) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        String json;
+        try {
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = jsonStream.read(chunk)) != -1) {
+                buf.write(chunk, 0, n);
+            }
+            json = new String(buf.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to read JSON form data", e);
+        }
+        Object parsed = org.aspose.pdf.forms.FormJsonSupport.parse(json.trim());
+        if (!(parsed instanceof java.util.List)) {
+            return;
+        }
+        org.aspose.pdf.forms.Form form = requireBoundForm();
+        if (form == null) {
+            return;
+        }
+        for (Object item : (java.util.List<Object>) parsed) {
+            if (!(item instanceof java.util.Map)) {
+                continue;
+            }
+            java.util.Map<String, Object> obj = (java.util.Map<String, Object>) item;
+            Object name = obj.get("Name");
+            Object value = obj.get("Value");
+            if (name == null) {
+                continue;
+            }
+            Field field = form.get(name.toString());
+            if (field != null && value != null) {
+                try {
+                    field.setValue(value.toString());
+                } catch (Exception e) {
+                    LOG.fine("importJson: could not set '" + name + "': " + e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
      * Saves to the destination remembered by the {@code (input, output)} ctor.
      * Throws {@link IllegalStateException} if no output destination was bound.
      *

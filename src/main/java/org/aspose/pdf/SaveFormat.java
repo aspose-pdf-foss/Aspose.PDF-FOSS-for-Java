@@ -17,5 +17,24 @@ public enum SaveFormat {
      */
     Doc,
     /** XML format. */
-    Xml
+    Xml,
+    /**
+     * Office Open XML spreadsheet format ({@code .xlsx}). Tables recognised in
+     * the source are exported as worksheets of typed cells (see
+     * {@link ExcelSaveOptions}).
+     */
+    Xlsx,
+    /**
+     * Alias of {@link #Xlsx} kept for Aspose.PDF API compatibility
+     * ({@code SaveFormat.Excel}). The FOSS writer emits an {@code .xlsx}
+     * package regardless of the requested spreadsheet flavour.
+     */
+    Excel,
+    /**
+     * Markdown format ({@code .md}). The document is projected to the structural
+     * model and serialized as CommonMark / GitHub-Flavored Markdown (headings,
+     * paragraphs, pipe tables, lists, emphasis, links, images). See
+     * {@link MarkdownSaveOptions}.
+     */
+    Markdown
 }

@@ -42,6 +42,14 @@ public class PageCollection implements Iterable<Page> {
     private final java.util.Map<Document, DocumentPageImporter> importers = new java.util.IdentityHashMap<>();
     private boolean treeRepairAttempted;
     private boolean treeRepaired;
+    /**
+     * Number of /Kids slots encountered during the last flatten pass whose child
+     * resolved to null (a missing/free object). Bounds the blank-placeholder
+     * padding used to honour a declared /Count on damaged files, so a corrupt
+     * /Count can never make us allocate more pages than the tree actually has
+     * slots for.
+     */
+    private int unresolvedKidSlots;
 
     /**
      * Creates a PageCollection wrapping the /Pages root dictionary.
@@ -695,12 +703,28 @@ public class PageCollection implements Iterable<Page> {
             return;
         }
         flatPages = new ArrayList<>();
+        unresolvedKidSlots = 0;
         flattenNode(pagesDict, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
         if (parser != null && !treeRepairAttempted && getDeclaredPageCount() > flatPages.size()) {
             try {
                 repairBrokenTreeIfNeeded();
             } catch (IOException e) {
                 LOG.warning("Failed to repair malformed page tree during flatten: " + e.getMessage());
+            }
+        }
+        // Last resort for a damaged tree: /Count still declares more pages than
+        // are reachable AND recovery could not find the missing page objects
+        // (they are free/absent in the xref). Pad with blank placeholder pages so
+        // the declared count and 1-based page indices are preserved — matching
+        // Aspose's lenient behaviour, where get(n) on such a file returns a blank
+        // page instead of throwing. Padding is capped by unresolvedKidSlots so a
+        // corrupt /Count can never trigger an unbounded allocation.
+        int declared = getDeclaredPageCount();
+        if (declared > flatPages.size() && unresolvedKidSlots > 0) {
+            int pad = Math.min(declared - flatPages.size(), unresolvedKidSlots);
+            LOG.warning(() -> "Padding damaged page tree with blank placeholder pages");
+            for (int i = 0; i < pad; i++) {
+                flatPages.add(createPlaceholderPage());
             }
         }
         // Assign 1-based page numbers
@@ -859,6 +883,11 @@ public class PageCollection implements Iterable<Page> {
                     if (child instanceof PdfDictionary) {
                         flattenNode((PdfDictionary) child, ancestors);
                     } else {
+                        // A /Kids slot whose child is null/free — the page object
+                        // is missing from the xref. Record the slot so the flatten
+                        // pass can later pad a blank placeholder for it (see
+                        // ensureFlattened) rather than silently dropping the page.
+                        unresolvedKidSlots++;
                         LOG.warning(() -> "Unexpected non-dictionary child in /Kids");
                     }
                 }
@@ -883,6 +912,25 @@ public class PageCollection implements Iterable<Page> {
                 LOG.fine(() -> "Skipping unknown node type: " + type);
             }
         }
+    }
+
+    /**
+     * Builds a blank in-memory placeholder page (A4) used to fill a /Kids slot
+     * whose real page object is missing on a damaged file. The placeholder dict
+     * is <em>not</em> wired into the root /Kids array, so it does not alter the
+     * saved document — it only preserves the declared page count and index space
+     * for read-side callers.
+     *
+     * @return a fresh blank Page bound to this collection's owning document
+     */
+    private Page createPlaceholderPage() {
+        PdfDictionary placeholder = new PdfDictionary();
+        placeholder.set(PdfName.TYPE, PdfName.PAGE);
+        placeholder.set(PdfName.MEDIABOX, new Rectangle(0, 0, 595, 842).toPdfArray());
+        placeholder.set(PdfName.PARENT, pagesDict);
+        Page page = new Page(placeholder, parser);
+        page.setOwningDocument(owningDocument);
+        return page;
     }
 
     private int getDeclaredPageCount() {

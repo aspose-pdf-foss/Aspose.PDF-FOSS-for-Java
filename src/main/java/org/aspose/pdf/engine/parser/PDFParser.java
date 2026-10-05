@@ -456,6 +456,25 @@ public final class PDFParser implements Closeable {
     }
 
     /**
+     * Removes an object from the parser so it is no longer enumerated by
+     * {@link #getAllObjectKeys()} (and thus not written on a full rewrite). Used
+     * to drop objects that became orphaned by an edit — e.g. embedded font
+     * programs left behind by {@code FontReplace.RemoveUnusedFonts}. No-op if the
+     * key is unknown.
+     *
+     * @param key the object to remove
+     */
+    public void removeObject(PdfObjectKey key) {
+        if (key == null) {
+            return;
+        }
+        if (xrefEntries != null) {
+            xrefEntries.remove(key);
+        }
+        objectCache.remove(key);
+    }
+
+    /**
      * Initializes decryption if the PDF is encrypted.
      * Must be called after parse() and before loading any objects.
      *

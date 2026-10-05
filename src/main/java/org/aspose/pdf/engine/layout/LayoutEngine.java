@@ -3,6 +3,7 @@ package org.aspose.pdf.engine.layout;
 import org.aspose.pdf.BaseParagraph;
 import org.aspose.pdf.BorderInfo;
 import org.aspose.pdf.Cell;
+import org.aspose.pdf.Cells;
 import org.aspose.pdf.Color;
 import org.aspose.pdf.FloatingBox;
 import org.aspose.pdf.HeaderFooter;
@@ -19,6 +20,7 @@ import org.aspose.pdf.PageNumberStamp;
 import org.aspose.pdf.Paragraphs;
 import org.aspose.pdf.Rectangle;
 import org.aspose.pdf.Row;
+import org.aspose.pdf.Rows;
 import org.aspose.pdf.Table;
 import org.aspose.pdf.TextStamp;
 import org.aspose.pdf.TocInfo;
@@ -425,6 +427,96 @@ public class LayoutEngine {
     }
 
     /**
+     * Lays out this page's main {@link Page#getParagraphs() paragraphs} (plus a
+     * TOC title and any footnote/endnote blocks) into a standalone content
+     * stream, WITHOUT touching the page's existing {@code /Contents} or
+     * {@code /Resources}. Header and footer are intentionally excluded — those
+     * are rendered separately by {@link #buildHeaderFooterOverlay(Page)}.
+     * <p>
+     * This is the loaded-document counterpart to {@link #layout(Page)} for the
+     * body: {@code layout()} rebuilds and REPLACES the page content from the
+     * paragraph list, which is correct only for a freshly authored page. When a
+     * user adds paragraphs to a page of an existing PDF (or appends a brand-new
+     * page to a loaded document), the paragraphs must be rendered as an overlay
+     * and appended, so parsed content is preserved and the added text still
+     * round-trips through extraction. Returns {@code null} when the page has no
+     * paragraphs.
+     * </p>
+     *
+     * @param page the page whose main paragraphs to render
+     * @return the overlay content + resources, or {@code null} if there is
+     *         nothing to render
+     */
+    public HeaderFooterOverlay buildParagraphOverlay(Page page) {
+        if (page == null) {
+            throw new IllegalArgumentException("Page must not be null");
+        }
+        Paragraphs paragraphs = page.getParagraphs();
+        if (paragraphs == null || paragraphs.size() == 0) {
+            return null;
+        }
+
+        // Page dimensions / margins — mirror layout()'s resolution so positions
+        // line up with the rest of the engine.
+        double pageWidth;
+        double pageHeight;
+        MarginInfo margins;
+        PageInfo pageInfo = page.getPageInfo();
+        if (pageInfo != null) {
+            pageWidth = pageInfo.getWidth();
+            pageHeight = pageInfo.getHeight();
+            margins = pageInfo.getMargin() != null
+                    ? toMarginInfo(pageInfo.getMargin())
+                    : new MarginInfo();
+        } else {
+            Rectangle mediaBox = page.getMediaBox();
+            if (mediaBox != null) {
+                pageWidth = mediaBox.getWidth();
+                pageHeight = mediaBox.getHeight();
+            } else {
+                pageWidth = 595;
+                pageHeight = 842;
+            }
+            margins = new MarginInfo(90, 90, 90, 90);
+        }
+
+        lastLineBaselineY = Double.NaN;
+        lastLineRightX = Double.NaN;
+        lastLineHeight = Double.NaN;
+        inlineFirstLineX = Double.NaN;
+
+        LayoutContext ctx = new LayoutContext(pageWidth, pageHeight, margins);
+        ContentStreamBuilder builder = new ContentStreamBuilder();
+        ResourceBuilder resources = new ResourceBuilder();
+
+        // TOC title (if any), matching layout() step 4.
+        TocInfo tocInfo = page.getTocInfo();
+        if (tocInfo != null && tocInfo.getTitle() != null) {
+            layoutTextFragment(tocInfo.getTitle(), builder, resources, ctx);
+            ctx.advanceCursor(10);
+        }
+
+        // Main paragraphs.
+        for (BaseParagraph para : paragraphs) {
+            layoutParagraph(para, builder, resources, ctx);
+        }
+
+        // Footnote / endnote blocks (mirrors layout() step 5b).
+        layoutFootnoteBlockIfAny(builder, resources, ctx);
+        layoutEndnoteBlockIfLastPage(builder, resources, ctx);
+
+        // Sync any fonts the builder registered into the resource builder so the
+        // overlay's /Resources is complete (mirrors layout() step 8).
+        for (java.util.Map.Entry<String, String> entry : builder.getFontResources().entrySet()) {
+            if (resources.getFontResourceName(entry.getKey()) == null) {
+                resources.addFont(entry.getKey());
+            }
+        }
+
+        return new HeaderFooterOverlay(builder.toByteArray(), resources.buildResourcesDictionary());
+    }
+
+    /**
      * Dispatches a paragraph to the appropriate type-specific renderer.
      *
      * @param para      the paragraph to lay out
@@ -566,10 +658,22 @@ public class LayoutEngine {
         double availWidth = ctx.getAvailableWidth();
         double inlineX = inlineFirstLineX;
         inlineFirstLineX = Double.NaN;   // consume — set only for the next paragraph
+        // First-line indent (TextFormattingOptions.FirstLineIndent): the first
+        // line starts inset by this amount and therefore wraps in a narrower box.
+        double firstLineIndent = 0;
+        org.aspose.pdf.text.TextFormattingOptions fmt =
+                tf.getTextState() != null ? tf.getTextState().getFormattingOptions() : null;
+        if (fmt != null) {
+            firstLineIndent = fmt.getFirstLineIndent();
+        }
         List<String> lines;
         if (!Double.isNaN(inlineX) && inlineX < ctx.getContentRight()) {
             double firstWidth = Math.max(1, ctx.getContentRight() - inlineX);
             lines = wrapAsymmetric(text, fontName, fontSize, firstWidth, availWidth);
+        } else if (firstLineIndent > 0) {
+            inlineX = Double.NaN;
+            lines = wrapAsymmetric(text, fontName, fontSize,
+                    Math.max(1, availWidth - firstLineIndent), availWidth);
         } else {
             inlineX = Double.NaN;
             lines = TextLayoutHelper.wrapText(text, fontName, fontSize, availWidth);
@@ -621,6 +725,9 @@ public class LayoutEngine {
                 lineX = inlineX;
             } else {
                 lineX = ctx.getContentLeft();
+                if (lineIndex == 0 && firstLineIndent > 0) {
+                    lineX += firstLineIndent;   // indent the first line (left/default align)
+                }
                 if (align == HorizontalAlignment.Center) {
                     lineX = ctx.getContentLeft() + (availWidth - lineWidth) / 2.0;
                 } else if (align == HorizontalAlignment.Right) {
@@ -1391,17 +1498,32 @@ public class LayoutEngine {
 
         double totalHeight = 0;
 
-        for (Row row : table.getRows()) {
-            // Calculate row height based on cell content
-            double rowHeight = calculateRowHeight(row, colWidths, resources, padTop, padBottom,
+        // Pre-compute each row's natural height so a row-spanning cell can be drawn
+        // across the sum of the rows it covers (rowSpan needs the heights of the
+        // rows BELOW the current one, which the single-pass loop would not know yet).
+        Rows rowList = table.getRows();
+        int rowCount = rowList.size();
+        double[] rowHeights = new double[rowCount];
+        for (int ri = 0; ri < rowCount; ri++) {
+            Row row = rowList.get(ri);
+            double rh = calculateRowHeight(row, colWidths, resources, padTop, padBottom,
                     padLeft, padRight, table);
-
             if (row.getFixedRowHeight() > 0) {
-                rowHeight = row.getFixedRowHeight();
+                rh = row.getFixedRowHeight();
             }
-            if (row.getMinRowHeight() > 0 && rowHeight < row.getMinRowHeight()) {
-                rowHeight = row.getMinRowHeight();
+            if (row.getMinRowHeight() > 0 && rh < row.getMinRowHeight()) {
+                rh = row.getMinRowHeight();
             }
+            rowHeights[ri] = rh;
+        }
+
+        // Carry grid: how many more rows each column is occupied by a rowSpan cell
+        // anchored above. A column with carry>0 is skipped in the current row.
+        int[] carry = new int[colWidths.length];
+
+        for (int ri = 0; ri < rowCount; ri++) {
+            Row row = rowList.get(ri);
+            double rowHeight = rowHeights[ri];
 
             if (!ctx.hasSpace(rowHeight)) {
                 LOG.fine("Not enough space for table row; stopping table layout");
@@ -1410,17 +1532,36 @@ public class LayoutEngine {
 
             double cellY = ctx.getCursorY();
             double cellX = tableX;
-            int cellIndex = 0;
+            int col = 0;
+            int ci = 0;
+            Cells cells = row.getCells();
 
-            for (Cell cell : row.getCells()) {
-                if (cellIndex >= colWidths.length) {
+            while (col < colWidths.length) {
+                if (carry[col] > 0) {
+                    // Occupied by a rowSpan cell anchored above — skip this column.
+                    carry[col]--;
+                    cellX += colWidths[col];
+                    col++;
+                    continue;
+                }
+                if (ci >= cells.size()) {
                     break;
                 }
+                Cell cell = cells.get(ci++);
 
-                // Calculate cell width (with colspan)
+                int span = Math.max(1, cell.getColSpan());
+                int endCol = Math.min(col + span, colWidths.length);
                 double cellWidth = 0;
-                for (int i = cellIndex; i < Math.min(cellIndex + cell.getColSpan(), colWidths.length); i++) {
+                for (int i = col; i < endCol; i++) {
                     cellWidth += colWidths[i];
+                }
+
+                // Height across the spanned rows (rowSpan).
+                int rowSpan = Math.max(1, cell.getRowSpan());
+                int endRow = Math.min(ri + rowSpan, rowCount);
+                double cellHeight = 0;
+                for (int rr = ri; rr < endRow; rr++) {
+                    cellHeight += rowHeights[rr];
                 }
 
                 // Draw cell background
@@ -1434,7 +1575,7 @@ public class LayoutEngine {
                 if (cellBg != null) {
                     builder.saveState();
                     emitColor(cellBg, builder, true);
-                    builder.rectangle(cellX, cellY - rowHeight, cellWidth, rowHeight);
+                    builder.rectangle(cellX, cellY - cellHeight, cellWidth, cellHeight);
                     builder.fill();
                     builder.restoreState();
                 }
@@ -1445,7 +1586,7 @@ public class LayoutEngine {
                     cellBorder = table.getDefaultCellBorder();
                 }
                 if (cellBorder != null) {
-                    drawCellBorder(builder, cellBorder, cellX, cellY, cellWidth, rowHeight);
+                    drawCellBorder(builder, cellBorder, cellX, cellY, cellWidth, cellHeight);
                 }
 
                 // Layout cell content
@@ -1461,8 +1602,15 @@ public class LayoutEngine {
 
                 layoutCellContent(cell, builder, resources, innerX, innerY, innerWidth);
 
+                // Reserve the spanned columns for the rows below.
+                if (rowSpan > 1) {
+                    for (int i = col; i < endCol; i++) {
+                        carry[i] = rowSpan - 1;
+                    }
+                }
+
                 cellX += cellWidth;
-                cellIndex += cell.getColSpan();
+                col = endCol;
             }
 
             ctx.advanceCursor(rowHeight);
@@ -1733,10 +1881,19 @@ public class LayoutEngine {
                 return java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(image.getFile()));
             }
             if (image.getImageStream() != null) {
+                java.io.InputStream in = image.getImageStream();
                 java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = image.getImageStream().read(buf)) > 0) out.write(buf, 0, n);
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                // The layout reads an image twice (row-height measure, then draw);
+                // a one-shot stream would be empty on the second read. Rewind it so
+                // the draw pass gets the bytes too (ByteArrayInputStream et al.).
+                try {
+                    in.reset();
+                } catch (java.io.IOException ignore) {
+                    // non-resettable stream — nothing more we can do
+                }
                 return out.toByteArray();
             }
         } catch (java.io.IOException e) {
@@ -2005,6 +2162,8 @@ public class LayoutEngine {
                     double lineHeight = TextLayoutHelper.getLineHeight(fontName, fontSize);
                     totalHeight += lines.size() * lineHeight;
                 }
+            } else if (para instanceof Image) {
+                totalHeight += measureCellImageHeight((Image) para, innerWidth) + 2;
             } else {
                 // Default: assume one line height for unknown content
                 totalHeight += TextLayoutHelper.getLineHeight(DEFAULT_FONT, DEFAULT_FONT_SIZE);
@@ -2099,8 +2258,62 @@ public class LayoutEngine {
 
                     currentY -= lineHeight;
                 }
+            } else if (para instanceof Image) {
+                currentY -= drawCellImage((Image) para, builder, resources, x, currentY, width);
             }
         }
+    }
+
+    /**
+     * Draws an image inside a table cell at the current cell cursor, scaled to fit
+     * the cell width. Returns the vertical space consumed (image height + a small
+     * gap) so the cell cursor advances past it.
+     */
+    /** The on-page height an image will occupy in a cell of the given inner width. */
+    private double measureCellImageHeight(Image image, double maxWidth) {
+        byte[] raw = readImageBytes(image);
+        if (raw == null || raw.length == 0) {
+            return TextLayoutHelper.getLineHeight(DEFAULT_FONT, DEFAULT_FONT_SIZE);
+        }
+        DecodedImage decoded = image.getSelectedFrame() >= 0
+                ? decodeImageFrame(raw, image.getSelectedFrame())
+                : decodeImageBytes(raw);
+        if (decoded == null) {
+            return TextLayoutHelper.getLineHeight(DEFAULT_FONT, DEFAULT_FONT_SIZE);
+        }
+        double w = image.getFixWidth() > 0 ? image.getFixWidth() : decoded.width;
+        double h = image.getFixHeight() > 0 ? image.getFixHeight() : decoded.height;
+        if (w > maxWidth && w > 0) {
+            h *= maxWidth / w;
+        }
+        return h;
+    }
+
+    private double drawCellImage(Image image, ContentStreamBuilder builder,
+                                 ResourceBuilder resources, double x, double topY, double maxWidth) {
+        byte[] raw = readImageBytes(image);
+        if (raw == null || raw.length == 0) {
+            return 0;
+        }
+        DecodedImage decoded = image.getSelectedFrame() >= 0
+                ? decodeImageFrame(raw, image.getSelectedFrame())
+                : decodeImageBytes(raw);
+        if (decoded == null) {
+            return 0;
+        }
+        double w = image.getFixWidth() > 0 ? image.getFixWidth() : decoded.width;
+        double h = image.getFixHeight() > 0 ? image.getFixHeight() : decoded.height;
+        if (w > maxWidth && w > 0) {
+            h *= maxWidth / w;
+            w = maxWidth;
+        }
+        String resName = resources.addImage(image.toString() + "@" + System.identityHashCode(image),
+                buildImageXObject(decoded));
+        builder.saveState();
+        builder.concatMatrix(w, 0, 0, h, x, topY - h);
+        builder.drawXObject(resName);
+        builder.restoreState();
+        return h + 2;
     }
 
     /**

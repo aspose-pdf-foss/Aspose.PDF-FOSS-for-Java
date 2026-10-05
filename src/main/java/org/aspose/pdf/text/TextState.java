@@ -159,8 +159,11 @@ public class TextState {
         // Mirror the setFontSize write-back: only fires for a state bound to an
         // extracted fragment and only for a font carrying real program bytes
         // (Standard-14 replacements have no bytes and take the by-name path).
-        if (font != null && sourceWriteBackFragment != null
-                && font.getFontData() != null && font.getFontData().length > 0) {
+        if (font != null && sourceWriteBackFragment != null) {
+            // Both embedded (font-program bytes present) and Standard-14
+            // replacements (no bytes) write back to the source now; the fragment
+            // picks the right encoding path. Standard-14 replacement is required
+            // for FontReplace.RemoveUnusedFonts (Courier/Times-Roman etc.).
             sourceWriteBackFragment.applyFontToSource(font);
         }
     }

@@ -92,6 +92,90 @@ public class Form implements Iterable<Field> {
         return fields.size();
     }
 
+    /**
+     * Exports all fields to a JSON array (indented) and returns the produced JSON text.
+     *
+     * @param jsonStream destination stream; must not be {@code null}
+     * @return the JSON text written (never {@code null})
+     */
+    public String exportToJson(java.io.OutputStream jsonStream) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        ensureLoaded();
+        java.util.List<FormJsonSupport.FieldEntry> entries = new java.util.ArrayList<>();
+        for (Field field : fields) {
+            String name = field.getPartialName();
+            if (name == null || name.isEmpty()) {
+                name = field.getFullName();
+            }
+            if (name == null || name.isEmpty()) {
+                continue;
+            }
+            String value = field.getValue();
+            entries.add(new FormJsonSupport.FieldEntry(name, field.getFieldFlags(),
+                    value == null ? "" : value));
+        }
+        String json = FormJsonSupport.toJson(entries, true);
+        try {
+            jsonStream.write(json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            jsonStream.flush();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to write JSON form data", e);
+        }
+        return json;
+    }
+
+    /**
+     * Imports field values from a JSON array (as produced by {@link #exportToJson}).
+     *
+     * @param jsonStream the JSON input stream; must not be {@code null}
+     * @return the number of fields whose value was applied (never {@code null})
+     */
+    @SuppressWarnings("unchecked")
+    public Integer importFromJson(java.io.InputStream jsonStream) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        String json;
+        try {
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = jsonStream.read(chunk)) != -1) {
+                buf.write(chunk, 0, n);
+            }
+            json = new String(buf.toByteArray(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to read JSON form data", e);
+        }
+        Object parsed = FormJsonSupport.parse(json);
+        int applied = 0;
+        if (parsed instanceof java.util.List) {
+            for (Object item : (java.util.List<Object>) parsed) {
+                if (!(item instanceof java.util.Map)) {
+                    continue;
+                }
+                java.util.Map<String, Object> obj = (java.util.Map<String, Object>) item;
+                Object name = obj.get("Name");
+                Object value = obj.get("Value");
+                if (name == null) {
+                    continue;
+                }
+                Field field = get(name.toString());
+                if (field != null && value != null) {
+                    try {
+                        field.setValue(value.toString());
+                        applied++;
+                    } catch (Exception e) {
+                        LOG.fine("importFromJson: could not set '" + name + "': " + e.getMessage());
+                    }
+                }
+            }
+        }
+        return applied;
+    }
+
     @Override
     public Iterator<Field> iterator() {
         ensureLoaded();
@@ -234,17 +318,36 @@ public class Form implements Iterable<Field> {
         }
     }
 
-    private static void ensureStandardFont(PdfDictionary fonts, String resName,
-                                           String baseFont, String subtype) {
+    private void ensureStandardFont(PdfDictionary fonts, String resName,
+                                    String baseFont, String subtype) {
         if (fonts.get(resName) != null) return;
         PdfDictionary f = new PdfDictionary();
         f.set(PdfName.of("Type"), PdfName.of("Font"));
         f.set(PdfName.of("Subtype"), PdfName.of(subtype));
         f.set(PdfName.of("BaseFont"), PdfName.of(baseFont));
+        f.set(PdfName.of("Name"), PdfName.of(resName));
         if (!"ZapfDingbats".equals(baseFont)) {
             f.set(PdfName.of("Encoding"), PdfName.of("WinAnsiEncoding"));
         }
-        fonts.set(PdfName.of(resName), f);
+        // Adobe Acrobat regenerates the appearance of EDITABLE (non-read-only)
+        // variable-text fields on open, resolving the /DA font against this /DR.
+        // It only accepts the default font when it is an INDIRECT object — an
+        // inline /DR font dict makes Acrobat's regeneration fail silently and the
+        // field shows blank until it first gains focus (read-only fields keep
+        // their baked /AP and are unaffected). Register the font as a top-level
+        // object so it serialises as an indirect reference.
+        PdfBase entry = f;
+        if (document != null) {
+            try {
+                PdfBase ref = document.registerImportedObject(f);
+                if (ref != null) {
+                    entry = ref;
+                }
+            } catch (RuntimeException e) {
+                LOG.fine("could not register /DR font indirectly: " + e.getMessage());
+            }
+        }
+        fonts.set(PdfName.of(resName), entry);
     }
 
     /**

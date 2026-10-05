@@ -53,6 +53,7 @@ public class Page {
     private HeaderFooter header;
     private HeaderFooter footer;
     private boolean headerFooterOverlayApplied;
+    private boolean paragraphOverlayApplied;
     private TocInfo tocInfo;
     private java.util.List<Layer> _layers;
     private ArtifactCollection artifactsCache;
@@ -1710,6 +1711,72 @@ public class Page {
         appendToContentStream(ops.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
         clearContentsCache();
         headerFooterOverlayApplied = true;
+    }
+
+    /**
+     * Renders this page's main {@link #getParagraphs() paragraphs} as a Form
+     * XObject overlay appended to the page's existing content stream.
+     * <p>
+     * The layout engine's full page-rebuild path ({@code LayoutEngine.layout})
+     * runs only when a brand-new document is serialised; it REPLACES the page
+     * content and so cannot be used on a document loaded from disk. When a user
+     * appends a page to a loaded document — or adds paragraphs to an existing
+     * page — the added paragraphs would otherwise never reach the file. This
+     * method renders them into a standalone Form XObject (carrying its own
+     * {@code /Resources}) and appends a {@code Do} after any original content,
+     * so the text is both visible and extractable (extraction recurses into
+     * Form XObjects) without disturbing what was already on the page.
+     * </p>
+     * <p>
+     * No-op when the page has no paragraphs, or when the overlay was already
+     * applied (idempotent across repeated saves of the same document instance).
+     * </p>
+     *
+     * @throws IOException if content-stream generation fails
+     */
+    public void applyParagraphOverlay() throws java.io.IOException {
+        if (paragraphOverlayApplied || paragraphs == null || paragraphs.isEmpty()) {
+            return;
+        }
+        org.aspose.pdf.engine.layout.LayoutEngine engine =
+                new org.aspose.pdf.engine.layout.LayoutEngine();
+        org.aspose.pdf.engine.layout.LayoutEngine.HeaderFooterOverlay overlay =
+                engine.buildParagraphOverlay(this);
+        if (overlay == null || overlay.content.length == 0) {
+            paragraphOverlayApplied = true;
+            return;
+        }
+
+        Rectangle box = getMediaBox();
+        if (box == null) box = new Rectangle(0, 0, 612, 792);
+
+        // Wrap the rendered paragraphs as a Form XObject. The content is authored
+        // in page user space, so no placement matrix is needed and BBox is the
+        // full media box (clip only).
+        org.aspose.pdf.engine.pdfobjects.PdfStream form = new org.aspose.pdf.engine.pdfobjects.PdfStream();
+        form.set("Type", PdfName.of("XObject"));
+        form.set("Subtype", PdfName.of("Form"));
+        form.set("BBox", box.toPdfArray());
+        form.set("Resources", overlay.resources);
+        form.setDecodedData(overlay.content);
+
+        org.aspose.pdf.engine.pdfobjects.PdfObjectReference formRef = owningDocument != null
+                ? owningDocument.registerImportedObject(form)
+                : null;
+
+        Resources resources = ensureResources();
+        PdfDictionary xObjects = resources.getXObjects();
+        if (xObjects == null) {
+            xObjects = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("XObject"), xObjects);
+        }
+        String resName = createUniqueXObjectName(xObjects, "FmBody", 0);
+        xObjects.set(PdfName.of(resName), formRef != null ? formRef : form);
+
+        String ops = "\nq\n/" + resName + " Do\nQ\n";
+        appendToContentStream(ops.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        clearContentsCache();
+        paragraphOverlayApplied = true;
     }
 
     /** Returns the TOC info for this page, or null. */

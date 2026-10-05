@@ -3,6 +3,7 @@ package org.aspose.pdf.engine.filter;
 import org.aspose.pdf.engine.pdfobjects.PdfBase;
 import org.aspose.pdf.engine.pdfobjects.PdfDictionary;
 import org.aspose.pdf.engine.pdfobjects.PdfName;
+import org.aspose.pdf.engine.pdfobjects.PdfObjectReference;
 import org.aspose.pdf.engine.pdfobjects.PdfStream;
 
 import java.io.ByteArrayOutputStream;
@@ -735,6 +736,24 @@ public final class JBIG2DecodeFilter implements PdfFilter {
                 }
                 exCur = !exCur;
             }
+            // §6.5.10: the run-length export flags MUST select exactly
+            // SDNUMEXSYMS symbols. When they don't (a truncated/short final run
+            // in some encoders — corpus 59930 marked 2 of 5 as exported, so a
+            // text region could not reference the 3 dropped glyphs and the tile
+            // rendered blank), fall back to the positional export below, which
+            // takes the first SDNUMEXSYMS symbols (= all new symbols when there
+            // are no input symbols — the usual case for these per-glyph dicts).
+            if (exportFlags != null) {
+                int exCount = 0;
+                for (boolean fl : exportFlags) {
+                    if (fl) {
+                        exCount++;
+                    }
+                }
+                if (exCount != sdNumExSyms) {
+                    exportFlags = null;
+                }
+            }
         }
 
         // Build the export symbol list (§6.5.10): the flagged symbols, or —
@@ -1089,6 +1108,16 @@ public final class JBIG2DecodeFilter implements PdfFilter {
         byte[] globalsData = null;
         if (params != null) {
             PdfBase globalsObj = params.get("JBIG2Globals");
+            // /JBIG2Globals is routinely an indirect reference — dereference it,
+            // otherwise the symbol dictionaries it carries are silently dropped
+            // and text regions decode to a blank page (jbig2-1).
+            if (globalsObj instanceof PdfObjectReference) {
+                try {
+                    globalsObj = ((PdfObjectReference) globalsObj).dereference();
+                } catch (Exception e) {
+                    LOG.fine(() -> "JBIG2: failed to dereference /JBIG2Globals: " + e.getMessage());
+                }
+            }
             if (globalsObj instanceof PdfStream) {
                 globalsData = ((PdfStream) globalsObj).getDecodedData();
                 if (globalsData != null && globalsData.length > 0) {

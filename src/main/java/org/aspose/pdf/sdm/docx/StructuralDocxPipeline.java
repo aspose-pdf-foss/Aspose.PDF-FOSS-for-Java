@@ -39,7 +39,8 @@ public final class StructuralDocxPipeline {
         if (options == null) {
             options = new DocSaveOptions();
         }
-        SdmDocument sdm = StructuralHtmlPipeline.buildStructuralSdm(doc, toHtmlOptions(options), true);
+        SdmDocument sdm = StructuralHtmlPipeline.buildStructuralSdm(
+                doc, toHtmlOptions(options), true, isTextboxMode(options));
         new SdmDocxWriter().write(sdm, out);
     }
 
@@ -55,8 +56,20 @@ public final class StructuralDocxPipeline {
         if (options == null) {
             options = new DocSaveOptions();
         }
-        SdmDocument sdm = StructuralHtmlPipeline.buildStructuralSdm(doc, toHtmlOptions(options), true);
+        SdmDocument sdm = StructuralHtmlPipeline.buildStructuralSdm(
+                doc, toHtmlOptions(options), true, isTextboxMode(options));
         return new SdmDocxWriter().write(sdm);
+    }
+
+    /**
+     * True for {@link DocSaveOptions.RecognitionMode#Textbox} — the fully
+     * fixed-layout ("each element in a textbox") mode that renders every page as
+     * an underlay raster with positioned text frames, the DOCX analogue of the
+     * FIXED_LAYOUT HTML export.
+     */
+    private static boolean isTextboxMode(DocSaveOptions options) {
+        return options != null
+                && options.getRecognitionMode() == DocSaveOptions.RecognitionMode.Textbox;
     }
 
     /** Maps the DOCX options onto the shared enrichment flags carried by HtmlSaveOptions. */

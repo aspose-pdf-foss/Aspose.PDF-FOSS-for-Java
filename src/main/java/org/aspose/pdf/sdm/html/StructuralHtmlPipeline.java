@@ -89,6 +89,26 @@ public final class StructuralHtmlPipeline {
      */
     public static SdmDocument buildStructuralSdm(Document doc, HtmlSaveOptions options,
             boolean flowTarget) throws IOException {
+        return buildStructuralSdm(doc, options, flowTarget, false);
+    }
+
+    /**
+     * As {@link #buildStructuralSdm(Document, HtmlSaveOptions, boolean)} but with
+     * an explicit {@code forceFixedPages} flag: when true (DOCX
+     * {@link org.aspose.pdf.DocSaveOptions.RecognitionMode#Textbox} mode) EVERY
+     * page is converted to a fixed-layout underlay + positioned text frames, the
+     * DOCX analogue of the FIXED_LAYOUT HTML export. Only meaningful for a flow
+     * target.
+     *
+     * @param doc             the open source document
+     * @param options         shared enrichment flags; null = defaults
+     * @param flowTarget      true when the consumer is an editable flow target (DOCX)
+     * @param forceFixedPages true = fix every page (Textbox mode)
+     * @return the enriched SDM document
+     * @throws IOException if page content cannot be read
+     */
+    public static SdmDocument buildStructuralSdm(Document doc, HtmlSaveOptions options,
+            boolean flowTarget, boolean forceFixedPages) throws IOException {
         if (doc == null) {
             throw new IllegalArgumentException("document must not be null");
         }
@@ -134,7 +154,7 @@ public final class StructuralHtmlPipeline {
         if (flowTarget) {
             try {
                 fixedPages = org.aspose.pdf.sdm.enrich.FixedLayoutPageEnricher.enrich(
-                        doc, sdm, projection.getPgm());
+                        doc, sdm, projection.getPgm(), forceFixedPages);
             } catch (RuntimeException e) {
                 LOG.warning("fixed-layout page handling failed — continuing without: " + e);
             }

@@ -128,9 +128,435 @@ public final class HtmlSdmReader {
             sdm.getMetadata().setLang(lang);
         }
 
+        // Our own PDF->HTML fixed-layout export is a stack of <div class="page">
+        // boxes, each holding absolutely positioned <span> text over a full-page
+        // <img class="v"> vector underlay. That is NOT reflowable content — walk
+        // it back into fixed pages so the PDF->HTML->PDF round-trip reproduces the
+        // source verbatim instead of collapsing every positioned run into flow.
+        java.util.List<Element> fixedPages = fixedLayoutPageDivs(body);
+        if (fixedPages != null) {
+            buildFixedLayout(fixedPages, sdm);
+            return sdm;
+        }
+
         CssContext rootCtx = new CssContext();
         walkBlocks(body, rootCtx, sdm.getChildren(), sdm);
         return sdm;
+    }
+
+    // ---- Fixed-layout (PDF->HTML export) round-trip -------------------------
+
+    /**
+     * Detects our own fixed-layout HTML export: the {@code body} is a sequence of
+     * {@code <div class="page">} boxes whose content is absolutely positioned. Any
+     * one page carrying a {@code <span>} with a {@code left:}/{@code top:} inline
+     * style (or a full-page {@code <img class="v">} underlay) is the signature.
+     * Returns the ordered page divs, or {@code null} for ordinary reflow HTML.
+     */
+    private java.util.List<Element> fixedLayoutPageDivs(Element body) {
+        java.util.List<Element> pages = new java.util.ArrayList<>();
+        NodeList kids = body.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) {
+                continue;
+            }
+            Element el = (Element) n;
+            if ("div".equalsIgnoreCase(el.getTagName()) && hasClassToken(el, "page")
+                    && styleLenPt(el, "width") != null && styleLenPt(el, "height") != null) {
+                pages.add(el);
+            } else {
+                return null; // a non-page top-level block -> not our fixed export
+            }
+        }
+        if (pages.isEmpty()) {
+            return null;
+        }
+        // Confirm positioned content lives inside (guards against a coincidental
+        // class="page" wrapper around ordinary flow markup).
+        for (Element p : pages) {
+            if (hasPositionedContent(p)) {
+                return pages;
+            }
+        }
+        return null;
+    }
+
+    /** Whether {@code el} has a descendant span/img carrying an absolute position. */
+    private static boolean hasPositionedContent(Element el) {
+        NodeList spans = el.getElementsByTagName("span");
+        for (int i = 0; i < spans.getLength(); i++) {
+            String s = ((Element) spans.item(i)).getAttribute("style");
+            if (s != null && s.contains("left:") && s.contains("top:")) {
+                return true;
+            }
+        }
+        return el.getElementsByTagName("img").getLength() > 0;
+    }
+
+    /**
+     * Rebuilds the fixed-layout pages into the SDM: one page group per
+     * {@code <div class="page">}, a full-page image underlay painted out of flow,
+     * and each positioned {@code <span>} as a framed paragraph placed at its exact
+     * page coordinate ({@code frame-x-pt}/{@code frame-y-pt}, honoured by
+     * {@code SdmPdfLayout}). Coordinates are px == pt (the writer emits at scale 1),
+     * so they are read raw, not through the CSS 96dpi px->pt conversion.
+     */
+    private void buildFixedLayout(java.util.List<Element> pageDivs, SdmDocument sdm) {
+        for (int pi = 0; pi < pageDivs.size(); pi++) {
+            Element pageDiv = pageDivs.get(pi);
+            double dispW = rawPt(pageDiv, "width", 612);
+            double dispH = rawPt(pageDiv, "height", 792);
+            // A /Rotate page: the writer wraps the positioned layers in a
+            // rotation <div> and keeps their UNROTATED coordinates (the underlay
+            // is pre-rasterised in the displayed orientation). We rebuild the PDF
+            // page the way the source did — unrotated content + a page /Rotate —
+            // so the text lands in its unrotated coordinate space and the viewer
+            // turns the whole page. The underlay is un-rotated back to match.
+            int rot = pageRotation(pageDiv);
+            boolean swap = rot == 90 || rot == 270;
+            double pageW = swap ? dispH : dispW;
+            double pageH = swap ? dispW : dispH;
+            if (pi == 0) {
+                // First page seeds the document geometry (renderHtmlViaSdm reads
+                // page-width/height + zero margins from the metadata).
+                java.util.Map<String, String> c = sdm.getMetadata().getCustom();
+                c.put("page-width", fmtNum(pageW));
+                c.put("page-height", fmtNum(pageH));
+                c.put("margin-left", "0");
+                c.put("margin-right", "0");
+                c.put("margin-top", "0");
+                c.put("margin-bottom", "0");
+                c.put("fixed-layout", "1");
+            }
+            java.util.List<SdmBlock> blocks = new java.util.ArrayList<>();
+            collectFixed(pageDiv, blocks, sdm, pageW, pageH, rot);
+            if (blocks.isEmpty()) {
+                // A genuinely blank source page: keep it as an empty placeholder so
+                // the page COUNT is preserved — dropping it would slide every later
+                // page one position and wreck a page-by-page fidelity comparison.
+                org.aspose.pdf.sdm.Paragraph blank = new org.aspose.pdf.sdm.Paragraph();
+                assignId(blank);
+                blocks.add(blank);
+            }
+            SdmBlock first = blocks.get(0);
+            first.getAttributes().put("page-w-pt", pageW);
+            first.getAttributes().put("page-h-pt", pageH);
+            if (rot != 0) {
+                first.getAttributes().put("page-rotate", rot);
+            }
+            if (pi > 0) {
+                first.getAttributes().put("force-new-page", Boolean.TRUE);
+            }
+            sdm.getChildren().addAll(blocks);
+        }
+    }
+
+    /** Depth-first collect of positioned spans (framed text) and imgs (out-of-flow
+     *  backdrops) inside a fixed-layout page, in document order. */
+    private void collectFixed(Element el, java.util.List<SdmBlock> out,
+                              SdmDocument sdm, double pageW, double pageH, int rot) {
+        NodeList kids = el.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) {
+                continue;
+            }
+            Element c = (Element) n;
+            String tag = c.getTagName().toLowerCase(Locale.ROOT);
+            if ("span".equals(tag)) {
+                SdmBlock p = fixedTextBlock(c, pageW);
+                if (p != null) {
+                    out.add(p);
+                }
+            } else if ("img".equals(tag)) {
+                SdmBlock fig = fixedImageBlock(c, sdm, pageW, pageH, rot);
+                if (fig != null) {
+                    out.add(fig);
+                }
+            } else if ("input".equals(tag) || "textarea".equals(tag) || "select".equals(tag)) {
+                // A form control on a fixed-layout page: its box border is baked
+                // into the vector underlay, but its VALUE is HTML text a browser
+                // paints inside the box. Reproduce that value as positioned text so
+                // our render shows the field content instead of an empty box (an
+                // interactive AcroForm field is not needed for a faithful raster).
+                SdmBlock p = framedText(c, fieldValueText(c, tag), pageW);
+                if (p != null) {
+                    // A PDF viewer clips a field's value to its box: a single-line
+                    // <input> shows only the leading run that fits, a <textarea>
+                    // only the top lines. Carry the box height so the layout drops
+                    // overflow instead of wrapping the value down over the labels
+                    // below it (corpus 39156: a Title value "…that goes over the
+                    // box width" wrapped onto "Employee email address:", and the
+                    // background-info field's line2..line7 ran off the page).
+                    Double h = rawPtOrNull(c, "height");
+                    if (h != null && h > 1) {
+                        p.getAttributes().put("frame-h-pt", h);
+                    }
+                    out.add(p);
+                }
+            } else {
+                // rotation wrapper / nested container: recurse
+                collectFixed(c, out, sdm, pageW, pageH, rot);
+            }
+        }
+    }
+
+    /** The /Rotate of a fixed-layout page: the {@code rotate(Ndeg)} of the wrapper
+     *  div the writer emits around the positioned layers (0 when none). */
+    private static int pageRotation(Element pageDiv) {
+        NodeList kids = pageDiv.getChildNodes();
+        for (int i = 0; i < kids.getLength(); i++) {
+            Node n = kids.item(i);
+            if (n.getNodeType() != Node.ELEMENT_NODE) {
+                continue;
+            }
+            String style = ((Element) n).getAttribute("style");
+            if (style != null && style.contains("rotate(")) {
+                int p = style.indexOf("rotate(");
+                int q = style.indexOf("deg", p);
+                if (q > p) {
+                    try {
+                        int deg = (int) Math.round(
+                                Double.parseDouble(style.substring(p + 7, q).trim()));
+                        return ((deg % 360) + 360) % 360;
+                    } catch (NumberFormatException ignore) {
+                        // unparseable transform -> treat as unrotated
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    /** A positioned {@code <span>} -> a framed single-run paragraph. */
+    private SdmBlock fixedTextBlock(Element span, double pageW) {
+        return framedText(span, span.getTextContent(), pageW);
+    }
+
+    /** The display VALUE of a fixed-layout form control, or null when it carries
+     *  no paintable text (checkbox/radio/button/hidden/password glyphs live in
+     *  the vector underlay, not as text). */
+    private static String fieldValueText(Element el, String tag) {
+        if ("textarea".equals(tag)) {
+            return el.getTextContent();
+        }
+        if ("select".equals(tag)) {
+            NodeList opts = el.getElementsByTagName("option");
+            Element first = null;
+            for (int i = 0; i < opts.getLength(); i++) {
+                Element o = (Element) opts.item(i);
+                if (first == null) {
+                    first = o;
+                }
+                if (o.hasAttribute("selected")) {
+                    return o.getTextContent();
+                }
+            }
+            return first != null ? first.getTextContent() : null;
+        }
+        // input: only text-like types show their value as glyphs.
+        String type = el.getAttribute("type");
+        if (type == null || type.isEmpty()) {
+            type = "text";
+        }
+        switch (type.toLowerCase(Locale.ROOT)) {
+            case "text": case "email": case "number": case "tel": case "url":
+            case "search": case "date": case "time":
+                return el.getAttribute("value");
+            default: // checkbox/radio/button/submit/hidden/password/image/file...
+                return null;
+        }
+    }
+
+    /** A positioned element -> a framed single-run paragraph carrying {@code text}
+     *  at the element's {@code left}/{@code top} with its font styling. Shared by
+     *  positioned {@code <span>}s and the value text of fixed-layout form fields. */
+    private SdmBlock framedText(Element span, String text, double pageW) {
+        if (text == null || text.isEmpty()) {
+            return null;
+        }
+        Double left = rawPtOrNull(span, "left");
+        Double top = rawPtOrNull(span, "top");
+        if (left == null || top == null) {
+            return null;
+        }
+        double fontSize = rawPt(span, "font-size", 12);
+        org.aspose.pdf.sdm.TextStyle ts = new org.aspose.pdf.sdm.TextStyle();
+        ts.setFontSize(fontSize);
+        String family = styleRaw(span, "font-family");
+        if (family != null && !family.isEmpty()) {
+            ts.setFontFamily(family);
+        }
+        String weight = styleRaw(span, "font-weight");
+        if (weight != null && weight.toLowerCase(Locale.ROOT).contains("bold")) {
+            ts.setBold(true);
+        }
+        String fstyle = styleRaw(span, "font-style");
+        if (fstyle != null && (fstyle.contains("italic") || fstyle.contains("oblique"))) {
+            ts.setItalic(true);
+        }
+        Integer color = parseCssColor(styleRaw(span, "color"));
+        if (color != null) {
+            ts.setColor(color);
+        }
+        org.aspose.pdf.sdm.Paragraph p = new org.aspose.pdf.sdm.Paragraph();
+        p.getInline().add(new org.aspose.pdf.sdm.Run(text, ts));
+        p.getAttributes().put("frame-x-pt", left);
+        p.getAttributes().put("frame-y-pt", top);
+        // An element that declares its own width (a form field's box) wraps its
+        // value inside that width, matching how a browser paints the control.
+        // Positioned label spans carry no width, so they get a generous frame and
+        // are never re-wrapped by a font-metric mismatch (the source already fit
+        // them on one line).
+        Double declaredW = rawPtOrNull(span, "width");
+        double frameW = declaredW != null && declaredW > 1
+                ? declaredW : Math.max(1, pageW - left);
+        p.getAttributes().put("frame-w-pt", frameW);
+        assignId(p);
+        return p;
+    }
+
+    /** A positioned {@code <img>} (vector underlay {@code .v} or raster {@code .i})
+     *  -> an out-of-flow, full-opacity backdrop figure at its page coordinate. */
+    private SdmBlock fixedImageBlock(Element img, SdmDocument sdm,
+                                     double pageW, double pageH, int rot) {
+        ResourceRef ref = putImage(img, sdm);
+        if (ref == null) {
+            return null;
+        }
+        boolean underlay = hasClassToken(img, "v");
+        // The underlay is rasterised in the DISPLAYED orientation; the page we
+        // build is unrotated (a /Rotate is set instead), so turn the underlay
+        // back by -rot to match, letting the page rotation redisplay it.
+        if (underlay && rot != 0) {
+            Resource res = sdm.getResources().get(ref);
+            if (res != null && res.getBytes() != null && res.getBytes().length > 0) {
+                byte[] turned = rotateImageBytes(res.getBytes(), (360 - rot) % 360);
+                if (turned != null) {
+                    sdm.getResources().put(ref.getId(),
+                            new Resource(Resource.Kind.IMAGE, turned, "image/png"));
+                }
+            }
+        }
+        Figure fig = new Figure(ref);
+        double left = underlay ? 0 : rawPt(img, "left", 0);
+        double top = underlay ? 0 : rawPt(img, "top", 0);
+        double w = underlay ? pageW : rawPt(img, "width", pageW);
+        double h = underlay ? pageH : rawPt(img, "height", pageH);
+        fig.getAttributes().put("background", Boolean.TRUE);
+        fig.getAttributes().put("pos-page-anchored", Boolean.TRUE);
+        fig.getAttributes().put("pos-x-pt", left);
+        fig.getAttributes().put("pos-y-pt", top);
+        fig.getAttributes().put("display-width", w);
+        fig.getAttributes().put("display-height", h);
+        fig.getAttributes().put("background-opacity", 1.0);
+        assignId(fig);
+        return fig;
+    }
+
+    /** Reads a style length as raw points (px treated as pt, per the scale-1 export). */
+    private static double rawPt(Element el, String prop, double def) {
+        Double v = rawPtOrNull(el, prop);
+        return v != null ? v : def;
+    }
+
+    private static Double rawPtOrNull(Element el, String prop) {
+        String raw = styleRaw(el, prop);
+        if (raw == null) {
+            return null;
+        }
+        raw = raw.trim().toLowerCase(Locale.ROOT);
+        if (raw.endsWith("px")) raw = raw.substring(0, raw.length() - 2);
+        else if (raw.endsWith("pt")) raw = raw.substring(0, raw.length() - 2);
+        try {
+            return Double.parseDouble(raw.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /** Raw inline-style property value (uninterpreted), or null. */
+    private static String styleRaw(Element el, String prop) {
+        String style = el.getAttribute("style");
+        if (style == null) {
+            return null;
+        }
+        for (String d : style.split(";")) {
+            int c = d.indexOf(':');
+            if (c > 0 && d.substring(0, c).trim().equalsIgnoreCase(prop)) {
+                return d.substring(c + 1).trim();
+            }
+        }
+        return null;
+    }
+
+    /** Parses {@code rgb(r,g,b)} or {@code #rrggbb} to 0xAARRGGBB, or null. */
+    private static Integer parseCssColor(String v) {
+        if (v == null) {
+            return null;
+        }
+        v = v.trim().toLowerCase(Locale.ROOT);
+        try {
+            if (v.startsWith("rgb")) {
+                int lp = v.indexOf('('), rp = v.indexOf(')');
+                if (lp < 0 || rp < 0) return null;
+                String[] parts = v.substring(lp + 1, rp).split(",");
+                if (parts.length < 3) return null;
+                int r = Integer.parseInt(parts[0].trim());
+                int g = Integer.parseInt(parts[1].trim());
+                int b = Integer.parseInt(parts[2].trim());
+                return 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+            if (v.startsWith("#") && v.length() == 7) {
+                return 0xFF000000 | Integer.parseInt(v.substring(1), 16);
+            }
+        } catch (RuntimeException ignore) {
+            // malformed colour -> default (black) at the layout layer
+        }
+        return null;
+    }
+
+    /** Formats a number without a trailing {@code .0} for metadata strings. */
+    private static String fmtNum(double v) {
+        if (v == Math.floor(v)) {
+            return Long.toString((long) v);
+        }
+        return Double.toString(v);
+    }
+
+    /** Rotates a raster image clockwise by {@code deg} (0/90/180/270) and re-encodes
+     *  it as PNG. Returns null on any failure (caller keeps the original bytes). */
+    private static byte[] rotateImageBytes(byte[] png, int deg) {
+        if (deg == 0) {
+            return png;
+        }
+        try {
+            java.awt.image.BufferedImage src =
+                    javax.imageio.ImageIO.read(new java.io.ByteArrayInputStream(png));
+            if (src == null) {
+                return null;
+            }
+            int w = src.getWidth(), h = src.getHeight();
+            boolean swap = deg == 90 || deg == 270;
+            java.awt.image.BufferedImage dst = new java.awt.image.BufferedImage(
+                    swap ? h : w, swap ? w : h, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+            java.awt.Graphics2D g = dst.createGraphics();
+            java.awt.geom.AffineTransform at = new java.awt.geom.AffineTransform();
+            switch (deg) {
+                case 90:  at.translate(h, 0); at.rotate(Math.PI / 2); break;
+                case 180: at.translate(w, h); at.rotate(Math.PI);     break;
+                case 270: at.translate(0, w); at.rotate(3 * Math.PI / 2); break;
+                default:  break;
+            }
+            g.drawImage(src, at, null);
+            g.dispose();
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            javax.imageio.ImageIO.write(dst, "png", out);
+            return out.toByteArray();
+        } catch (java.io.IOException | RuntimeException e) {
+            return null;
+        }
     }
 
     /** @return the report from the most recent {@link #read} (fonts/CSS/opaque). */

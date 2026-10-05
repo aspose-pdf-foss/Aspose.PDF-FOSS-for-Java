@@ -107,12 +107,67 @@ No API removals or signature changes were detected by the available tooling.
 See the **Changed** section above for the scope and limits of that
 determination.
 
+
+## [26.9]
+
+Release 26.9 focuses on document conversion: it adds two-way PDF ↔ XLSX and
+PDF ↔ Markdown routes, plus a "live" interactive-forms mode for XLSX import.
+All routes are built on the shared structural pipeline (SDM) and introduce no
+new external dependencies.
+
+### Added
+
+#### PDF → XLSX (Excel export)
+- New save format `SaveFormat.Xlsx` (alias `SaveFormat.Excel`) and
+  `ExcelSaveOptions`.
+- Cell value typing (`CellValueTyper`): numbers, dates, booleans, currency and
+  percentages are written as native typed cells rather than text.
+- Source styling is carried over: font family and size, text color, cell fill,
+  borders, row heights, column widths, alignment.
+- Merged cells are detected and preserved end-to-end (`mergeCells`).
+
+#### XLSX → PDF (Excel import)
+- New load format `LoadFormat.Xlsx` and `ExcelLoadOptions`.
+- Parses strings, styles, merges, fills, fonts, number formats and drawings;
+  each sheet is mapped to a separate PDF table.
+- Correct rowspan/colspan handling during page layout.
+
+#### Live XLSX → PDF (interactive forms)
+- Opt-in mode `ExcelLoadOptions.setInteractiveForms(true)`:
+  - sheet cells are converted into AcroForm fields;
+  - Excel formulas are translated into PDF JavaScript (calculate actions) — a
+    new `ExcelFormulaTranslator` with an extended function set and a graceful
+    fallback to the static value when a function is unsupported;
+  - field policy: numeric cells are editable, formula cells are read-only with
+    recalculation, label cells are static (unless referenced).
+  - Recalculation runs in form-capable viewers (Acrobat, Foxit).
+
+#### PDF → Markdown (export)
+- New save format `SaveFormat.Markdown` and `MarkdownSaveOptions`.
+- Exports GFM: tables, lists, emphasis (bold/italic/strikethrough), code,
+  links, images, footnotes and YAML front-matter.
+
+#### Markdown → PDF (import)
+- New load format `LoadFormat.Markdown` and `MarkdownLoadOptions`.
+- Hand-written, zero-dependency CommonMark/GFM subset parser → SDM → page
+  layout.
+
+### Fixed
+- Inline styles (bold/italic/strike/code/link) on a single line now render as
+  one correct block instead of being fragmented per word or forced to a single
+  font across the whole line.
+- Eliminated double-printing of list markers and false detection of a list as
+  a table.
+- Fixed merged-cell carry-over and rowspan shifting in the DOCX/HTML/XLSX → PDF
+  routes.
+
+
 ### Maven Coordinates
 
 ```xml
 <dependency>
     <groupId>org.aspose</groupId>
     <artifactId>aspose-pdf-foss</artifactId>
-    <version>26.8.0</version>
+    <version>26.9.0</version>
 </dependency>
 ```

@@ -40,6 +40,7 @@ public class TextBoxField extends Field {
         dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
         dict.set(PdfName.of("FT"), PdfName.of("Tx"));
         setRectLenient(rect);
+        markPrintable(dict);
         // ISO §12.7.3.3: variable-text fields need /DA with at least a /Tf
         // selector or strict readers (poppler, mupdf) won't render typed text.
         if (getDefaultAppearance() == null) {
@@ -96,6 +97,23 @@ public class TextBoxField extends Field {
                 // Set main Rect to the first rectangle
                 setRectLenient(rects[0]);
             }
+        }
+        markPrintable(dict);
+    }
+
+    /**
+     * Ensures a freshly created widget annotation carries the Print flag
+     * ({@code /F} bit 3, ISO 32000-1:2008 §12.5.3). Real generators (and Acrobat)
+     * always set it; without any {@code /F}, Adobe Acrobat/Reader does not paint
+     * the field's baked {@code /AP} appearance until the field first gains focus,
+     * so values look invisible on open. Only applied when {@code /F} is absent so
+     * an explicitly-configured flag set is never overridden.
+     *
+     * @param d the widget annotation dictionary
+     */
+    static void markPrintable(PdfDictionary d) {
+        if (d.get("F") == null) {
+            d.set(PdfName.of("F"), PdfInteger.valueOf(4)); // Print
         }
     }
 
@@ -308,6 +326,15 @@ public class TextBoxField extends Field {
         bbox.add(new PdfFloat(rect.getWidth()));
         bbox.add(new PdfFloat(rect.getHeight()));
         apStream.set(PdfName.BBOX, bbox);
+        // /FormType and the identity /Matrix are defaults per §8.10.2, but real
+        // generators write them explicitly and some viewers (and Acrobat's
+        // form-field appearance path) are happier when they are present.
+        apStream.set(PdfName.of("FormType"), PdfInteger.valueOf(1));
+        PdfArray matrix = new PdfArray();
+        for (double m : new double[]{1, 0, 0, 1, 0, 0}) {
+            matrix.add(new PdfFloat((float) m));
+        }
+        apStream.set(PdfName.of("Matrix"), matrix);
         apStream.set(PdfName.RESOURCES, buildAppearanceResources(fontName));
         apStream.setDecodedData(cs.toString().getBytes(StandardCharsets.ISO_8859_1));
 
@@ -401,6 +428,10 @@ public class TextBoxField extends Field {
         font.set(PdfName.of("Name"), PdfName.of(fontName));
         fonts.set(fontName, font);
         resources.set(PdfName.of("Font"), fonts);
+        PdfArray procSet = new PdfArray();
+        procSet.add(PdfName.of("PDF"));
+        procSet.add(PdfName.of("Text"));
+        resources.set(PdfName.of("ProcSet"), procSet);
         return resources;
     }
 

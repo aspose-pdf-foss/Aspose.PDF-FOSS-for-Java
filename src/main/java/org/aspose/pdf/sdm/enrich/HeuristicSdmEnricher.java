@@ -106,6 +106,10 @@ public final class HeuristicSdmEnricher {
     private static final Pattern DECIMAL = Pattern.compile("^\\(?(\\d{1,3})[.)].*");
     private static final Pattern ALPHA = Pattern.compile("^\\(?[a-zA-Z][.)]\\s.*");
     private static final Pattern ROMAN = Pattern.compile("^\\(?[ivxIVX]{1,5}[.)]\\s.*");
+    /** The leading marker glyph + trailing space, for stripping it from item text
+     *  (the marker is structural — each writer re-emits its own). */
+    private static final Pattern MARKER_PREFIX = Pattern.compile(
+            "^\\s*(?:[•●◦▪·∙*–—-]|\\(?(?:\\d{1,3}|[a-zA-Z]|[ivxIVX]{1,5})[.)])\\s*");
 
     /** Geometry digest of one top-level block. */
     private static final class Info {
@@ -486,6 +490,8 @@ public final class HeuristicSdmEnricher {
             li.getChildren().addAll(items.get(k));
             if (deep) {
                 if (nested == null) {
+                    // newList must read the ORIGINAL label to parse an ordered
+                    // list's start number, so open it before stripping the marker.
                     nested = newList(itemKind.get(k), infoTextOf(items.get(k)));
                     lastRootItem.getChildren().add(nested);
                 }
@@ -494,6 +500,11 @@ public final class HeuristicSdmEnricher {
                 nested = null;
                 root.getItems().add(li);
                 lastRootItem = li;
+            }
+            // The marker glyph is structural (writers re-emit it) — strip it from
+            // the item text last, after any newList() has read the label.
+            if (!items.get(k).isEmpty()) {
+                stripLeadingMarker(items.get(k).get(0));
             }
         }
         return root;
@@ -519,6 +530,32 @@ public final class HeuristicSdmEnricher {
         ListBlock list = new ListBlock(ordered, start);
         list.setMarkerStyle(kind.name().toLowerCase(Locale.ROOT));
         return list;
+    }
+
+    /**
+     * Removes the leading list-marker glyph ({@code •}, {@code 1.}, {@code a.},
+     * {@code iv)}) from the first text run of a list-item paragraph. The marker is
+     * structural — each writer re-emits its own bullet/number — so leaving it in
+     * the item text double-prints it ("- • First item", "1. 1. First step").
+     */
+    private static void stripLeadingMarker(SdmBlock block) {
+        if (!(block instanceof Paragraph)) {
+            return;
+        }
+        for (SdmInline inline : ((Paragraph) block).getInline()) {
+            if (inline instanceof Run) {
+                Run run = (Run) inline;
+                String t = run.getText();
+                if (t == null) {
+                    return;
+                }
+                java.util.regex.Matcher m = MARKER_PREFIX.matcher(t);
+                if (m.find() && m.end() > 0) {
+                    run.setText(t.substring(m.end()));
+                }
+                return; // only the first run carries the marker
+            }
+        }
     }
 
     // ------------------------------------------------------------------ tables
@@ -592,8 +629,12 @@ public final class HeuristicSdmEnricher {
         for (int v : colCountHist.values()) {
             dominantFreq = Math.max(dominantFreq, v);
         }
-        if (maxCols >= 4 && dominantFreq < 0.6 * rows.size()) {
-            return 0; // ragged merged-cell form / prose mis-grouped — keep prose
+        // A genuine MERGED table has uneven per-row cell counts (a colspan header
+        // row has fewer cells than the body) yet its cells still tile a clean
+        // rectangular grid. Only reject as ragged when the cells do NOT tile a full
+        // grid (a real key/value form or mis-grouped prose).
+        if (maxCols >= 4 && dominantFreq < 0.6 * rows.size() && !tilesFullGrid(rows)) {
+            return 0; // ragged form / prose mis-grouped — keep prose
         }
         // Claim content per RUN: the extractor merges same-line cells into one
         // visual paragraph, so a cell claims the runs whose box centres sit in
@@ -606,6 +647,7 @@ public final class HeuristicSdmEnricher {
         for (AbsorbedRow r : rows) {
             allCells.addAll(r.getCellList());
         }
+        int markerLines = 0;
         for (int i = 0; i < children.size(); i++) {
             SdmBlock b = children.get(i);
             if (!(b instanceof Paragraph)) {
@@ -623,10 +665,23 @@ public final class HeuristicSdmEnricher {
                 byCell.computeIfAbsent(e.getKey(), k -> new ArrayList<>()).addAll(e.getValue());
             }
             claimed.put(b, Boolean.TRUE);
+            if (markerOf(info.text) != MarkerKind.NONE) {
+                markerLines++;
+            }
             firstIdx = Math.min(firstIdx, i);
         }
         if (claimed.size() < 2) {
             return 0; // vector-only or near-empty grid — degrade to nothing
+        }
+        // LIST GUARD: a bullet/number list ("• First item" on each row) tiles a
+        // clean 2-column grid — marker glyph in the left column, item text in the
+        // right — that the geometric absorber cannot tell from a real table. A
+        // genuine data table is not led on (nearly) every row by a lone list
+        // marker. When the grid is narrow (<=2 cols) and >=75% of the claimed
+        // lines begin with a list marker, reject so applyLists() (which runs next)
+        // recovers a proper ordered/unordered list instead of a bogus table.
+        if (maxCols <= 2 && markerLines >= 2 && markerLines * 4 >= claimed.size() * 3) {
+            return 0;
         }
         // DOUBLE-PRINT: some producers paint a line twice (bold-by-overprint);
         // the copies coincide pixel-perfectly in the PDF but arrive as TWO
@@ -688,24 +743,106 @@ public final class HeuristicSdmEnricher {
             table.getAttributes().put("border-color",
                     String.format("#%06x", rc & 0xFFFFFF));
         }
-        AbsorbedRow first = rows.get(0);
-        for (AbsorbedCell c : first.getCellList()) {
-            Rectangle rect = c.getRectangle();
-            table.getColumns().add(rect == null ? new ColumnSpec()
-                    : new ColumnSpec(ColumnSpec.WidthType.POINTS,
-                            Math.max(1, rect.getURX() - rect.getLLX()), ColumnSpec.Align.LEFT));
-        }
+        // Recover a canonical column/row grid so MERGED cells (a header spanning
+        // columns, a category spanning rows) survive as colSpan/rowSpan instead of
+        // collapsing the grid. Columns/rows are defined by cell START edges (left
+        // edges / tops), which align in both ruled grids and content-box column
+        // tables — a cell's RIGHT/BOTTOM edge is content-width and must NOT define a
+        // boundary. A cell's span is how many later start-lines its far edge crosses.
+        final double edgeTol = 2.5;
+        List<AbsorbedCell> geoCells = new ArrayList<>();
+        List<Double> colStartVals = new ArrayList<>();
+        List<Double> rowTopVals = new ArrayList<>();
+        double tableRight = -Double.MAX_VALUE;
+        double tableBottom = Double.MAX_VALUE;
         for (AbsorbedRow r : rows) {
-            TableRow row = new TableRow(TableRow.Kind.BODY);
             for (AbsorbedCell c : r.getCellList()) {
-                TableCell cell = new TableCell();
-                List<SdmBlock> content = byCell.get(c);
-                if (content != null) {
-                    cell.getChildren().addAll(content);
+                Rectangle cr = c.getRectangle();
+                if (cr == null) {
+                    continue;
                 }
-                row.getCells().add(cell);
+                geoCells.add(c);
+                colStartVals.add(cr.getLLX());
+                rowTopVals.add(cr.getURY());
+                tableRight = Math.max(tableRight, cr.getURX());
+                tableBottom = Math.min(tableBottom, cr.getLLY());
+            }
+        }
+        double[] colStarts = clusterEdges(colStartVals, edgeTol, true);   // ascending (left→right)
+        double[] rowStarts = clusterEdges(rowTopVals, edgeTol, false);    // descending (top→bottom)
+        int nCols = Math.max(1, colStarts.length);
+        int nRows = Math.max(1, rowStarts.length);
+        for (int i = 0; i < nCols; i++) {
+            double right = (i + 1 < nCols) ? colStarts[i + 1] : tableRight;
+            table.getColumns().add(new ColumnSpec(ColumnSpec.WidthType.POINTS,
+                    Math.max(1, right - colStarts[i]), ColumnSpec.Align.LEFT));
+        }
+        // Place each absorbed cell into the grid at its top-left start boundary,
+        // with spans measured by the start-lines its far edges cross.
+        TableCell[][] anchor = new TableCell[nRows][nCols];
+        boolean[][] covered = new boolean[nRows][nCols];
+        double tLlx = Double.MAX_VALUE, tLly = Double.MAX_VALUE;
+        double tUrx = -Double.MAX_VALUE, tUry = -Double.MAX_VALUE;
+        for (AbsorbedCell c : geoCells) {
+            Rectangle cr = c.getRectangle();
+            int c0 = nearestEdge(colStarts, cr.getLLX());
+            int r0 = nearestEdge(rowStarts, cr.getURY()); // top
+            if (c0 < 0 || r0 < 0 || c0 >= nCols || r0 >= nRows) {
+                continue;
+            }
+            // colSpan: subsequent column starts that fall inside the cell's width.
+            int colSpan = 1;
+            for (int j = c0 + 1; j < nCols && colStarts[j] < cr.getURX() - edgeTol; j++) {
+                colSpan++;
+            }
+            // rowSpan: subsequent row starts (going down) above the cell's bottom.
+            int rowSpan = 1;
+            for (int j = r0 + 1; j < nRows && rowStarts[j] > cr.getLLY() + edgeTol; j++) {
+                rowSpan++;
+            }
+            colSpan = Math.min(colSpan, nCols - c0);
+            rowSpan = Math.min(rowSpan, nRows - r0);
+            if (anchor[r0][c0] != null) {
+                continue; // two cells claim the same anchor — keep the first
+            }
+            TableCell cell = new TableCell();
+            List<SdmBlock> content = byCell.get(c);
+            if (content != null) {
+                cell.getChildren().addAll(content);
+            }
+            if (colSpan > 1) {
+                cell.setColSpan(colSpan);
+            }
+            if (rowSpan > 1) {
+                cell.setRowSpan(rowSpan);
+            }
+            cell.getAttributes().put("cell-bounds", new double[]{
+                    cr.getLLX(), cr.getLLY(), cr.getURX(), cr.getURY()});
+            tLlx = Math.min(tLlx, cr.getLLX());
+            tLly = Math.min(tLly, cr.getLLY());
+            tUrx = Math.max(tUrx, cr.getURX());
+            tUry = Math.max(tUry, cr.getURY());
+            anchor[r0][c0] = cell;
+            for (int rr = r0; rr < r0 + rowSpan; rr++) {
+                for (int cc = c0; cc < c0 + colSpan; cc++) {
+                    covered[rr][cc] = true;
+                }
+            }
+        }
+        // Emit rows containing only the cells that ANCHOR there (in column order);
+        // the writers reconstruct covered positions from the spans (carry-forward).
+        for (int r = 0; r < nRows; r++) {
+            TableRow row = new TableRow(TableRow.Kind.BODY);
+            for (int c = 0; c < nCols; c++) {
+                if (anchor[r][c] != null) {
+                    row.getCells().add(anchor[r][c]);
+                }
             }
             table.getRows().add(row);
+        }
+        if (tUrx > tLlx && tUry > tLly) {
+            table.getAttributes().put("table-bounds", new double[]{tLlx, tLly, tUrx, tUry});
+            table.getAttributes().put("table-page", pageIdx);
         }
         // Replace the first claimed block with the table; drop the rest.
         List<SdmBlock> rebuilt = new ArrayList<>(children.size());
@@ -721,6 +858,121 @@ public final class HeuristicSdmEnricher {
         children.clear();
         children.addAll(rebuilt);
         return 1;
+    }
+
+    /**
+     * True when the absorbed cells tile a clean rectangular grid exactly once each
+     * (a real table, incl. merged cells), using cell START edges for the grid and
+     * far-edge crossings for spans. Overlaps or gaps → not a clean grid.
+     */
+    private boolean tilesFullGrid(List<AbsorbedRow> rows) {
+        final double tol = 2.5;
+        List<Double> lx = new ArrayList<>();
+        List<Double> ty = new ArrayList<>();
+        for (AbsorbedRow r : rows) {
+            for (AbsorbedCell c : r.getCellList()) {
+                Rectangle cr = c.getRectangle();
+                if (cr == null) {
+                    continue;
+                }
+                lx.add(cr.getLLX());
+                ty.add(cr.getURY());
+            }
+        }
+        if (lx.isEmpty()) {
+            return false;
+        }
+        double[] cs = clusterEdges(lx, tol, true);
+        double[] rs = clusterEdges(ty, tol, false);
+        int nc = cs.length;
+        int nr = rs.length;
+        if (nc < 1 || nr < 1) {
+            return false;
+        }
+        int[][] cover = new int[nr][nc];
+        for (AbsorbedRow r : rows) {
+            for (AbsorbedCell c : r.getCellList()) {
+                Rectangle cr = c.getRectangle();
+                if (cr == null) {
+                    continue;
+                }
+                int c0 = nearestEdge(cs, cr.getLLX());
+                int r0 = nearestEdge(rs, cr.getURY());
+                if (c0 < 0 || r0 < 0 || c0 >= nc || r0 >= nr) {
+                    return false;
+                }
+                int cspan = 1;
+                while (c0 + cspan < nc && cs[c0 + cspan] < cr.getURX() - tol) {
+                    cspan++;
+                }
+                int rspan = 1;
+                while (r0 + rspan < nr && rs[r0 + rspan] > cr.getLLY() + tol) {
+                    rspan++;
+                }
+                for (int rr = r0; rr < r0 + rspan; rr++) {
+                    for (int cc = c0; cc < c0 + cspan; cc++) {
+                        cover[rr][cc]++;
+                    }
+                }
+            }
+        }
+        for (int i = 0; i < nr; i++) {
+            for (int j = 0; j < nc; j++) {
+                if (cover[i][j] != 1) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Clusters raw edge coordinates into a sorted set of distinct boundaries:
+     * values within {@code tol} collapse to their average. Returns them ascending
+     * when {@code ascending}, else descending (for row boundaries top&rarr;bottom).
+     */
+    private static double[] clusterEdges(List<Double> raw, double tol, boolean ascending) {
+        if (raw.isEmpty()) {
+            return new double[0];
+        }
+        List<Double> sorted = new ArrayList<>(raw);
+        java.util.Collections.sort(sorted);
+        List<Double> edges = new ArrayList<>();
+        double sum = sorted.get(0);
+        int count = 1;
+        double groupStart = sorted.get(0);
+        for (int i = 1; i < sorted.size(); i++) {
+            double v = sorted.get(i);
+            if (v - groupStart <= tol) {
+                sum += v;
+                count++;
+            } else {
+                edges.add(sum / count);
+                sum = v;
+                count = 1;
+                groupStart = v;
+            }
+        }
+        edges.add(sum / count);
+        double[] out = new double[edges.size()];
+        for (int i = 0; i < edges.size(); i++) {
+            out[i] = ascending ? edges.get(i) : edges.get(edges.size() - 1 - i);
+        }
+        return out;
+    }
+
+    /** Index of the boundary in {@code edges} nearest to {@code value}. */
+    private static int nearestEdge(double[] edges, double value) {
+        int best = -1;
+        double bestD = Double.MAX_VALUE;
+        for (int i = 0; i < edges.length; i++) {
+            double d = Math.abs(edges[i] - value);
+            if (d < bestD) {
+                bestD = d;
+                best = i;
+            }
+        }
+        return best;
     }
 
     /**

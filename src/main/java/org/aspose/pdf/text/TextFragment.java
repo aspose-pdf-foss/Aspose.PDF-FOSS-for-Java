@@ -109,6 +109,9 @@ public class TextFragment extends BaseParagraph {
     // resolve it. Null when unknown (falls back to the page resources).
     private org.aspose.pdf.engine.pdfobjects.PdfDictionary sourceResources;
     private TextReplaceOptions textReplaceOptions;
+    // Edit options carried over from the absorbing TextFragmentAbsorber. Drives
+    // FontReplace.RemoveUnusedFonts behaviour when a fragment's font is replaced.
+    private TextEditOptions editOptions;
     // Underline path operators detected in the source content (each group = one
     // underline subpath: re/m/l constructing ops + the f/S paint op). Removed from
     // the content stream when the fragment's underline is turned off (see
@@ -670,7 +673,11 @@ public class TextFragment extends BaseParagraph {
             return;
         }
         byte[] ttf = newFont.getFontData();
-        if (ttf == null || ttf.length == 0) {
+        if (ttf == null || ttf.length == 0 || isStandard14(newFont.getName())) {
+            // Standard-14 (Courier/Times-Roman/…) must stay non-embedded even when
+            // FontRepository resolved a system font program for them: register a
+            // simple non-embedded Type1 resource and re-encode with WinAnsi.
+            applySimpleFontToSource(newFont);
             return;
         }
         // Aspose parity: assigning an embeddable font to an absorbed fragment
@@ -750,6 +757,308 @@ public class TextFragment extends BaseParagraph {
         } catch (Exception e) {
             LOG.warning("Failed to write font change back to content stream: " + e.getMessage());
         }
+    }
+
+    /**
+     * Writes back a Standard-14 (non-embedded) font replacement for this fragment.
+     * Registers a simple {@code /Type1} resource (e.g. {@code /Courier}) in the
+     * governing resources, repoints this fragment's active font-selection operator
+     * at it, and re-encodes the show operator's text with WinAnsi single-byte
+     * codes. When {@link TextEditOptions.FontReplace#RemoveUnusedFonts} is active,
+     * prunes any {@code /Font} entries no longer referenced afterwards.
+     *
+     * @param newFont the Standard-14 replacement font
+     */
+    private void applySimpleFontToSource(org.aspose.pdf.text.Font newFont) {
+        // Standard-14 fonts are neither embedded nor subset.
+        newFont.setEmbedded(false);
+        newFont.setSubset(false);
+        try {
+            OperatorCollection ops = sourceOperators != null ? sourceOperators : page.getContents();
+            if (ops == null) {
+                return;
+            }
+            int idx = sourceOperatorIndex;
+            if (sourceOperator != null) {
+                int refreshed = indexOfByIdentity(ops, sourceOperator);
+                if (refreshed >= 0) idx = refreshed;
+            }
+            if (idx < 0 || idx >= ops.size()) {
+                return;
+            }
+            Operator showOp = ops.getAt(idx);
+            String opText = getOpText(showOp);
+            if (opText == null || opText.isEmpty()) {
+                return;
+            }
+
+            // Register (or reuse) the simple font, then repoint the governing
+            // font-selection operator at it. Mutating the governing Tf (rather than
+            // bracketing) means no residual reference to the old font remains, which
+            // is what lets RemoveUnusedFonts actually drop it.
+            String resName = registerSimpleFontOnResources(newFont);
+            if (resName == null) {
+                return;
+            }
+            SelectFont governing = null;
+            int govIdx = -1;
+            for (int i = idx - 1; i >= 0; i--) {
+                Operator op = ops.getAt(i);
+                if (op instanceof SelectFont) { governing = (SelectFont) op; govIdx = i; break; }
+                if (op instanceof BT || op instanceof ET) break;
+            }
+            if (governing != null) {
+                // Repoint the active Tf at the new resource, keeping its size, and
+                // remember the displaced font so RemoveUnusedFonts can retire any
+                // other selections of it (e.g. a leading Tf governing empty runs).
+                String oldName = governing.getFontName();
+                if (oldName != null && !oldName.equals(resName)) {
+                    recordReplacedFont(oldName);
+                }
+                ops.setAt(govIdx, new SelectFont(resName, governing.getSize()));
+            } else {
+                double size = sourceTfSize > 0 ? sourceTfSize : getTextState().getFontSize();
+                if (size <= 0) size = 1.0;
+                ops.addAt(idx, new SelectFont(resName, size));
+                idx++;
+            }
+
+            // Re-encode this operator's text as WinAnsi single-byte codes.
+            byte[] enc = encodeWinAnsi(opText);
+            List<PdfBase> operand = new ArrayList<>(1);
+            operand.add(new PdfString(enc));
+            ops.setAt(idx, new ShowText(operand));
+
+            if (editOptions != null
+                    && editOptions.getFontReplaceBehavior() == TextEditOptions.FontReplace.RemoveUnusedFonts) {
+                removeUnusedFontResources(ops, resName);
+            }
+
+            if (sourceContentStream != null) {
+                sourceContentStream.setDecodedData(serializeOperators(ops));
+            } else {
+                page.markContentsDirty();
+            }
+            if (page.getOwningDocument() != null) {
+                page.getOwningDocument().requestFullRewrite();
+            }
+        } catch (Exception e) {
+            LOG.warning("Failed to write Standard-14 font change back: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Registers (or reuses) a non-embedded {@code /Type1} font resource for the
+     * given Standard-14 font in the governing resource dictionary, returning its
+     * resource name.
+     *
+     * @param newFont the Standard-14 font
+     * @return the resource name, or null on failure
+     */
+    private String registerSimpleFontOnResources(org.aspose.pdf.text.Font newFont) {
+        try {
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict = sourceResources;
+            if (resDict == null) {
+                org.aspose.pdf.Resources pr = page.getResources();
+                if (pr == null) return null;
+                resDict = pr.getPdfDictionary();
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts = asDict(resDict.get("Font"));
+            if (fonts == null) {
+                fonts = new org.aspose.pdf.engine.pdfobjects.PdfDictionary();
+                resDict.set(PdfName.of("Font"), fonts);
+            }
+            String baseFont = newFont.getName() != null
+                    ? newFont.getName().replaceAll("\\s+", "") : "Helvetica";
+            // Reuse an already-registered simple copy of the same base font.
+            for (PdfName key : fonts.keySet()) {
+                org.aspose.pdf.engine.pdfobjects.PdfDictionary fd = asDict(fonts.get(key));
+                if (fd != null && baseFont.equals(fd.getNameAsString("BaseFont"))
+                        && "Type1".equals(fd.getNameAsString("Subtype"))
+                        && fd.get("FontDescriptor") == null) {
+                    return key.getName();
+                }
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fontDict =
+                    new org.aspose.pdf.engine.pdfobjects.PdfDictionary();
+            fontDict.set(PdfName.TYPE, PdfName.of("Font"));
+            fontDict.set(PdfName.of("Subtype"), PdfName.of("Type1"));
+            fontDict.set(PdfName.of("BaseFont"), PdfName.of(baseFont));
+            fontDict.set(PdfName.of("Encoding"), PdfName.of("WinAnsiEncoding"));
+            // Aspose names replacement fonts F0, F1, … — tests assert on "F0".
+            String resName = freshSimpleFontResourceName(fonts);
+            fonts.set(PdfName.of(resName), fontDict);
+            return resName;
+        } catch (Exception e) {
+            LOG.warning("Failed to register simple font: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Removes {@code /Font} entries from the governing resources that are no longer
+     * referenced by any {@code Tf} (SelectFont) operator in {@code ops}. Used for
+     * {@link TextEditOptions.FontReplace#RemoveUnusedFonts}.
+     *
+     * @param ops the operator collection governing the edited stream
+     */
+    private void removeUnusedFontResources(OperatorCollection ops, String resName) {
+        try {
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict = sourceResources;
+            if (resDict == null) {
+                org.aspose.pdf.Resources pr = page.getResources();
+                if (pr == null) return;
+                resDict = pr.getPdfDictionary();
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts = asDict(resDict.get("Font"));
+            if (fonts == null) return;
+            java.util.Set<String> replaced = replacedFontsFor(resDict);
+            // RemoveUnusedFonts implies wholesale consolidation onto the
+            // replacement font: treat every other /Font entry as replaced so text
+            // the absorber did not surface as a fragment (e.g. whitespace-only or
+            // skipped runs) does not keep an original font alive.
+            for (PdfName key : fonts.keySet()) {
+                if (!key.getName().equals(resName)) {
+                    replaced.add(key.getName());
+                }
+            }
+            // Retire any lingering Tf selections of a font that was replaced away
+            // (e.g. a leading Tf that governed only empty runs) by repointing them
+            // at the replacement resource, so the old font is truly unreferenced.
+            for (int i = 0; i < ops.size(); i++) {
+                if (ops.getAt(i) instanceof SelectFont) {
+                    SelectFont sf = (SelectFont) ops.getAt(i);
+                    String n = sf.getFontName();
+                    String bare = n == null ? null : (n.startsWith("/") ? n.substring(1) : n);
+                    if (bare != null && replaced.contains(bare) && !bare.equals(resName)) {
+                        ops.setAt(i, new SelectFont(resName, sf.getSize()));
+                    }
+                }
+            }
+            // Compute the still-referenced set from the (repointed) operators.
+            java.util.Set<String> used = new java.util.HashSet<>();
+            for (int i = 0; i < ops.size(); i++) {
+                if (ops.getAt(i) instanceof SelectFont) {
+                    String n = ((SelectFont) ops.getAt(i)).getFontName();
+                    if (n != null) used.add(n.startsWith("/") ? n.substring(1) : n);
+                }
+            }
+            java.util.List<PdfName> toRemove = new ArrayList<>();
+            for (PdfName key : fonts.keySet()) {
+                if (!used.contains(key.getName())) {
+                    toRemove.add(key);
+                }
+            }
+            // Object subtrees reachable only from the removed fonts (their
+            // FontDescriptor/FontFile programs) become orphans — collect them so
+            // the writer drops the embedded bytes, then subtract anything still
+            // reachable from a kept font to avoid deleting shared objects.
+            java.util.Set<org.aspose.pdf.engine.pdfobjects.PdfObjectKey> orphanKeys = new java.util.HashSet<>();
+            java.util.Set<org.aspose.pdf.engine.pdfobjects.PdfObjectKey> keptKeys = new java.util.HashSet<>();
+            for (PdfName key : fonts.keySet()) {
+                if (toRemove.contains(key)) {
+                    collectSubtreeKeys(fonts.get(key), orphanKeys, new java.util.HashSet<>());
+                } else {
+                    collectSubtreeKeys(fonts.get(key), keptKeys, new java.util.HashSet<>());
+                }
+            }
+            orphanKeys.removeAll(keptKeys);
+            for (PdfName key : toRemove) {
+                fonts.remove(key);
+            }
+            if (!orphanKeys.isEmpty() && page != null && page.getOwningDocument() != null) {
+                page.getOwningDocument().removeParserObjects(orphanKeys);
+            }
+        } catch (Exception e) {
+            LOG.warning("Failed to remove unused fonts: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Collects the object keys of every indirect object reachable from {@code v}
+     * (dictionaries, arrays, streams, references). Used to find the embedded-font
+     * object subtree so it can be pruned when the font is removed.
+     *
+     * @param v    the value to walk
+     * @param out  accumulates reachable object keys
+     * @param seen guards against reference cycles
+     */
+    private static void collectSubtreeKeys(PdfBase v,
+            java.util.Set<org.aspose.pdf.engine.pdfobjects.PdfObjectKey> out,
+            java.util.Set<org.aspose.pdf.engine.pdfobjects.PdfObjectKey> seen) {
+        if (v == null) return;
+        if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfObjectReference) {
+            org.aspose.pdf.engine.pdfobjects.PdfObjectReference ref =
+                    (org.aspose.pdf.engine.pdfobjects.PdfObjectReference) v;
+            org.aspose.pdf.engine.pdfobjects.PdfObjectKey k = ref.getKey();
+            if (k != null) {
+                if (!seen.add(k)) return;
+                out.add(k);
+            }
+            try { collectSubtreeKeys(ref.dereference(), out, seen); } catch (Exception ignore) {}
+            return;
+        }
+        if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfDictionary) {
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary d =
+                    (org.aspose.pdf.engine.pdfobjects.PdfDictionary) v;
+            for (PdfName key : d.keySet()) {
+                collectSubtreeKeys(d.get(key), out, seen);
+            }
+        } else if (v instanceof org.aspose.pdf.engine.pdfobjects.PdfArray) {
+            org.aspose.pdf.engine.pdfobjects.PdfArray a =
+                    (org.aspose.pdf.engine.pdfobjects.PdfArray) v;
+            for (int i = 0; i < a.size(); i++) {
+                collectSubtreeKeys(a.get(i), out, seen);
+            }
+        }
+    }
+
+    /** Font resource names displaced by a Standard-14 replacement, per resource dict. */
+    private static final java.util.Map<org.aspose.pdf.engine.pdfobjects.PdfDictionary,
+            java.util.Set<String>> REPLACED_FONTS = new java.util.WeakHashMap<>();
+
+    /** Records {@code oldName} (bare, no leading '/') as replaced in the governing resources. */
+    private void recordReplacedFont(String oldName) {
+        org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict = sourceResources;
+        if (resDict == null && page != null && page.getResources() != null) {
+            resDict = page.getResources().getPdfDictionary();
+        }
+        if (resDict == null) return;
+        String bare = oldName.startsWith("/") ? oldName.substring(1) : oldName;
+        replacedFontsFor(resDict).add(bare);
+    }
+
+    /** Returns (creating if needed) the replaced-font-name set for {@code resDict}. */
+    private static java.util.Set<String> replacedFontsFor(
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict) {
+        synchronized (REPLACED_FONTS) {
+            return REPLACED_FONTS.computeIfAbsent(resDict, k -> new java.util.HashSet<>());
+        }
+    }
+
+    /** True when {@code name} is one of the 14 standard PDF fonts (subset tag ignored). */
+    private static boolean isStandard14(String name) {
+        if (name == null) return false;
+        String n = name.contains("+") ? name.substring(name.indexOf('+') + 1) : name;
+        switch (n) {
+            case "Courier": case "Courier-Bold": case "Courier-Oblique": case "Courier-BoldOblique":
+            case "Helvetica": case "Helvetica-Bold": case "Helvetica-Oblique": case "Helvetica-BoldOblique":
+            case "Times-Roman": case "Times-Bold": case "Times-Italic": case "Times-BoldItalic":
+            case "Symbol": case "ZapfDingbats":
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** Encodes {@code text} to WinAnsi single-byte codes (non-representable → '?'). */
+    private static byte[] encodeWinAnsi(String text) {
+        byte[] out = new byte[text.length()];
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            out[i] = (c > 0 && c < 0x100) ? (byte) c : (byte) '?';
+        }
+        return out;
     }
 
     /** Encodes {@code text} as big-endian 2-byte glyph indices via the font's cmap. */
@@ -840,6 +1149,16 @@ public class TextFragment extends BaseParagraph {
     private static String freshFontResourceName(org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts) {
         for (int i = 0; ; i++) {
             String name = "FT" + i;
+            if (fonts.get(PdfName.of(name)) == null) {
+                return name;
+            }
+        }
+    }
+
+    /** Returns a Standard-14 replacement resource name ({@code F0}, {@code F1}, …). */
+    private static String freshSimpleFontResourceName(org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts) {
+        for (int i = 0; ; i++) {
+            String name = "F" + i;
             if (fonts.get(PdfName.of(name)) == null) {
                 return name;
             }
@@ -1891,6 +2210,17 @@ public class TextFragment extends BaseParagraph {
      */
     public void setTextReplaceOptions(TextReplaceOptions textReplaceOptions) {
         this.textReplaceOptions = textReplaceOptions;
+    }
+
+    /**
+     * Associates the absorbing pass's edit options with this fragment. Used to
+     * honour {@link TextEditOptions.FontReplace#RemoveUnusedFonts} when the
+     * fragment's font is replaced via {@code getTextState().setFont(...)}.
+     *
+     * @param editOptions the edit options (may be null)
+     */
+    public void setEditOptions(TextEditOptions editOptions) {
+        this.editOptions = editOptions;
     }
 
     /**

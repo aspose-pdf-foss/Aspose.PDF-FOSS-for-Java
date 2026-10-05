@@ -201,7 +201,10 @@ public class HeuristicSdmEnricherTest {
         ListBlock list = (ListBlock) out.get(1);
         assertTrue(!list.isOrdered(), "bullets → unordered");
         assertEquals(2, list.getItems().size());
-        assertEquals("• First point of the list",
+        // The leading marker glyph is stripped from the item text — it is
+        // structural and every writer (md "-", html <li>, docx numPr) re-emits
+        // its own, so keeping it would double-print the bullet.
+        assertEquals("First point of the list",
                 textOf(list.getItems().get(0).getChildren().get(0)));
         assertEquals(SdmNodeType.PARAGRAPH, out.get(2).getType());
         assertEquals(SdmNodeType.PARAGRAPH, out.get(3).getType(),
@@ -228,7 +231,9 @@ public class HeuristicSdmEnricherTest {
         assertEquals(Integer.valueOf(3), list.getStart(), "start parsed from the first label");
         assertEquals(2, list.getItems().size(), "two top-level items");
         List<SdmBlock> firstItem = list.getItems().get(0).getChildren();
-        assertEquals("3. Third step of the procedure", textOf(firstItem.get(0)));
+        // Marker stripped (see note above); the start number was still parsed
+        // from the original "3." label before stripping.
+        assertEquals("Third step of the procedure", textOf(firstItem.get(0)));
         assertEquals("continued explanation of step three", textOf(firstItem.get(1)),
                 "hanging-indent line joins the item");
         SdmBlock nested = firstItem.get(2);

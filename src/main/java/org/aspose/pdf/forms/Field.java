@@ -217,6 +217,95 @@ Field extends WidgetAnnotation implements Iterable<Field> {
     }
 
     /**
+     * Exports this field's value to a single-element JSON array
+     * ({@code [{"Name":..,"Flags":..,"Value":..}]}).
+     *
+     * @param jsonStream destination stream; must not be {@code null}
+     * @param indented   whether to pretty-print
+     */
+    public void exportValueToJson(java.io.OutputStream jsonStream, boolean indented) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        String name = getPartialName();
+        if (name == null || name.isEmpty()) {
+            name = getFullName();
+        }
+        String value = getValue();
+        java.util.List<FormJsonSupport.FieldEntry> one = new java.util.ArrayList<>();
+        one.add(new FormJsonSupport.FieldEntry(name == null ? "" : name,
+                getFieldFlags(), value == null ? "" : value));
+        try {
+            jsonStream.write(FormJsonSupport.toJson(one, indented)
+                    .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            jsonStream.flush();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to write field JSON", e);
+        }
+    }
+
+    /** Imports this field's value from a JSON array, matching by this field's name. */
+    public boolean importValueFromJson(java.io.InputStream jsonStream) {
+        return importValueFromJson(jsonStream, null);
+    }
+
+    /**
+     * Imports this field's value from a JSON array. When {@code fieldNameInJson} is
+     * given, the entry with that {@code Name} is used; otherwise this field's own name.
+     *
+     * @return {@code true} if a matching entry was found and applied
+     */
+    @SuppressWarnings("unchecked")
+    public boolean importValueFromJson(java.io.InputStream jsonStream, String fieldNameInJson) {
+        if (jsonStream == null) {
+            throw new IllegalArgumentException("jsonStream must not be null");
+        }
+        String target = fieldNameInJson;
+        if (target == null) {
+            target = getPartialName();
+            if (target == null || target.isEmpty()) {
+                target = getFullName();
+            }
+        }
+        String json;
+        try {
+            java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            while ((n = jsonStream.read(chunk)) != -1) {
+                buf.write(chunk, 0, n);
+            }
+            json = new String(buf.toByteArray(), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("Failed to read field JSON", e);
+        }
+        Object parsed = FormJsonSupport.parse(json);
+        java.util.List<Object> arr;
+        if (parsed instanceof java.util.List) {
+            arr = (java.util.List<Object>) parsed;
+        } else if (parsed instanceof java.util.Map) {
+            arr = java.util.Collections.singletonList(parsed);
+        } else {
+            return false;
+        }
+        for (Object item : arr) {
+            if (!(item instanceof java.util.Map)) {
+                continue;
+            }
+            java.util.Map<String, Object> obj = (java.util.Map<String, Object>) item;
+            Object name = obj.get("Name");
+            if (name != null && name.toString().equals(target)) {
+                Object value = obj.get("Value");
+                if (value != null) {
+                    setValue(value.toString());
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Returns the field flags (/Ff entry).
      *
      * @return the flags integer (0 if not set)

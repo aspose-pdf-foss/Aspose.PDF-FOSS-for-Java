@@ -38,6 +38,12 @@ public final class PDFWriter {
 
     private static final Logger LOGGER = Logger.getLogger(PDFWriter.class.getName());
 
+    /** Aspose-compatibility producer marker comment written after the header
+     *  binary hint. Aspose.PDF emits a "%   " marker line into its output and
+     *  some callers assert on its presence; §7.5.2 permits comments anywhere,
+     *  so emitting it costs nothing and preserves output parity. */
+    private static final byte[] ASPOSE_MARKER = "%   \n".getBytes(StandardCharsets.US_ASCII);
+
     /** Binary hint bytes after the header, per §7.5.2.
      *  Four bytes with high bit set to indicate binary content. */
     private static final byte[] BINARY_HINT = {(byte) 0xE2, (byte) 0xE3, (byte) 0xCF, (byte) 0xD3};
@@ -215,6 +221,12 @@ public final class PDFWriter {
             remaining -= read;
         }
 
+        // Emit the Aspose-compatibility marker at the start of the appended
+        // revision (§7.5.2 comments are legal anywhere). The original prefix
+        // keeps its own header, so incremental saves would otherwise lack it.
+        writeBytes(new byte[]{'\n'});
+        writeBytes(ASPOSE_MARKER);
+
         // Find the old xref offset from the original file (we need it for /Prev)
         long oldXrefOffset = findOldXrefOffset(original);
 
@@ -367,6 +379,54 @@ public final class PDFWriter {
     }
 
     /**
+     * Promotes an INLINE dictionary that ISO 32000 (or Adobe Acrobat) requires
+     * to be an indirect object — a {@code /FontDescriptor} (§9.8.1 Table 122:
+     * "shall be an indirect reference") or a font dictionary ({@code /Type /Font};
+     * Acrobat regenerates editable field appearances only when the {@code /DR}
+     * font is indirect, and inline font dicts trip other strict readers). The
+     * writer already lifts every reachable stream to indirect (§7.3.8) but leaves
+     * nested dictionaries inline unless promoted here.
+     *
+     * <p>Only bare inline dicts are touched: a value that is already a reference,
+     * a stream, or carries an object key is left as-is — so parser-loaded fonts
+     * (already indirect) and everything else are unaffected. Returns the dict to
+     * descend into when promoted, else {@code null}.</p>
+     */
+    private PdfBase promoteMandatoryIndirectDict(PdfBase value,
+                                                 Map<PdfObjectKey, PdfBase> objects,
+                                                 java.util.function.Consumer<PdfObjectReference> slotSetter) {
+        if (!(value instanceof PdfDictionary) || value instanceof PdfStream) {
+            return null;
+        }
+        PdfDictionary d = (PdfDictionary) value;
+        if (d.getObjectKey() != null) {
+            return null; // already registered / will serialise as indirect
+        }
+        String type = nameString(d.get(PdfName.of("Type")));
+        if (!"FontDescriptor".equals(type) && !"Font".equals(type)) {
+            return null;
+        }
+        PdfObjectKey key = new PdfObjectKey(nextFreeObjectNumber(objects), 0);
+        d.setObjectKey(key);
+        objects.put(key, d);
+        indexRegistered(d, key);
+        slotSetter.accept(new PdfObjectReference(key, k -> objects.get(k)));
+        return d;
+    }
+
+    /** The name string of a value that is (or resolves to) a {@link PdfName}, else {@code null}. */
+    private static String nameString(PdfBase v) {
+        if (v instanceof PdfObjectReference) {
+            try {
+                v = ((PdfObjectReference) v).dereference();
+            } catch (Exception e) {
+                return null;
+            }
+        }
+        return v instanceof PdfName ? ((PdfName) v).getName() : null;
+    }
+
+    /**
      * Walks {@code node}, registering any orphan / stale streams and
      * reference-target dictionaries it encounters per the contract on
      * {@link #registerOrphanStreams(Map, PdfDictionary)}. Iterative with an
@@ -411,9 +471,12 @@ public final class PDFWriter {
                         new java.util.ArrayList<>(((PdfDictionary) node).keySet());
                 for (PdfName k : keys) {
                     PdfBase value = ((PdfDictionary) node).get(k);
-                    PdfBase descendInto = walkReferenceForReregistration(
-                            value, objects,
-                            newRef -> ((PdfDictionary) node).set(k, newRef));
+                    java.util.function.Consumer<PdfObjectReference> slot =
+                            newRef -> ((PdfDictionary) node).set(k, newRef);
+                    PdfBase descendInto = walkReferenceForReregistration(value, objects, slot);
+                    if (descendInto == null) {
+                        descendInto = promoteMandatoryIndirectDict(value, objects, slot);
+                    }
                     work.push(descendInto != null ? descendInto : value);
                 }
             } else if (node instanceof PdfArray) {
@@ -421,8 +484,11 @@ public final class PDFWriter {
                 for (int i = 0; i < arr.size(); i++) {
                     final int idx = i;
                     PdfBase value = arr.get(i);
-                    PdfBase descendInto = walkReferenceForReregistration(
-                            value, objects, newRef -> arr.set(idx, newRef));
+                    java.util.function.Consumer<PdfObjectReference> slot = newRef -> arr.set(idx, newRef);
+                    PdfBase descendInto = walkReferenceForReregistration(value, objects, slot);
+                    if (descendInto == null) {
+                        descendInto = promoteMandatoryIndirectDict(value, objects, slot);
+                    }
                     work.push(descendInto != null ? descendInto : value);
                 }
             }
@@ -476,18 +542,15 @@ public final class PDFWriter {
                 objects.put(refKey, target);
                 indexRegistered(target, refKey);
             } else if (existing != target) {
-                // Identity lookup via the phase index (linear entrySet scan
-                // here was quadratic on large documents).
-                PdfObjectKey found = reverseIndex != null ? reverseIndex.get(target) : null;
-                if (found == null) {
-                    for (Map.Entry<PdfObjectKey, PdfBase> e : objects.entrySet()) {
-                        if (e.getValue() == target) {
-                            found = e.getKey();
-                            break;
-                        }
-                    }
-                }
-                PdfObjectKey effectiveKey = found;
+                // Identity lookup via the phase index. reverseIndex is
+                // authoritative for membership in {@code objects}: it is seeded
+                // from every object at phase start and kept in sync by
+                // indexRegistered() on every objects.put(). A null lookup
+                // therefore means the target is genuinely not registered yet, so
+                // the old linear entrySet fallback could never find it — it only
+                // burned O(N) per orphan and made merges quadratic (PDFNET_48386
+                // hung the writer for minutes on a 4-way concatenate).
+                PdfObjectKey effectiveKey = reverseIndex != null ? reverseIndex.get(target) : null;
                 if (effectiveKey == null) {
                     effectiveKey = new PdfObjectKey(nextFreeObjectNumber(objects), 0);
                     objects.put(effectiveKey, target);
@@ -511,6 +574,7 @@ public final class PDFWriter {
         writeBytes(new byte[]{'%'});
         writeBytes(BINARY_HINT);
         writeBytes(new byte[]{'\n'});
+        writeBytes(ASPOSE_MARKER);
     }
 
     /**
@@ -946,6 +1010,7 @@ public final class PDFWriter {
         writeBytes(new byte[]{'%'});
         writeBytes(BINARY_HINT);
         writeBytes(new byte[]{'\n'});
+        writeBytes(ASPOSE_MARKER);
 
         // 2. Build object streams (pack eligible objects)
         ObjectStreamResult osResult = buildObjectStreams(objects, maxPerStream);

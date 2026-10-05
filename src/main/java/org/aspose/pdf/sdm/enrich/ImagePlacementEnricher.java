@@ -19,6 +19,9 @@ import org.aspose.pdf.pgm.PgmBoxKind;
 import org.aspose.pdf.pgm.PgmModel;
 import org.aspose.pdf.pgm.PgmRect;
 import org.aspose.pdf.sdm.Figure;
+import org.aspose.pdf.sdm.Table;
+import org.aspose.pdf.sdm.TableCell;
+import org.aspose.pdf.sdm.TableRow;
 import org.aspose.pdf.sdm.Resource;
 import org.aspose.pdf.sdm.ResourceRef;
 import org.aspose.pdf.sdm.SdmBlock;
@@ -98,13 +101,88 @@ public final class ImagePlacementEnricher {
                 fig.setId(SdmIds.sessionNodeId(NS, "imgabs", seq++));
                 fig.getAttributes().put("display-width", r.getWidth());
                 fig.getAttributes().put("display-height", r.getHeight());
-                insertByPosition(sdm, pgm, fig, pi - 1, r.getURY());
+                // If the placement sits inside a recognised table cell, put the
+                // image INTO that cell (a product-catalogue icon column) instead of
+                // dropping it as a stray figure after the table.
+                if (!placeInTableCell(sdm, fig, pi - 1, r)) {
+                    insertByPosition(sdm, pgm, fig, pi - 1, r.getURY());
+                }
                 existing.add(PgmRect.fromCorners(r.getLLX(), r.getLLY(), r.getURX(), r.getURY()));
                 added++;
             }
         }
         final int fAdded = added;
         LOG.fine(() -> "ImagePlacementEnricher: recovered " + fAdded + " image(s)");
+
+        // Sweep pre-existing top-level image figures (emitted by the shallow reader)
+        // into any table cell whose recorded bounds contain them, so an icon column
+        // shows the icon IN the cell rather than as a stray figure after the table.
+        for (int i = 0; i < sdm.getChildren().size(); i++) {
+            SdmBlock b = sdm.getChildren().get(i);
+            if (!(b instanceof Figure)) {
+                continue;
+            }
+            Figure f = (Figure) b;
+            if (f.getImage() == null || f.getId() == null) {
+                continue;
+            }
+            PgmRect box = null;
+            int page0 = -1;
+            for (PgmBox bx : pgm.byId(f.getId())) {
+                if (bx.getKind() == PgmBoxKind.IMAGE) {
+                    box = bx.getRect();
+                    page0 = bx.getPage();
+                    break;
+                }
+            }
+            if (box == null) {
+                continue;
+            }
+            Rectangle r = new Rectangle(box.getX(), box.getY(),
+                    box.getX() + box.getW(), box.getY() + box.getH());
+            if (placeInTableCell(sdm, f, page0, r)) {
+                sdm.getChildren().remove(i);
+                i--;
+            }
+        }
+    }
+
+    /**
+     * If the image placement's centre falls inside a recognised table cell on this
+     * page (matched via the cell's recorded {@code cell-bounds}), inserts the image
+     * figure as the first child of that cell and returns true.
+     */
+    private static boolean placeInTableCell(SdmDocument sdm, Figure fig, int page0, Rectangle r) {
+        double cx = (r.getLLX() + r.getURX()) / 2;
+        double cy = (r.getLLY() + r.getURY()) / 2;
+        for (SdmBlock b : sdm.getChildren()) {
+            if (!(b instanceof Table)) {
+                continue;
+            }
+            Table t = (Table) b;
+            Object pg = t.getAttributes().get("table-page");
+            if (!(pg instanceof Integer) || (Integer) pg != page0) {
+                continue;
+            }
+            for (TableRow row : t.getRows()) {
+                for (TableCell cell : row.getCells()) {
+                    Object cb = cell.getAttributes().get("cell-bounds");
+                    if (!(cb instanceof double[])) {
+                        continue;
+                    }
+                    double[] bb = (double[]) cb;
+                    double lx = Math.min(bb[0], bb[2]);
+                    double rx = Math.max(bb[0], bb[2]);
+                    double by = Math.min(bb[1], bb[3]);
+                    double ty = Math.max(bb[1], bb[3]);
+                    if (cx >= lx && cx <= rx && cy >= by && cy <= ty) {
+                        cell.getChildren().add(0, fig);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /** Rects (PDF points) of images the reader already captured on the given page. */

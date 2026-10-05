@@ -148,11 +148,92 @@ public class JpegDevice extends PageDevice {
             ImageWriteParam param = writer.getDefaultWriteParam();
             param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
             param.setCompressionQuality(quality / 100.0f);
-            writer.write(null, new IIOImage(rgb, null, null), param);
+            // Stamp the device resolution into the JFIF density fields so the
+            // saved JPEG advertises the correct DPI (ISO/IEC 10918 JFIF APP0).
+            // Without this the file carries no density and readers report 0/72.
+            javax.imageio.metadata.IIOMetadata meta = buildJfifMetadata(writer, param, rgb);
+            writer.write(null, new IIOImage(rgb, null, meta), param);
         } finally {
             writer.dispose();
         }
         LOG.fine(() -> "JPEG image written: " + rgb.getWidth() + "x" + rgb.getHeight()
                 + " quality=" + quality);
+    }
+
+    /**
+     * Builds JPEG image metadata carrying the device resolution as the JFIF
+     * pixel density (resUnits = 1 → dots-per-inch). Returns {@code null} if the
+     * writer cannot supply or accept a metadata tree, in which case the image is
+     * written without density (the pixel data is unaffected either way).
+     *
+     * @param writer the JPEG image writer
+     * @param param  the write parameters (needed to obtain default metadata)
+     * @param rgb    the image being written (its type selects the metadata shape)
+     * @return populated metadata, or {@code null} if density could not be set
+     */
+    private javax.imageio.metadata.IIOMetadata buildJfifMetadata(
+            ImageWriter writer, ImageWriteParam param, BufferedImage rgb) {
+        try {
+            javax.imageio.ImageTypeSpecifier type =
+                    javax.imageio.ImageTypeSpecifier.createFromRenderedImage(rgb);
+            javax.imageio.metadata.IIOMetadata meta =
+                    writer.getDefaultImageMetadata(type, param);
+            if (meta == null || meta.isReadOnly()) {
+                return null;
+            }
+            String fmt = "javax_imageio_jpeg_image_1.0";
+            javax.imageio.metadata.IIOMetadataNode root =
+                    (javax.imageio.metadata.IIOMetadataNode) meta.getAsTree(fmt);
+            javax.imageio.metadata.IIOMetadataNode jfif = findOrCreateJfif(root);
+            jfif.setAttribute("resUnits", "1"); // dots per inch
+            jfif.setAttribute("Xdensity", String.valueOf(resolution.getX()));
+            jfif.setAttribute("Ydensity", String.valueOf(resolution.getY()));
+            meta.setFromTree(fmt, root);
+            return meta;
+        } catch (RuntimeException | javax.imageio.metadata.IIOInvalidTreeException e) {
+            LOG.fine(() -> "Could not embed JFIF density: " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Finds the {@code app0JFIF} node under {@code JPEGvariety}, creating the
+     * intermediate nodes if the default tree omitted them.
+     *
+     * @param root the root metadata node for the JPEG image format
+     * @return the {@code app0JFIF} element ready to receive density attributes
+     */
+    private static javax.imageio.metadata.IIOMetadataNode findOrCreateJfif(
+            javax.imageio.metadata.IIOMetadataNode root) {
+        javax.imageio.metadata.IIOMetadataNode variety =
+                childByName(root, "JPEGvariety");
+        if (variety == null) {
+            variety = new javax.imageio.metadata.IIOMetadataNode("JPEGvariety");
+            root.insertBefore(variety, root.getFirstChild());
+        }
+        javax.imageio.metadata.IIOMetadataNode jfif = childByName(variety, "app0JFIF");
+        if (jfif == null) {
+            jfif = new javax.imageio.metadata.IIOMetadataNode("app0JFIF");
+            variety.appendChild(jfif);
+        }
+        return jfif;
+    }
+
+    /**
+     * Returns the first direct child element with the given name, or {@code null}.
+     *
+     * @param parent the parent metadata node
+     * @param name   the child tag name to match
+     * @return the matching child, or {@code null} if none
+     */
+    private static javax.imageio.metadata.IIOMetadataNode childByName(
+            javax.imageio.metadata.IIOMetadataNode parent, String name) {
+        for (org.w3c.dom.Node n = parent.getFirstChild(); n != null; n = n.getNextSibling()) {
+            if (n instanceof javax.imageio.metadata.IIOMetadataNode
+                    && name.equals(n.getNodeName())) {
+                return (javax.imageio.metadata.IIOMetadataNode) n;
+            }
+        }
+        return null;
     }
 }

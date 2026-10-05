@@ -132,6 +132,21 @@ public final class SdmDocxWriter {
     private int relCounter;
     private int docPrId;
     private boolean inHyperlink;
+
+    /**
+     * True while emitting a positioned (abs-x/framePr) paragraph on a
+     * fixed-layout poster page. Such text sits OVER the page-underlay raster, so
+     * near-white glyphs are visible against the source artwork and must keep
+     * their colour — the {@link #emitRunText} white-text rescue is suppressed.
+     */
+    private boolean overUnderlay;
+
+    /**
+     * Count of fixed-layout page underlays emitted so far. Every poster page is
+     * one physical page; consecutive posters carry no flow content between them,
+     * so each underlay after the first forces a page break to keep pagination.
+     */
+    private int postersEmitted;
     /** Bookmark {@code w:id} (integer, per OOXML schema) assigned per anchor name. */
     private final java.util.Map<String, Integer> bookmarkIds = new java.util.HashMap<>();
     private int bookmarkCounter;
@@ -299,7 +314,13 @@ public final class SdmDocxWriter {
             int ilvl, String framePr) {
         body.append("<w:p>");
         emitParagraphProps(style, pStyle, numId, ilvl, false, framePr);
+        boolean prevOverUnderlay = overUnderlay;
+        // A framed paragraph is a poster-page label painted over the underlay
+        // raster: its colour is meaningful against the artwork, so don't rescue
+        // white text there (unlike flow paragraphs, which sit on white paper).
+        overUnderlay = prevOverUnderlay || framePr != null;
         emitInlines(inlines);
+        overUnderlay = prevOverUnderlay;
         body.append("</w:p>");
     }
 
@@ -499,10 +520,20 @@ public final class SdmDocxWriter {
             if (uRel != null) {
                 double w = numAttrOr(fig, "display-width", 612);
                 double h = numAttrOr(fig, "display-height", 792);
+                // Each poster page is one physical page. Its text became
+                // out-of-flow page-anchored frames, so consecutive poster pages
+                // carry no flow content to paginate them and would all pile onto
+                // one sheet. Force a page break before every underlay after the
+                // first so each lands on its own page (and the following frames
+                // anchor to that page).
                 body.append("<w:p>");
+                if (postersEmitted > 0) {
+                    body.append("<w:pPr><w:pageBreakBefore/></w:pPr>");
+                }
                 emitAnchoredDrawing(uRel, Math.round(w * EMU_PER_PT), Math.round(h * EMU_PER_PT),
                         fig.getAlt() == null ? "" : fig.getAlt());
                 body.append("</w:p>");
+                postersEmitted++;
             }
             return;
         }
@@ -733,8 +764,26 @@ public final class SdmDocxWriter {
             }
             return;
         }
-        body.append("<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/>")
-            .append("<w:tblW w:w=\"0\" w:type=\"auto\"/>");
+        // Fixed layout at the source column widths, but ONLY for WIDE tables:
+        // under Word's default AUTO layout a wide table whose cells hold short
+        // text collapses to a narrow column (Word shrinks each column to its
+        // content), squishing landscape tables. Honouring explicit widths keeps
+        // the source geometry. Narrow in-prose tables keep AUTO (untouched) —
+        // there squish is not a problem and a mis-estimated fixed width would
+        // clip text.
+        long[] colw = computeColumnTwips(table, cols);
+        boolean fixed = isWideTable(table, cols);
+        long tblwSum = 0;
+        for (long w : colw) {
+            tblwSum += w;
+        }
+        body.append("<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/>");
+        if (fixed) {
+            body.append("<w:tblW w:w=\"").append(tblwSum).append("\" w:type=\"dxa\"/>")
+                .append("<w:tblLayout w:type=\"fixed\"/>");
+        } else {
+            body.append("<w:tblW w:w=\"0\" w:type=\"auto\"/>");
+        }
         if (ruled) {
             String b = "<w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"" + ruleColor + "\"/>";
             body.append("<w:tblBorders>")
@@ -747,7 +796,7 @@ public final class SdmDocxWriter {
                 .append("</w:tblBorders>");
         }
         body.append("</w:tblPr>");
-        emitTableGrid(table, cols);
+        emitTableGrid(colw);
 
         int[] carryRows = new int[cols];   // remaining continuation rows per column
         int[] carrySpan = new int[cols];   // gridSpan of the cell owning the merge
@@ -759,13 +808,13 @@ public final class SdmDocxWriter {
             while (c < cols) {
                 if (carryRows[c] > 0) {
                     int span = Math.max(1, carrySpan[c]);
-                    emitContinuationCell(span);
+                    emitContinuationCell(span, fixed ? spanTwips(colw, c, span) : 0);
                     carryRows[c]--;
                     c += span;
                 } else if (ci < cells.size()) {
                     TableCell cell = cells.get(ci++);
                     int span = Math.max(1, Math.min(cell.getColSpan(), cols - c));
-                    emitCell(cell, span);
+                    emitCell(cell, span, fixed ? spanTwips(colw, c, span) : 0);
                     if (cell.getRowSpan() > 1) {
                         carryRows[c] = cell.getRowSpan() - 1;
                         carrySpan[c] = span;
@@ -774,7 +823,12 @@ public final class SdmDocxWriter {
                 } else {
                     // Ragged row — pad with a real (non-merged) empty cell so the
                     // grid stays rectangular.
-                    body.append("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr><w:p/></w:tc>");
+                    if (fixed) {
+                        body.append("<w:tc><w:tcPr><w:tcW w:w=\"").append(colw[c])
+                            .append("\" w:type=\"dxa\"/></w:tcPr><w:p/></w:tc>");
+                    } else {
+                        body.append("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/></w:tcPr><w:p/></w:tc>");
+                    }
                     c += 1;
                 }
             }
@@ -813,30 +867,123 @@ public final class SdmDocxWriter {
         return n;
     }
 
-    private void emitTableGrid(Table table, int cols) {
-        body.append("<w:tblGrid>");
+    /** Minimum column width (twips) so a scaled/unknown column never vanishes. */
+    private static final long MIN_COL_TWIPS = 180;
+
+    /**
+     * Column widths in twips for a fixed-layout table: source POINTS widths
+     * where known, an even share of the leftover content width for unknown
+     * columns, all scaled down proportionally if the total overflows the page
+     * content box (Word does not shrink a fixed table — it overruns the margin).
+     */
+    private long[] computeColumnTwips(Table table, int cols) {
+        double[] g = pageGeometryPt();
+        long content = Math.max(720, twips(g[0] - g[2] - g[3]));
+        long[] w = new long[cols];
         List<ColumnSpec> specs = table.getColumns();
+        long known = 0;
+        int unknown = 0;
         for (int i = 0; i < cols; i++) {
-            long w = 0;
+            long cw = 0;
             if (specs != null && i < specs.size()
-                    && specs.get(i).getWidthType() == ColumnSpec.WidthType.POINTS) {
-                w = twips(specs.get(i).getWidth());
+                    && specs.get(i).getWidthType() == ColumnSpec.WidthType.POINTS
+                    && specs.get(i).getWidth() > 0) {
+                cw = twips(specs.get(i).getWidth());
             }
-            if (w <= 0) {
-                w = 1440; // 1 inch default; Word re-fits to content/page width
+            if (cw > 0) {
+                w[i] = cw;
+                known += cw;
+            } else {
+                w[i] = -1;
+                unknown++;
             }
-            body.append("<w:gridCol w:w=\"").append(w).append("\"/>");
+        }
+        if (unknown > 0) {
+            long remain = content - known;
+            long each = remain > 0 ? Math.max(MIN_COL_TWIPS, remain / unknown) : MIN_COL_TWIPS;
+            for (int i = 0; i < cols; i++) {
+                if (w[i] < 0) {
+                    w[i] = each;
+                }
+            }
+        }
+        long sum = 0;
+        for (long x : w) {
+            sum += x;
+        }
+        if (sum <= 0) {
+            long each = Math.max(MIN_COL_TWIPS, content / Math.max(1, cols));
+            for (int i = 0; i < cols; i++) {
+                w[i] = each;
+            }
+            return w;
+        }
+        if (sum > content) {
+            double s = (double) content / sum;
+            for (int i = 0; i < cols; i++) {
+                w[i] = Math.max(1, Math.round(w[i] * s));
+            }
+        }
+        return w;
+    }
+
+    /**
+     * A table is "wide" when its known source column widths span at least 60% of
+     * the page content width — the case where AUTO layout squishes it to a
+     * narrow column. Narrow in-prose tables (mostly unknown or small widths)
+     * return false and keep the safe AUTO behaviour.
+     */
+    private boolean isWideTable(Table table, int cols) {
+        List<ColumnSpec> specs = table.getColumns();
+        if (specs == null) {
+            return false;
+        }
+        long known = 0;
+        for (int i = 0; i < cols && i < specs.size(); i++) {
+            if (specs.get(i).getWidthType() == ColumnSpec.WidthType.POINTS
+                    && specs.get(i).getWidth() > 0) {
+                known += twips(specs.get(i).getWidth());
+            }
+        }
+        double[] g = pageGeometryPt();
+        long content = Math.max(720, twips(g[0] - g[2] - g[3]));
+        return known >= 0.60 * content;
+    }
+
+    /** Sum of the fixed column widths spanned by a cell. */
+    private static long spanTwips(long[] colw, int start, int span) {
+        long s = 0;
+        for (int i = start; i < start + span && i < colw.length; i++) {
+            s += colw[i];
+        }
+        return Math.max(MIN_COL_TWIPS, s);
+    }
+
+    private void emitTableGrid(long[] colw) {
+        body.append("<w:tblGrid>");
+        for (long w : colw) {
+            body.append("<w:gridCol w:w=\"").append(Math.max(1, w)).append("\"/>");
         }
         body.append("</w:tblGrid>");
     }
 
-    private void emitCell(TableCell cell, int gridSpan) {
-        body.append("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/>");
+    private void emitCell(TableCell cell, int gridSpan, long cellTwips) {
+        body.append("<w:tc><w:tcPr>");
+        if (cellTwips > 0) {
+            body.append("<w:tcW w:w=\"").append(cellTwips).append("\" w:type=\"dxa\"/>");
+        } else {
+            body.append("<w:tcW w:w=\"0\" w:type=\"auto\"/>");
+        }
         if (gridSpan > 1) {
             body.append("<w:gridSpan w:val=\"").append(gridSpan).append("\"/>");
         }
         if (cell.getRowSpan() > 1) {
             body.append("<w:vMerge w:val=\"restart\"/>");
+        }
+        // Cell background shading (CT_TcPr: shd follows vMerge, precedes tcMar).
+        if (cell.getStyle() != null && cell.getStyle().getBackground() != 0) {
+            body.append("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"")
+                .append(hex(cell.getStyle().getBackground())).append("\"/>");
         }
         body.append("</w:tcPr>");
         int before = body.length();
@@ -854,8 +1001,13 @@ public final class SdmDocxWriter {
         body.append("</w:tc>");
     }
 
-    private void emitContinuationCell(int gridSpan) {
-        body.append("<w:tc><w:tcPr><w:tcW w:w=\"0\" w:type=\"auto\"/>");
+    private void emitContinuationCell(int gridSpan, long cellTwips) {
+        body.append("<w:tc><w:tcPr>");
+        if (cellTwips > 0) {
+            body.append("<w:tcW w:w=\"").append(cellTwips).append("\" w:type=\"dxa\"/>");
+        } else {
+            body.append("<w:tcW w:w=\"0\" w:type=\"auto\"/>");
+        }
         if (gridSpan > 1) {
             body.append("<w:gridSpan w:val=\"").append(gridSpan).append("\"/>");
         }
@@ -1101,7 +1253,18 @@ public final class SdmDocxWriter {
                 rpr.append("<w:strike/>");
             }
             if (st.getColor() != 0) {
-                rpr.append("<w:color w:val=\"").append(hex(st.getColor())).append("\"/>");
+                // White-text rescue: in the reflow, a near-white run painted on
+                // a coloured fill in the source (a section-header bar, a badge)
+                // loses that fill — the writer never shades flow cells/paragraphs
+                // — so it would print invisible white-on-white. When the run has
+                // no background of its own and is NOT a poster-page frame over
+                // the underlay raster, drop the colour so the text inherits the
+                // default dark and stays legible.
+                if (isNearWhite(st.getColor()) && st.getBackground() == 0 && !overUnderlay) {
+                    // inherit default (auto/black): emit no w:color
+                } else {
+                    rpr.append("<w:color w:val=\"").append(hex(st.getColor())).append("\"/>");
+                }
             }
             if (st.getFontSize() > 0) {
                 long half = Math.round(st.getFontSize() * 2);
@@ -1418,6 +1581,15 @@ public final class SdmDocxWriter {
 
     private static String hex(int argb) {
         return String.format("%06X", argb & 0xFFFFFF);
+    }
+
+    /** True when every RGB channel is near the top of the range (>= 0xE6) — a
+     *  glyph colour that is invisible on white paper. */
+    private static boolean isNearWhite(int argb) {
+        int r = (argb >> 16) & 0xFF;
+        int g = (argb >> 8) & 0xFF;
+        int b = argb & 0xFF;
+        return r >= 0xE6 && g >= 0xE6 && b >= 0xE6;
     }
 
     private static Double parse(String s) {
