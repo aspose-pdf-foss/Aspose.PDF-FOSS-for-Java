@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>org.aspose</groupId>
     <artifactId>aspose-pdf-foss</artifactId>
-    <version>26.8.0</version>
+    <version>26.9.0</version>
     <packaging>jar</packaging>
     <name>Aspose.PDF FOSS</name>
     <description>Open-source, pure-Java PDF library for creating, editing, and converting PDF documents — text extraction, AcroForm/XFA forms, digital signatures, encryption, and PDF/A-1-4 validation, with zero third-party dependencies.</description>
