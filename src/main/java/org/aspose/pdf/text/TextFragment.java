@@ -112,6 +112,16 @@ public class TextFragment extends BaseParagraph {
     // Edit options carried over from the absorbing TextFragmentAbsorber. Drives
     // FontReplace.RemoveUnusedFonts behaviour when a fragment's font is replaced.
     private TextEditOptions editOptions;
+    // Font assigned via setFont() whose source write-back is deferred to save
+    // time (see scheduleFontWriteBack / flushPendingFontWriteBack). Deferral lets
+    // callers flip embed/subset flags after setFont and have the final state honoured.
+    private org.aspose.pdf.text.Font pendingFont;
+    private boolean pendingFontRegistered;
+    // Existing (originally non-embedded) document font to embed in place on save,
+    // scheduled by getFont().setEmbedded(true). Distinct from pendingFont (a
+    // setFont replacement): this keeps the font dict/encoding and only injects the
+    // program bytes into the descriptor.
+    private org.aspose.pdf.text.Font pendingEmbedExistingFont;
     // Underline path operators detected in the source content (each group = one
     // underline subpath: re/m/l constructing ops + the f/S paint op). Removed from
     // the content stream when the fragment's underline is turned off (see
@@ -589,7 +599,7 @@ public class TextFragment extends BaseParagraph {
      *
      * @param newSize the new font size in points (ignored if not positive)
      */
-    void applyFontSizeToSource(double newSize) {
+    void applyFontSizeToSource(double newSize, double oldSize) {
         if (newSize <= 0 || sourceOperatorIndex < 0) {
             return;
         }
@@ -608,6 +618,24 @@ public class TextFragment extends BaseParagraph {
             if (idx < 0 || idx >= ops.size()) {
                 return;
             }
+            // The on-screen size is Tf × |text-matrix glyph scale| × |CTM scale|.
+            // We rewrite the single carrier operator found walking back from the
+            // show op, using ABSOLUTE target values so repeated/again calls (and
+            // several fragments that share one carrier operator) are idempotent
+            // rather than compounding.
+            //
+            // A scaling Tm carries the size directly: target glyph scale = newSize
+            // / rawTf (CTM assumed 1 here — the historical behaviour that already
+            // round-trips fragments 1-3).
+            //
+            // A Tf whose active text matrix is unscaled OR is a scaling Tm set by
+            // an EARLIER run (so the walk-back reaches the Tf first) carries only
+            // part of the size: the rest is the inherited Tm/CTM scale. That scale
+            // is oldSize/rawTf, so to land the effective size on newSize the Tf
+            // must become newSize × rawTf / oldSize — e.g. corpus CommonDocument
+            // p3 "Object": /F8 1 Tf under an inherited 9.96 Tm, oldSize 9.96 →
+            // Tf = 5×1/9.96 = 0.502 (effective 5), not a naive 5 (effective 49.8).
+            double rawTf = sourceTfSize > 0 ? sourceTfSize : 1.0;
             boolean mutated = false;
             for (int i = idx - 1; i >= 0; i--) {
                 Operator op = ops.getAt(i);
@@ -618,11 +646,10 @@ public class TextFragment extends BaseParagraph {
                     org.aspose.pdf.Matrix m = ((org.aspose.pdf.operators.SetTextMatrix) op).getMatrix();
                     double glyphScale = Math.hypot(m.getC(), m.getD());
                     if (glyphScale > 1e-9 && Math.abs(glyphScale - 1.0) > 1e-9) {
-                        double tf = sourceTfSize > 0 ? sourceTfSize : 1.0;
-                        if (Math.abs(newSize - tf * glyphScale) < 1e-6) {
+                        if (Math.abs(newSize - rawTf * glyphScale) < 1e-6) {
                             break; // already at this size — no rewrite
                         }
-                        double factor = newSize / (tf * glyphScale);
+                        double factor = newSize / (rawTf * glyphScale);
                         ops.setAt(i, new org.aspose.pdf.operators.SetTextMatrix(new org.aspose.pdf.Matrix(
                                 m.getA() * factor, m.getB() * factor,
                                 m.getC() * factor, m.getD() * factor,
@@ -633,10 +660,14 @@ public class TextFragment extends BaseParagraph {
                     // identity glyph scale — the size lives in Tf; keep walking
                 } else if (op instanceof org.aspose.pdf.operators.SelectFont) {
                     org.aspose.pdf.operators.SelectFont tf = (org.aspose.pdf.operators.SelectFont) op;
-                    if (Math.abs(tf.getSize() - newSize) < 1e-6) {
+                    // Divide out the scale inherited from the active text matrix /
+                    // CTM (oldSize/rawTf) so the on-screen size lands on newSize.
+                    double inheritedScale = (oldSize > 1e-9 && rawTf > 1e-9) ? oldSize / rawTf : 1.0;
+                    double newTf = inheritedScale > 1e-9 ? newSize / inheritedScale : newSize;
+                    if (Math.abs(tf.getSize() - newTf) < 1e-6) {
                         break; // already at this size — no rewrite
                     }
-                    ops.setAt(i, new org.aspose.pdf.operators.SelectFont(tf.getFontName(), newSize));
+                    ops.setAt(i, new org.aspose.pdf.operators.SelectFont(tf.getFontName(), newTf));
                     mutated = true;
                     break;
                 }
@@ -650,6 +681,87 @@ public class TextFragment extends BaseParagraph {
             }
         } catch (IOException e) {
             LOG.warning("Failed to write font size back to content stream: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Schedules a deferred font write-back for {@code newFont} (assigned via
+     * {@link TextState#setFont}). Seeds the font's default embed/subset flags so a
+     * pre-save {@code getFont().isEmbedded()/isSubset()} is already correct —
+     * embeddable fonts (real program bytes, non-Standard-14) default to
+     * embedded+subset, Standard-14 / byte-less fonts to neither — then registers
+     * this fragment with the owning document so the actual content-stream edit
+     * runs at save time via {@link #flushPendingFontWriteBack()}. The deferral is
+     * what lets a caller flip the flags after {@code setFont} (e.g.
+     * {@code setSubset(false)}) and have the final state decide the output. When no
+     * owning document is reachable (a detached fragment) the write-back runs now.
+     *
+     * @param newFont the font assigned to this fragment
+     */
+    void scheduleFontWriteBack(org.aspose.pdf.text.Font newFont) {
+        if (newFont != null) {
+            byte[] bytes = newFont.getFontData();
+            boolean embeddable = bytes != null && bytes.length > 0 && !isStandard14(newFont.getName());
+            newFont.setEmbedded(embeddable);
+            newFont.setSubset(embeddable);
+        }
+        this.pendingFont = newFont;
+        org.aspose.pdf.Document doc = page != null ? page.getOwningDocument() : null;
+        if (doc != null) {
+            if (!pendingFontRegistered) {
+                doc.addPendingFontWriteBack(this);
+                pendingFontRegistered = true;
+            }
+        } else {
+            // Detached fragment: no save hook will fire, so write back eagerly.
+            flushPendingFontWriteBack();
+        }
+    }
+
+    /**
+     * Schedules embedding an existing (originally non-embedded) document font in
+     * place, triggered by {@code getFont().setEmbedded(true)} (FontTests.
+     * Embed_ExistingFont1). Unlike {@link #scheduleFontWriteBack}, the font dict
+     * and its encoding are kept — only the program bytes are injected into the
+     * descriptor on save. No-op when nothing changed or no save hook is reachable.
+     *
+     * @param font the existing font to embed
+     */
+    void scheduleEmbedExisting(org.aspose.pdf.text.Font font) {
+        if (font == null || pendingEmbedExistingFont == font) {
+            return;
+        }
+        pendingEmbedExistingFont = font;
+        org.aspose.pdf.Document doc = page != null ? page.getOwningDocument() : null;
+        if (doc != null) {
+            if (!pendingFontRegistered) {
+                doc.addPendingFontWriteBack(this);
+                pendingFontRegistered = true;
+            }
+        } else {
+            flushPendingFontWriteBack();
+        }
+    }
+
+    /**
+     * Runs the deferred font write-backs scheduled by {@link #scheduleFontWriteBack}
+     * and {@link #scheduleEmbedExisting}. Invoked from
+     * {@code Document.flushDirtyPages()} at save time. For a {@code setFont}
+     * replacement it picks the output path from the font's final flags (embeddable
+     * + subset -> embed, else simple non-embedded by-name); for an embed-existing
+     * request it injects the program into the current font's descriptor.
+     */
+    public void flushPendingFontWriteBack() {
+        org.aspose.pdf.text.Font replacement = pendingFont;
+        org.aspose.pdf.text.Font embedExisting = pendingEmbedExistingFont;
+        pendingFont = null;
+        pendingEmbedExistingFont = null;
+        pendingFontRegistered = false;
+        if (replacement != null) {
+            applyFontToSource(replacement);
+        }
+        if (embedExisting != null) {
+            applyEmbedExistingToSource(embedExisting);
         }
     }
 
@@ -673,20 +785,21 @@ public class TextFragment extends BaseParagraph {
             return;
         }
         byte[] ttf = newFont.getFontData();
-        if (ttf == null || ttf.length == 0 || isStandard14(newFont.getName())) {
-            // Standard-14 (Courier/Times-Roman/…) must stay non-embedded even when
-            // FontRepository resolved a system font program for them: register a
-            // simple non-embedded Type1 resource and re-encode with WinAnsi.
+        if (ttf == null || ttf.length == 0 || isStandard14(newFont.getName())
+                || !newFont.isSubset()) {
+            // Non-embedded output path. Taken for Standard-14 replacements
+            // (Courier/Times-Roman/…, which carry no bytes), and for an otherwise
+            // embeddable font the caller explicitly de-subset (setSubset(false) /
+            // setEmbedded(false)): an embedded replacement is always subset, so
+            // "not subset" means "not embedded" — register a simple by-name
+            // resource and re-encode with WinAnsi (FontTests.*NonSubset*).
             applySimpleFontToSource(newFont);
             return;
         }
-        // Aspose parity: assigning an embeddable font to an absorbed fragment
-        // "becomes embedded by default" (embedded + subset). Set these on the
-        // Font object so a pre-save getFont().isEmbedded()/isSubset() reflects it;
-        // callers may still flip them afterwards (e.g. setSubset(false)). This is
-        // scoped to the write-back path so it does not affect the generation path.
+        // Embeddable font kept as a subset => embed it. The default flags were
+        // seeded in scheduleFontWriteBack; reaching here means they survived to
+        // save time, so the font really is embedded.
         newFont.setEmbedded(true);
-        newFont.setSubset(true);
         try {
             OperatorCollection ops = sourceOperators != null
                     ? sourceOperators
@@ -740,6 +853,20 @@ public class TextFragment extends BaseParagraph {
                 ops.addAt(idx + 1, new SelectFont(governing.getFontName(), governing.getSize()));
             }
             ops.addAt(idx, new SelectFont(resName, size));
+
+            // FontReplace.RemoveUnusedFonts: retire the displaced font so an
+            // embedded replacement does not leave the original /Font entry (and
+            // its font program) behind. removeUnusedFontResources repoints any
+            // lingering selections of it — including the restore Tf bracketed in
+            // above — at the embedded resource, then drops the now-unreferenced
+            // entries (FontTests.Replace_Font_Subset expects a single font).
+            if (editOptions != null
+                    && editOptions.getFontReplaceBehavior() == TextEditOptions.FontReplace.RemoveUnusedFonts) {
+                if (governing != null && governing.getFontName() != null) {
+                    recordReplacedFont(governing.getFontName());
+                }
+                removeUnusedFontResources(ops, resName);
+            }
 
             if (sourceContentStream != null) {
                 sourceContentStream.setDecodedData(serializeOperators(ops));
@@ -844,6 +971,116 @@ public class TextFragment extends BaseParagraph {
             }
         } catch (Exception e) {
             LOG.warning("Failed to write Standard-14 font change back: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Embeds an existing (originally non-embedded) simple font in place: resolves
+     * the font program (the font's own bytes, else the system face by name) and
+     * injects it into the governing font's {@code /FontDescriptor} as
+     * {@code /FontFile2}, leaving the font dictionary, subtype and encoding intact
+     * so the already-drawn text is unaffected. The whole program is embedded (no
+     * subsetting), so a reload reports {@code isEmbedded() == true} and
+     * {@code isSubset() == false} (FontTests.Embed_ExistingFont1).
+     *
+     * @param font the existing font to embed
+     */
+    private void applyEmbedExistingToSource(org.aspose.pdf.text.Font font) {
+        if (font == null || page == null) {
+            return;
+        }
+        try {
+            byte[] ttf = font.getFontData();
+            if (ttf == null || ttf.length == 0) {
+                ttf = org.aspose.pdf.engine.font.ttf.FontDiskLookup.loadByName(font.getName());
+            }
+            // Only a TrueType program embeds as /FontFile2; bail if unresolved or
+            // an OpenType/CFF face (no simple-font FontFile3 path wired here).
+            if (ttf == null || ttf.length == 0
+                    || org.aspose.pdf.engine.font.ttf.Type0FontBuilder.isOpenTypeCff(ttf)) {
+                LOG.fine(() -> "Embed-existing skipped: no TrueType program for " + font.getName());
+                return;
+            }
+
+            // Governing font resource for this fragment: the name selected by the
+            // active Tf in scope (walk back within the text object), else the
+            // fragment's recorded source font name.
+            OperatorCollection ops = sourceOperators != null ? sourceOperators : page.getContents();
+            String resName = null;
+            if (ops != null) {
+                int idx = sourceOperatorIndex;
+                if (sourceOperator != null) {
+                    int refreshed = indexOfByIdentity(ops, sourceOperator);
+                    if (refreshed >= 0) idx = refreshed;
+                }
+                for (int i = Math.min(idx, ops.size()) - 1; i >= 0; i--) {
+                    Operator op = ops.getAt(i);
+                    if (op instanceof SelectFont) { resName = ((SelectFont) op).getFontName(); break; }
+                    if (op instanceof BT || op instanceof ET) break;
+                }
+            }
+            if (resName == null) {
+                resName = sourceFontName;
+            }
+            if (resName != null && resName.startsWith("/")) {
+                resName = resName.substring(1);
+            }
+
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary resDict = sourceResources;
+            if (resDict == null) {
+                org.aspose.pdf.Resources pr = page.getResources();
+                if (pr == null) return;
+                resDict = pr.getPdfDictionary();
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fonts = asDict(resDict.get("Font"));
+            if (fonts == null) return;
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary fontDict =
+                    resName != null ? asDict(fonts.get(resName)) : null;
+            if (fontDict == null) {
+                // Fall back to the single font whose /BaseFont matches this font.
+                String want = font.getName() != null ? font.getName().replace(" ", "") : null;
+                for (PdfName key : fonts.keySet()) {
+                    org.aspose.pdf.engine.pdfobjects.PdfDictionary fd = asDict(fonts.get(key));
+                    if (fd == null || want == null) continue;
+                    String base = fd.getNameAsString("BaseFont");
+                    // Drop any "ABCDEF+" subset tag before comparing.
+                    if (base != null && base.length() > 7 && base.charAt(6) == '+') {
+                        base = base.substring(7);
+                    }
+                    if (want.equals(base)) {
+                        fontDict = fd;
+                        break;
+                    }
+                }
+            }
+            if (fontDict == null) return;
+
+            // Obtain (or create) the descriptor and attach the embedded program.
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary descriptor =
+                    asDict(fontDict.get("FontDescriptor"));
+            if (descriptor == null) {
+                descriptor = new org.aspose.pdf.engine.pdfobjects.PdfDictionary();
+                descriptor.set(PdfName.of("Type"), PdfName.of("FontDescriptor"));
+                descriptor.set(PdfName.of("FontName"),
+                        PdfName.of(font.getName() != null ? font.getName().replace(" ", "") : "Font"));
+                descriptor.set(PdfName.of("Flags"), org.aspose.pdf.engine.pdfobjects.PdfInteger.valueOf(32));
+                fontDict.set(PdfName.of("FontDescriptor"), descriptor);
+            }
+            org.aspose.pdf.engine.pdfobjects.PdfStream fontFile =
+                    new org.aspose.pdf.engine.pdfobjects.PdfStream();
+            fontFile.set(PdfName.of("Length1"),
+                    org.aspose.pdf.engine.pdfobjects.PdfInteger.valueOf(ttf.length));
+            fontFile.setDecodedData(ttf);
+            descriptor.set(PdfName.of("FontFile2"), fontFile);
+
+            if (sourceContentStream == null) {
+                page.markContentsDirty();
+            }
+            if (page.getOwningDocument() != null) {
+                page.getOwningDocument().requestFullRewrite();
+            }
+        } catch (Exception e) {
+            LOG.warning("Failed to embed existing font in place: " + e.getMessage());
         }
     }
 

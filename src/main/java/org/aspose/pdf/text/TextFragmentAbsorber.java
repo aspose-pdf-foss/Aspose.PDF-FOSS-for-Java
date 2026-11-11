@@ -258,7 +258,14 @@ public class TextFragmentAbsorber extends TextAbsorber {
     @Override
     public String getText() {
         boolean extractAll = searchPhrase == null || searchPhrase.isEmpty();
-        if (!extractAll || textFragments.getCount() == 0) {
+        // The compact fragment-join below is only the right output for the
+        // "empty phrase + area filter" case (Aspose's TFA.getText() returns the
+        // joined text of the fragments inside the rectangle). With no area filter
+        // Aspose's TFA.getText() is identical to a plain TextAbsorber's positional,
+        // formatting-mode-aware output — so defer to super.getText() there, which
+        // honours Pure/Raw mode and already matches TextAbsorber exactly
+        // (TextAbsorberTests.ExtractText_AbsorbersComparation_1/_2).
+        if (!extractAll || textFragments.getCount() == 0 || !hasAreaFilter()) {
             return super.getText();
         }
         java.util.List<TextFragment> list = new java.util.ArrayList<>(textFragments.getCount());
@@ -272,6 +279,24 @@ public class TextFragmentAbsorber extends TextAbsorber {
         StringBuilder out = new StringBuilder();
         buildSpans(list, out);
         return out.toString();
+    }
+
+    /**
+     * Whether a spatial filter (search rectangle, page-bounds limit, or exclude
+     * rectangles) is configured on the search options. Only in that case does the
+     * empty-phrase {@link #getText()} produce a compact join of the in-area
+     * fragments rather than the plain positional/formatting-mode output.
+     *
+     * @return {@code true} if any area filter is active
+     */
+    private boolean hasAreaFilter() {
+        if (textSearchOptions == null) {
+            return false;
+        }
+        return textSearchOptions.getRectangle() != null
+                || textSearchOptions.isLimitToPageBounds()
+                || (textSearchOptions.getExcludeRectangles() != null
+                    && textSearchOptions.getExcludeRectangles().length > 0);
     }
 
     /**

@@ -538,7 +538,12 @@ public class TextExtractor {
                             String baseFont = ((org.aspose.pdf.engine.pdfobjects.PdfDictionary) entry).getNameAsString("BaseFont");
                             if (baseFont != null && !baseFont.isEmpty()) {
                                 currentFontSubset = !baseFont.equals(stripSubsetPrefix(baseFont));
-                                currentFontName = stripSubsetPrefix(baseFont);
+                                // Normalise the Windows "comma style" TrueType suffix
+                                // (e.g. "Arial,Bold" -> "ArialBold") the way Aspose
+                                // surfaces it. The comma only appears in simple-TrueType
+                                // BaseFont style suffixes, never inside a real PostScript
+                                // font name, so this cannot corrupt other names.
+                                currentFontName = stripSubsetPrefix(baseFont).replace(",", "");
                             }
                         }
                     }

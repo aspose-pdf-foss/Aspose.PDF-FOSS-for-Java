@@ -37,6 +37,19 @@ public class SignatureField extends Field {
      * @param rect the field's bounding rectangle in page coordinates
      * @throws IllegalArgumentException if {@code page} or {@code rect} is null
      */
+    /**
+     * Constructs a new <em>detached</em>, unsigned signature field (no owning
+     * page). Page wiring is deferred to {@link Form#add(Field, Page, Rectangle)}.
+     * The {@code (Page, Rectangle)} overload keeps its non-null guards; this
+     * detached form intentionally allows deferred page/rect.
+     */
+    public SignatureField() {
+        super(new PdfDictionary(), "");
+        dict.set(PdfName.of("Type"), PdfName.of("Annot"));
+        dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
+        dict.set(PdfName.of("FT"), PdfName.of("Sig"));
+    }
+
     public SignatureField(Page page, Rectangle rect) {
         super(new PdfDictionary(), page, "");
         if (page == null) throw new IllegalArgumentException("page must not be null");

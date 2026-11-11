@@ -241,8 +241,16 @@ public class LineAnnotation extends MarkupAnnotation {
      * Updates the /L array in the PDF dictionary from the current starting/ending points.
      */
     private void updateLineArray() {
-        Point s = starting != null ? starting : new Point(0, 0);
-        Point e = ending != null ? ending : new Point(0, 0);
+        // When this wrapper was built from an existing dictionary (e.g. the copy
+        // produced while iterating a page's /Annots during a content resize), only
+        // the endpoint just set via setStarting/setEnding is cached; the other
+        // field is still null. Falling back to (0,0) would ZERO the untouched
+        // endpoint in /L. Preserve it from the current /L array instead.
+        double[] cur = getLine();
+        Point s = starting != null ? starting
+                : (cur != null ? new Point(cur[0], cur[1]) : new Point(0, 0));
+        Point e = ending != null ? ending
+                : (cur != null ? new Point(cur[2], cur[3]) : new Point(0, 0));
         PdfArray l = new PdfArray();
         l.add(new PdfFloat(s.getX()));
         l.add(new PdfFloat(s.getY()));

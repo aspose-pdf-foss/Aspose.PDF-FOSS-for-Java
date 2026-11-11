@@ -83,6 +83,13 @@ public abstract class PdfFont {
             if (toUnicode != null) {
                 String mapped = toUnicode.lookup(code);
                 if (mapped != null) {
+                    // Some producers map a tabulation/spacing code to U+0009 in
+                    // the ToUnicode CMap. A horizontal tab is never meaningful in
+                    // extracted/searched PDF text — it is positional whitespace —
+                    // so normalise it to a space, matching Aspose's extraction.
+                    if (mapped.indexOf('\t') >= 0) {
+                        mapped = mapped.replace('\t', ' ');
+                    }
                     sb.append(mapped);
                     continue;
                 }

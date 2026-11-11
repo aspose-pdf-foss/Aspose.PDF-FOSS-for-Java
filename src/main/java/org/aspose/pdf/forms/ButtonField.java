@@ -31,6 +31,19 @@ public class ButtonField extends Field {
      * @param page the page
      * @param rect the field rectangle
      */
+    /**
+     * Constructs a new <em>detached</em> push button field (no owning page).
+     * Page wiring is deferred to {@link Form#add(Field, Page, Rectangle)}.
+     */
+    public ButtonField() {
+        super(new PdfDictionary(), "");
+        dict.set(PdfName.of("Type"), PdfName.of("Annot"));
+        dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
+        dict.set(PdfName.of("FT"), PdfName.of("Btn"));
+        // Set push button flag (bit 17)
+        dict.set(PdfName.of("Ff"), PdfInteger.valueOf(1 << 16));
+    }
+
     public ButtonField(Page page, Rectangle rect) {
         super(new PdfDictionary(), page, "");
         dict.set(PdfName.of("Type"), PdfName.of("Annot"));

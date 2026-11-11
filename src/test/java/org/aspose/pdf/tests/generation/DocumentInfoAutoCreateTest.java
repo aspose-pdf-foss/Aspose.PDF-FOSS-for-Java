@@ -77,19 +77,17 @@ class DocumentInfoAutoCreateTest {
     @Test
     @DisplayName("Reopened PDF whose trailer has no /Info still gets a non-null DocumentInfo")
     void reopenDocumentWithoutInfo_getInfoCreatesEmpty(@TempDir Path tmp) throws IOException {
-        // Build a doc, save it, then verify behaviour on reopen.
+        // The FOSS writer always stamps a Producer/Creator /Info on save
+        // (PDFNET_49363_1), so a round-tripped file can no longer lack /Info.
+        // Feed a hand-built minimal PDF whose trailer genuinely has no /Info.
         Path out = tmp.resolve("no-info.pdf");
-        try (Document doc = new Document()) {
-            doc.getPages().add();
-            // Do NOT touch getInfo(): we want the saved file to have no /Info.
-            doc.save(out.toString());
-        }
+        java.nio.file.Files.write(out, minimalPdfWithoutInfo());
+
         try (Document reopened = new Document(out.toString())) {
-            // Sanity: the saved file genuinely has no /Info entry in its
-            // trailer (writer drops empty info dicts at save time).
+            // Sanity: the input genuinely has no /Info entry in its trailer.
             PdfDictionary trailer = reopened.getTrailer();
             assertFalse(trailer.containsKey("Info"),
-                    "test premise: writer must have dropped the empty /Info entry");
+                    "test premise: hand-built input must have no /Info entry");
 
             DocumentInfo created = reopened.getInfo();
             assertNotNull(created,
@@ -99,5 +97,43 @@ class DocumentInfoAutoCreateTest {
             assertEquals("PostHoc", reopened.getInfo().getTitle(),
                     "subsequent getInfo() sees the mutation");
         }
+    }
+
+    /**
+     * Builds a minimal, valid single-page PDF 1.7 whose trailer contains only
+     * /Size and /Root — deliberately no /Info — with a correct cross-reference
+     * table (byte offsets computed as the body is assembled).
+     */
+    private static byte[] minimalPdfWithoutInfo() throws IOException {
+        String[] objects = {
+                "<< /Type /Catalog /Pages 2 0 R >>",
+                "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+        };
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+        int[] offsets = new int[objects.length + 1]; // index 0 unused (free object)
+        for (int i = 0; i < objects.length; i++) {
+            offsets[i + 1] = body.size();
+            body.write(((i + 1) + " 0 obj\n" + objects[i] + "\nendobj\n")
+                    .getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        }
+
+        java.io.ByteArrayOutputStream pdf = new java.io.ByteArrayOutputStream();
+        pdf.write("%PDF-1.7\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        int bodyStart = pdf.size();
+        pdf.write(body.toByteArray());
+
+        int xrefStart = pdf.size();
+        StringBuilder xref = new StringBuilder();
+        xref.append("xref\n0 ").append(objects.length + 1).append('\n');
+        xref.append("0000000000 65535 f \n");
+        for (int i = 1; i <= objects.length; i++) {
+            xref.append(String.format("%010d 00000 n \n", bodyStart + offsets[i]));
+        }
+        xref.append("trailer\n<< /Size ").append(objects.length + 1)
+                .append(" /Root 1 0 R >>\n");
+        xref.append("startxref\n").append(xrefStart).append("\n%%EOF\n");
+        pdf.write(xref.toString().getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+        return pdf.toByteArray();
     }
 }

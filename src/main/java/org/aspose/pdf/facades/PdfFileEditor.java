@@ -1125,11 +1125,24 @@ public class PdfFileEditor {
             boolean fixedIcon = a instanceof org.aspose.pdf.annotations.TextAnnotation;
             Rectangle r = a.getRect();
             if (r != null && !fixedIcon) {
-                a.setRect(new Rectangle(
+                Rectangle scaled = new Rectangle(
                         r.getLLX() * scaleX + tx,
                         r.getLLY() * scaleY + ty,
                         r.getURX() * scaleX + tx,
-                        r.getURY() * scaleY + ty));
+                        r.getURY() * scaleY + ty);
+                try {
+                    a.setRect(scaled);
+                } catch (IllegalArgumentException degenerate) {
+                    // A line/link annotation may legitimately carry a degenerate
+                    // /Rect (e.g. a LineAnnotation created with a zero-area Rect —
+                    // its geometry lives in /L). The public setRect enforces
+                    // positive area and would throw here, which must NOT abort the
+                    // rest of this annotation's transform (notably the /L, /QuadPoints
+                    // and /InkList branches below) nor the remaining annotations and
+                    // the page-box resize. Skip the degenerate /Rect update and carry on.
+                    LOG.fine(() -> "Skipping degenerate transformed /Rect on "
+                            + a.getClass().getSimpleName() + "; continuing with other geometry");
+                }
             }
 
             if (a instanceof org.aspose.pdf.annotations.HighlightAnnotation) {

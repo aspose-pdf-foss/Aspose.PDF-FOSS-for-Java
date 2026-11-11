@@ -29,6 +29,25 @@ public final class FontDiskLookup {
 
     private static final Logger LOG = Logger.getLogger(FontDiskLookup.class.getName());
 
+    // Resolving a logical font name touches the filesystem (directory probes,
+    // file reads, TTC face extraction). The OS font set does not change during a
+    // run, so results are cached per-JVM keyed by the lookup parameters; this
+    // turns a per-document disk lookup into a one-time cost. MISS is a negative
+    // sentinel so "not found" is not re-searched on every call.
+    private static final java.util.concurrent.ConcurrentHashMap<String, byte[]> CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static final byte[] MISS = new byte[0];
+
+    private static byte[] cached(String key, java.util.function.Supplier<byte[]> loader) {
+        byte[] v = CACHE.get(key);
+        if (v != null) {
+            return v == MISS ? null : v;
+        }
+        byte[] r = loader.get();
+        CACHE.put(key, r == null ? MISS : r);
+        return r;
+    }
+
     private FontDiskLookup() {}
 
     /**
@@ -43,6 +62,10 @@ public final class FontDiskLookup {
      */
     public static byte[] loadByName(String logicalName) {
         if (logicalName == null || logicalName.isEmpty()) return null;
+        return cached("N:" + logicalName, () -> loadByName0(logicalName));
+    }
+
+    private static byte[] loadByName0(String logicalName) {
         String[] dirs = osFontDirs();
         String[] basenames = candidateBasenames(logicalName);
         for (String dir : dirs) {
@@ -82,6 +105,10 @@ public final class FontDiskLookup {
      */
     public static byte[] loadByExactBasename(String basename) {
         if (basename == null || basename.isEmpty()) return null;
+        return cached("E:" + basename, () -> loadByExactBasename0(basename));
+    }
+
+    private static byte[] loadByExactBasename0(String basename) {
         for (String dir : osFontDirs()) {
             Path dp = Paths.get(dir);
             if (!Files.isDirectory(dp)) continue;
@@ -114,6 +141,11 @@ public final class FontDiskLookup {
         if (family == null || family.isEmpty()) {
             return null;
         }
+        String key = "S:" + family + ':' + bold + ':' + italic + ':' + java.util.Arrays.toString(extraDirs);
+        return cached(key, () -> loadStyled0(family, bold, italic, extraDirs));
+    }
+
+    private static byte[] loadStyled0(String family, boolean bold, boolean italic, String[] extraDirs) {
         java.util.List<String> dirs = new java.util.ArrayList<>();
         if (extraDirs != null) {
             for (String d : extraDirs) {
@@ -169,6 +201,12 @@ public final class FontDiskLookup {
      */
     public static byte[] loadFallback(boolean serif, boolean mono, boolean bold, boolean italic,
                                       String[] extraDirs) {
+        String key = "F:" + serif + mono + bold + italic + ':' + java.util.Arrays.toString(extraDirs);
+        return cached(key, () -> loadFallback0(serif, mono, bold, italic, extraDirs));
+    }
+
+    private static byte[] loadFallback0(boolean serif, boolean mono, boolean bold, boolean italic,
+                                        String[] extraDirs) {
         java.util.LinkedHashSet<String> bases = new java.util.LinkedHashSet<>(
                 java.util.Arrays.asList(fallbackBasenames(serif, mono, bold, italic)));
         java.util.List<String> dirs = new java.util.ArrayList<>();

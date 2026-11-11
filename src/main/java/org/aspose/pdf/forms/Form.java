@@ -351,6 +351,33 @@ public class Form implements Iterable<Field> {
     }
 
     /**
+     * Attaches a <em>detached</em> field to a page at the given rectangle and
+     * adds it to this form. Sets the rectangle (lenient — degenerate rects are
+     * stored, matching field-constructor semantics), associates the page, and
+     * regenerates the field's appearance (for appearance-bearing field types)
+     * before performing the standard {@link #add(Field)} wiring (widget
+     * {@code /P}, page {@code /Annots}, {@code /AcroForm /Fields}, {@code /DR}).
+     * <p>
+     * This is the "build detached, attach on add" entry point: create a field
+     * with its no-argument constructor, set its properties, then call this.
+     * </p>
+     *
+     * @param field the (typically detached) field to attach and add
+     * @param page  the page to place the field's widget on (may be null)
+     * @param rect  the widget rectangle in page coordinates (may be null)
+     */
+    public void add(Field field, Page page, Rectangle rect) {
+        if (field != null) {
+            field.attachRect(rect);
+            if (page != null) {
+                field.setPage(page);
+            }
+            field.regenerateAppearanceIfSupported();
+        }
+        add(field);
+    }
+
+    /**
      * Adds a field to the specified page (1-based index).
      *
      * @param field     the field to add

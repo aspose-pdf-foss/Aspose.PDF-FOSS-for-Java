@@ -661,7 +661,13 @@ public class TableAbsorber {
                 addLevel(vLevels, (s[0] + s[2]) / 2);
             }
         }
-        if (hLevels.size() < 2 || vLevels.size() < 2) {
+        // A table needs at least two row bands (>=3 horizontal rule levels) and one column.
+        // A lone drawn box (a single rule rectangle = 2 h-levels, 2 v-levels) is a 1x1 "grid"
+        // and is NOT a table — emitting it as one both pollutes getTableList() and shifts the
+        // indices of the real tables (PDFNET_40807: a title box above the data table made
+        // getTableList().get(0) a 1-cell table). This mirrors the text heuristic's MIN_ROWS=2;
+        // single-column tables (>=2 rows, 1 column) remain valid (PDFNET_49399).
+        if (hLevels.size() < 3 || vLevels.size() < 2) {
             return null;
         }
         // Reader-order row/column iteration. In pageRotation space rows run

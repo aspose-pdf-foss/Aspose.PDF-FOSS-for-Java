@@ -143,7 +143,12 @@ public class PdfBookmarkEditor implements AutoCloseable {
      * @throws java.io.IOException on write failure
      */
     public void exportBookmarksToXML(String xmlFile) throws java.io.IOException {
-        Bookmarks bookmarks = extractBookmarks();
+        // Use the TOP-LEVEL tree (each root carries its descendants as nested
+        // childItems), not the flattened extractBookmarks() list — writeBookmarkXml
+        // already recurses into childItems, so iterating the flattened list would
+        // emit every nested node twice (once nested, once as a root). See
+        // extractBookmarks()'s flattening note (PDFNET-46150).
+        Bookmarks bookmarks = topLevelBookmarkTree();
         StringBuilder sb = new StringBuilder();
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         sb.append("<Bookmarks>\n");
@@ -292,13 +297,50 @@ public class PdfBookmarkEditor implements AutoCloseable {
             if (outlines == null) {
                 return result;
             }
+            // Aspose returns ALL bookmarks flattened in document (depth-first,
+            // pre-order) order, not just the top-level items — a nested outline
+            // with 10 nodes yields a 10-element collection (PDFNET-46150).
             for (OutlineItemCollection item : outlines) {
-                result.add(convertOutline(item));
+                flattenBookmarks(item, result);
             }
         } catch (Exception e) {
             LOG.log(Level.WARNING, "Failed to extract bookmarks", e);
         }
         return result;
+    }
+
+    /**
+     * Builds the bookmark tree keeping only the top-level roots in the result
+     * collection; each root carries its descendants via {@link Bookmark#getChildItems()}.
+     * This is the nested (non-flattened) view used by the XML export so the
+     * recursive writer emits each node exactly once.
+     */
+    private Bookmarks topLevelBookmarkTree() {
+        Bookmarks result = new Bookmarks();
+        try {
+            OutlineCollection outlines = document.getOutlines();
+            if (outlines == null) {
+                return result;
+            }
+            for (OutlineItemCollection item : outlines) {
+                result.add(convertOutline(item));
+            }
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Failed to read bookmark tree", e);
+        }
+        return result;
+    }
+
+    /**
+     * Appends an outline node and all of its descendants to {@code result} in
+     * depth-first pre-order (parent before children), matching the flat ordering
+     * Aspose's {@code ExtractBookmarks} produces.
+     */
+    private void flattenBookmarks(OutlineItemCollection item, Bookmarks result) {
+        result.add(convertOutline(item));
+        for (OutlineItemCollection child : item) {
+            flattenBookmarks(child, result);
+        }
     }
 
     /**

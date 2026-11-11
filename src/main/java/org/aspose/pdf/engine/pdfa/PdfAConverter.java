@@ -90,6 +90,7 @@ public final class PdfAConverter {
             mf.removeMetadataFilter(parser, format, errorAction, result);
             mf.ensurePdfAId(parser, format, errorAction, result);
             mf.syncDocInfoWithXmp(parser, format, errorAction, result);
+            mf.removeDisallowedXmpProperties(parser, format, errorAction, result);
         });
 
         // 2. File-structure fixes

@@ -49,6 +49,7 @@ public class TextStamp extends Stamp {
     private TextState textState;
     private TextFormattingOptions.WordWrapMode wordWrapMode = TextFormattingOptions.WordWrapMode.Undefined;
     private HorizontalAlignment textAlignment = HorizontalAlignment.None;
+    private boolean autoAdjustFontSizeToFitStampRectangle;
     private transient PdfObjectReference cachedFormReference;
     private transient Document cachedTargetDocument;
 
@@ -168,6 +169,30 @@ public class TextStamp extends Stamp {
      */
     public void setTextAlignment(HorizontalAlignment textAlignment) {
         this.textAlignment = textAlignment != null ? textAlignment : HorizontalAlignment.None;
+    }
+
+    /**
+     * Indicates whether the font size is automatically adjusted so the stamp
+     * text fits within the stamp rectangle (the {@code Width}×{@code Height}
+     * set on the stamp). When {@code true} and both a width and height are set,
+     * the configured font size is overridden by the largest size at which the
+     * text still fits the rectangle.
+     *
+     * @return {@code true} if auto font-size adjustment is enabled
+     */
+    public boolean isAutoAdjustFontSizeToFitStampRectangle() {
+        return autoAdjustFontSizeToFitStampRectangle;
+    }
+
+    /**
+     * Enables or disables automatic font-size adjustment so the stamp text fits
+     * within the stamp rectangle. Has no effect unless the stamp has an explicit
+     * {@link #setWidth(double) width} and {@link #setHeight(double) height}.
+     *
+     * @param value {@code true} to fit the font size to the stamp rectangle
+     */
+    public void setAutoAdjustFontSizeToFitStampRectangle(boolean value) {
+        this.autoAdjustFontSizeToFitStampRectangle = value;
     }
 
     PdfObjectReference getCachedFormReference() {

@@ -218,6 +218,7 @@ public class ContentStreamBuilder {
         for (int i = 0; i < text.length(); ) {
             int cp = text.codePointAt(i);
             int gid = reader.getGlyphId(cp);
+            reader.markGlyphUsed(gid); // record for font subsetting
             sb.append(String.format("%04X", gid & 0xFFFF));
             i += Character.charCount(cp);
         }

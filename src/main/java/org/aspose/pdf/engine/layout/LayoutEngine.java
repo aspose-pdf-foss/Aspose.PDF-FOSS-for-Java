@@ -196,7 +196,8 @@ public class LayoutEngine {
         }
 
         Paragraphs paragraphs = page.getParagraphs();
-        if (paragraphs == null || paragraphs.size() == 0) {
+        boolean hasLayoutStamps = !page.getLayoutStamps().isEmpty();
+        if ((paragraphs == null || paragraphs.size() == 0) && !hasLayoutStamps) {
             LOG.fine("Page has no paragraphs; skipping layout");
             return;
         }
@@ -265,6 +266,13 @@ public class LayoutEngine {
             layoutParagraph(para, builder, resources, ctx);
         }
 
+        // 5a. Positioned text overlays (e.g. layout showTextAligned): emitted inside
+        // this same content build, at their absolute XIndent/YIndent, so they are not
+        // lost when /Contents is rebuilt from the flowing paragraphs above.
+        for (TextStamp overlay : page.getLayoutStamps()) {
+            layoutTextStamp(overlay, builder, resources, pageWidth);
+        }
+
         // 5b. Per-page footnote block + (on last page) endnote block. Both
         // anchor to the bottom of the content area; the space they consume
         // was already reserved by Document.paginateNewDocumentPagesIfNeeded
@@ -304,6 +312,10 @@ public class LayoutEngine {
                 resources.addFont(baseFont);
             }
         }
+
+        // Subset embedded fonts marked for subsetting now that all glyphs for
+        // this page have been emitted (and thus recorded as used).
+        resources.subsetEmbeddedFonts();
 
         PdfDictionary resourcesDict = resources.buildResourcesDictionary();
         pageDict.set(PdfName.RESOURCES, resourcesDict);
@@ -551,6 +563,17 @@ public class LayoutEngine {
             ctx.advanceCursor(paraMargin.getTop());
         }
 
+        // Honour a block's own left/right margin as a horizontal inset for the
+        // duration of its layout: the content area narrows and the text wraps and
+        // aligns inside it. Gated on a positive left/right margin, so FOSS-native
+        // paragraphs (which carry none) see the unchanged content area.
+        boolean blockIndented = !inline && paraMargin != null
+                && (paraMargin.getLeft() > 0 || paraMargin.getRight() > 0);
+        if (blockIndented) {
+            ctx.setBlockIndent(paraMargin.getLeft(), paraMargin.getRight());
+            ctx.resetCursorX();
+        }
+
         double height = 0;
 
         if (para instanceof Heading) {
@@ -568,6 +591,12 @@ public class LayoutEngine {
             height = layoutImage((Image) para, builder, resources, ctx);
         } else {
             LOG.fine(() -> "Unsupported paragraph type: " + para.getClass().getSimpleName());
+        }
+
+        // Drop the transient block indent before the bottom margin / next block.
+        if (blockIndented) {
+            ctx.clearBlockIndent();
+            ctx.resetCursorX();
         }
 
         // Apply paragraph margin (bottom)
@@ -637,6 +666,15 @@ public class LayoutEngine {
             }
         }
         String fontName = (ts != null && ts.getFontName() != null) ? ts.getFontName() : DEFAULT_FONT;
+        // Apply bold/italic style synthesis for this uniform (single-style) fragment,
+        // mirroring the per-segment rich path. Only for non-embedded fonts: an embedded
+        // face already carries its style in the program bytes, so appending a style
+        // marker to its name would desync the name from the bytes.
+        int uniformStyle = ts != null ? ts.getFontStyle() : 0;
+        boolean uniformEmbedded = ts != null && ts.getFont() != null && ts.getFont().isEmbedded();
+        if (uniformStyle != 0 && !uniformEmbedded) {
+            fontName = applyFontStyle(fontName, uniformStyle);
+        }
         double fontSize = (ts != null && ts.getFontSize() > 0) ? ts.getFontSize() : DEFAULT_FONT_SIZE;
 
         // SimSun (the standard CJK face) has no Extension B glyphs. When a
@@ -1927,7 +1965,11 @@ public class LayoutEngine {
                 return new DecodedImage(dims[0], dims[1], "DCTDecode", cs, raw);
             }
         }
-        // General path: decode through ImageIO (covers GIF/PNG/BMP/TIFF/…)
+        // General path: decode through ImageIO (covers GIF/PNG/BMP/TIFF/…).
+        // Use an in-memory stream cache: the default disk cache spills every
+        // decoded stream to a temp file (Files.createTempFile), needless I/O for
+        // the in-memory byte arrays we always hand it.
+        javax.imageio.ImageIO.setUseCache(false);
         try {
             java.awt.image.BufferedImage bi = javax.imageio.ImageIO.read(
                     new java.io.ByteArrayInputStream(raw));
@@ -1948,6 +1990,7 @@ public class LayoutEngine {
      * @return the decoded frame, or {@code null} if the frame cannot be read
      */
     private DecodedImage decodeImageFrame(byte[] raw, int frame) {
+        javax.imageio.ImageIO.setUseCache(false); // in-memory stream cache; no temp file
         try (javax.imageio.stream.ImageInputStream iis =
                      javax.imageio.ImageIO.createImageInputStream(new java.io.ByteArrayInputStream(raw))) {
             java.util.Iterator<javax.imageio.ImageReader> readers = javax.imageio.ImageIO.getImageReaders(iis);
@@ -1976,6 +2019,31 @@ public class LayoutEngine {
         int h = bi.getHeight();
         byte[] rgb = new byte[w * h * 3];
         int idx = 0;
+        // Fast path: an opaque sRGB image (the common JPEG/PNG case, decoded to
+        // TYPE_3BYTE_BGR) has no alpha to composite and its raster samples already
+        // ARE the 0-255 R,G,B values. Reading them a row at a time skips the
+        // per-pixel colour-model conversion getRGB(x, y) performs (the hot path for
+        // ComponentColorModel images). Byte-identical to the getRGB path for this
+        // case (verified); anything with alpha or a non-sRGB space falls through to
+        // the general getRGB loop below.
+        if (!bi.getColorModel().hasAlpha()
+                && bi.getColorModel().getColorSpace().isCS_sRGB()
+                && bi.getRaster().getNumBands() >= 3) {
+            java.awt.image.Raster raster = bi.getRaster();
+            int bands = raster.getNumBands();
+            int[] rowSamples = new int[w * bands];
+            for (int y = 0; y < h; y++) {
+                raster.getPixels(0, y, w, 1, rowSamples);
+                for (int x = 0; x < w; x++) {
+                    int base = x * bands;
+                    rgb[idx++] = (byte) rowSamples[base];
+                    rgb[idx++] = (byte) rowSamples[base + 1];
+                    rgb[idx++] = (byte) rowSamples[base + 2];
+                }
+            }
+            byte[] fast = flateCompress(rgb);
+            return new DecodedImage(w, h, "FlateDecode", "DeviceRGB", fast);
+        }
         for (int y = 0; y < h; y++) {
             for (int x = 0; x < w; x++) {
                 int argb = bi.getRGB(x, y);
@@ -2159,7 +2227,9 @@ public class LayoutEngine {
                 String text = tf.getText();
                 if (text != null && !text.isEmpty()) {
                     List<String> lines = TextLayoutHelper.wrapText(text, fontName, fontSize, innerWidth);
-                    double lineHeight = TextLayoutHelper.getLineHeight(fontName, fontSize);
+                    double lineHeight = (ts != null && ts.getLineSpacing() > 0)
+                            ? Math.max(fontSize, ts.getLineSpacing())
+                            : TextLayoutHelper.getLineHeight(fontName, fontSize);
                     totalHeight += lines.size() * lineHeight;
                 }
             } else if (para instanceof Image) {
@@ -2216,6 +2286,12 @@ public class LayoutEngine {
                     }
                 }
                 String fontName = (ts != null && ts.getFontName() != null) ? ts.getFontName() : DEFAULT_FONT;
+                // Bold/italic synthesis for non-embedded cell fonts (mirrors the flowing path).
+                int cellStyle = ts != null ? ts.getFontStyle() : 0;
+                boolean cellEmbedded = ts != null && ts.getFont() != null && ts.getFont().isEmbedded();
+                if (cellStyle != 0 && !cellEmbedded) {
+                    fontName = applyFontStyle(fontName, cellStyle);
+                }
                 double fontSize = (ts != null && ts.getFontSize() > 0) ? ts.getFontSize() : DEFAULT_FONT_SIZE;
 
                 String fontResource = resources.addFont(fontName);
@@ -2227,7 +2303,11 @@ public class LayoutEngine {
                 }
 
                 List<String> lines = TextLayoutHelper.wrapText(text, fontName, fontSize, width);
-                double lineHeight = TextLayoutHelper.getLineHeight(fontName, fontSize);
+                // Match the measured leading (see measureCellContent): honour an
+                // explicit line spacing, else the typographic default.
+                double lineHeight = (ts != null && ts.getLineSpacing() > 0)
+                        ? Math.max(fontSize, ts.getLineSpacing())
+                        : TextLayoutHelper.getLineHeight(fontName, fontSize);
 
                 Color fgColor = (ts != null) ? ts.getForegroundColor() : null;
 

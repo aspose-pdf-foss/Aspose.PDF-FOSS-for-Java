@@ -49,6 +49,13 @@ public class ResourceBuilder {
             = new LinkedHashMap<>();
 
     /**
+     * Resource names of embedded fonts whose program should be subset (only the
+     * glyphs actually drawn are kept) at the end of page layout — populated from
+     * {@link org.aspose.pdf.text.Font#isSubset()}. See {@link #subsetEmbeddedFonts()}.
+     */
+    private final java.util.Set<String> subsetResources = new java.util.LinkedHashSet<>();
+
+    /**
      * Creates an empty ResourceBuilder.
      */
     public ResourceBuilder() {
@@ -104,14 +111,21 @@ public class ResourceBuilder {
                         .extractFirstFaceFromTTC(ttf);
                 if (unpacked != null) ttf = unpacked;
             }
+            String fontName = font.getName() != null ? font.getName() : "EmbeddedFont";
+            // CFF-based OpenType (.otf, 'OTTO') must embed as /FontFile3 in a
+            // CIDFontType0; TrueType-outline fonts keep the /FontFile2 path.
             org.aspose.pdf.engine.font.ttf.Type0FontBuilder.Result built =
-                    org.aspose.pdf.engine.font.ttf.Type0FontBuilder.build(
-                            font.getName() != null ? font.getName() : "EmbeddedFont", ttf);
+                    org.aspose.pdf.engine.font.ttf.Type0FontBuilder.isOpenTypeCff(ttf)
+                            ? org.aspose.pdf.engine.font.ttf.Type0FontBuilder.buildOpenType(fontName, ttf)
+                            : org.aspose.pdf.engine.font.ttf.Type0FontBuilder.build(fontName, ttf);
             fontCounter++;
             String resourceName = "F" + fontCounter;
             fonts.put(resourceName, built.type0Font);
             fontNameToResource.put(key, resourceName);
             type0Readers.put(resourceName, built.reader);
+            if (font.isSubset()) {
+                subsetResources.add(resourceName);
+            }
             LOG.fine(() -> "Added embedded TrueType font " + font.getName()
                     + " as " + resourceName);
             return resourceName;
@@ -202,6 +216,76 @@ public class ResourceBuilder {
      *
      * @return the /Resources PdfDictionary
      */
+    /**
+     * Subsets the embedded TrueType programs of fonts marked for subsetting
+     * (see {@link org.aspose.pdf.text.Font#setSubset(boolean)}), keeping only the
+     * glyphs actually drawn on this page. Must be called AFTER all content has
+     * been emitted (so every used glyph has been recorded via
+     * {@link org.aspose.pdf.engine.font.ttf.TrueTypeReader#markGlyphUsed(int)})
+     * and BEFORE {@link #buildResourcesDictionary()}.
+     * <p>
+     * The subset is a drop-in replacement of the {@code /FontFile2} bytes:
+     * {@link org.aspose.pdf.engine.optimization.TtfGlyphStripper} does not
+     * renumber glyphs, so the Identity-H {@code CIDToGIDMap} and {@code /W}
+     * widths stay valid. Any failure (strip returns {@code null}, a larger
+     * result, or a malformed graph) leaves the full program embedded — subsetting
+     * is best-effort and never drops a used glyph.
+     * </p>
+     */
+    public void subsetEmbeddedFonts() {
+        for (String res : subsetResources) {
+            org.aspose.pdf.engine.font.ttf.TrueTypeReader reader = type0Readers.get(res);
+            PdfDictionary type0 = fonts.get(res);
+            if (reader == null || type0 == null) {
+                continue;
+            }
+            java.util.Set<Integer> used = reader.getUsedGids();
+            if (used == null || used.isEmpty()) {
+                continue;
+            }
+            // The glyph stripper rebuilds glyf/loca; CFF (OpenType /FontFile3)
+            // programs have no such tables and are embedded whole.
+            if (!reader.hasGlyphOutlines()) {
+                continue;
+            }
+            try {
+                org.aspose.pdf.engine.pdfobjects.PdfArray descendants = type0.getArray("DescendantFonts");
+                if (descendants == null || descendants.size() == 0) {
+                    continue;
+                }
+                PdfDictionary cidFont = descendants.getDictionary(0);
+                if (cidFont == null) {
+                    continue;
+                }
+                PdfDictionary descriptor = cidFont.getDictionary("FontDescriptor");
+                if (descriptor == null) {
+                    continue;
+                }
+                org.aspose.pdf.engine.pdfobjects.PdfBase ffBase = descriptor.get("FontFile2");
+                if (!(ffBase instanceof PdfStream)) {
+                    continue;
+                }
+                PdfStream fontFile2 = (PdfStream) ffBase;
+                byte[] original = fontFile2.getDecodedData();
+                if (original == null || original.length == 0) {
+                    continue;
+                }
+                java.util.Set<Integer> gids = new java.util.TreeSet<>(used);
+                gids.add(0); // always keep .notdef
+                byte[] stripped = org.aspose.pdf.engine.optimization.TtfGlyphStripper.strip(original, gids);
+                if (stripped != null && stripped.length > 0 && stripped.length < original.length) {
+                    fontFile2.setDecodedData(stripped);
+                    fontFile2.set("Length1", org.aspose.pdf.engine.pdfobjects.PdfInteger.valueOf(stripped.length));
+                    final int before = original.length;
+                    final int after = stripped.length;
+                    LOG.fine(() -> "Subset embedded font " + res + ": " + before + " -> " + after + " bytes");
+                }
+            } catch (Exception e) {
+                LOG.fine(() -> "Font subset skipped for " + res + ": " + e.getMessage());
+            }
+        }
+    }
+
     public PdfDictionary buildResourcesDictionary() {
         PdfDictionary resources = new PdfDictionary();
 

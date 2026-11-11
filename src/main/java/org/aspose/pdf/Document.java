@@ -2878,6 +2878,31 @@ public class Document implements Closeable {
         return new PdfObjectReference(key, k -> pendingImports.get(k));
     }
 
+    /**
+     * Returns an indirect reference to a page's dictionary, assigning (and pinning) its object key
+     * if it does not have one yet. The page is registered in the pending-imports map under that key
+     * so the save path reuses it rather than allocating a fresh one — letting other structures
+     * (e.g. a {@code /StructTreeRoot}'s {@code /Pg} and {@code /ParentTree}) reference the page by a
+     * stable key built before save. Idempotent: repeated calls return the same key.
+     *
+     * @param page the page to reference
+     * @return an indirect reference to the page dictionary
+     */
+    public PdfObjectReference getOrAssignPageReference(Page page) {
+        if (page == null) throw new IllegalArgumentException("page must not be null");
+        PdfDictionary pd = page.getPdfDictionary();
+        PdfObjectKey key = pd.getObjectKey();
+        if (key == null) {
+            key = new PdfObjectKey(allocateObjectNumber(), 0);
+            pd.setObjectKey(key);
+        }
+        pendingImports.putIfAbsent(key, pd);
+        return new PdfObjectReference(key, k -> {
+            PdfBase o = pendingImports.get(k);
+            return o != null ? o : pd;
+        });
+    }
+
     /** Returns the pending-imports map (package-private for PageCollection/save paths). */
     Map<PdfObjectKey, PdfBase> getPendingImports() {
         return pendingImports;
@@ -3170,7 +3195,8 @@ public class Document implements Closeable {
             for (Page page : pages) {
                 pageNum++;
                 layoutEngine.setPageNumbering(pageNum, totalPages);
-                if (page.getParagraphs() != null && !page.getParagraphs().isEmpty()) {
+                boolean hasParagraphs = page.getParagraphs() != null && !page.getParagraphs().isEmpty();
+                if (hasParagraphs || !page.getLayoutStamps().isEmpty()) {
                     layoutEngine.layout(page);
                 }
             }
@@ -3400,6 +3426,18 @@ public class Document implements Closeable {
         // Sync XMP metadata if present
         if (metadata != null) {
             objNum = syncXmpToCatalog(catalog, objects, objNum);
+        }
+
+        // Document Info: Aspose always stamps a Producer/Creator when saving, so a
+        // freshly-created document (new Document() + save()) round-trips with
+        // non-null Producer/Creator (PDFNET_49363_1). This runs only on the
+        // new-document path (parser == null); loaded documents keep their own Info.
+        DocumentInfo newInfo = getInfo();
+        if (newInfo.getProducer() == null || newInfo.getProducer().isEmpty()) {
+            newInfo.setProducer("Aspose.PDF for Java");
+        }
+        if (newInfo.getCreator() == null || newInfo.getCreator().isEmpty()) {
+            newInfo.setCreator("Aspose.PDF for Java");
         }
 
         // Document Info
@@ -4152,6 +4190,78 @@ public void decrypt() throws IOException {
     }
 
     /**
+     * Applies a document {@link Fixup} (a canned normalization operation) to
+     * this document, writing a short processing log to {@code outputLogFile}.
+     *
+     * <p>Supported fixups are {@link Fixup#RotatePagesToLandscape} and
+     * {@link Fixup#RotatePagesToPortrait}; both normalize the {@code /Rotate}
+     * entry of every page so that the page is <em>displayed</em> in the
+     * requested orientation. The page {@code MediaBox} is not modified — only
+     * the rotation is adjusted (by a single +90° step when the current
+     * displayed orientation differs from the target).</p>
+     *
+     * @param fixup         the fixup to apply
+     * @param outputLogFile path of the log file to create (must not be null)
+     * @return {@code true} if the fixup was applied
+     * @throws IOException if the document pages cannot be read or the log
+     *                     cannot be written
+     */
+    public boolean convert(Fixup fixup, String outputLogFile) throws IOException {
+        if (fixup == null) {
+            throw new IllegalArgumentException("fixup must not be null");
+        }
+        if (outputLogFile == null) {
+            throw new IllegalArgumentException("outputLogFile must not be null");
+        }
+        boolean toLandscape;
+        switch (fixup) {
+            case RotatePagesToLandscape:
+                toLandscape = true;
+                break;
+            case RotatePagesToPortrait:
+                toLandscape = false;
+                break;
+            default:
+                throw new UnsupportedOperationException("Fixup not implemented: " + fixup);
+        }
+
+        int changed = 0;
+        int pageNo = 0;
+        StringBuilder log = new StringBuilder();
+        log.append("Fixup: ").append(fixup).append(System.lineSeparator());
+        for (Page page : getPages()) {
+            pageNo++;
+            Rectangle mb = page.getMediaBox();
+            // Displayed dimensions swap when the page is rotated by an odd
+            // quarter turn (90 or 270 degrees).
+            int rotate = ((page.getRotate() % 360) + 360) % 360;
+            boolean quarterTurned = (rotate == 90 || rotate == 270);
+            double w = mb != null ? mb.getWidth() : 0;
+            double h = mb != null ? mb.getHeight() : 0;
+            double dispW = quarterTurned ? h : w;
+            double dispH = quarterTurned ? w : h;
+            boolean displayedLandscape = dispW > dispH;
+            if (displayedLandscape != toLandscape) {
+                int next = (rotate + 90) % 360;
+                page.setRotate(Rotation.fromDegrees(next));
+                changed++;
+                log.append("  page ").append(pageNo).append(": ")
+                        .append(rotate).append(" -> ").append(next)
+                        .append(System.lineSeparator());
+            } else {
+                log.append("  page ").append(pageNo).append(": ")
+                        .append(rotate).append(" (unchanged)")
+                        .append(System.lineSeparator());
+            }
+        }
+        log.append("Pages changed: ").append(changed).append(System.lineSeparator());
+
+        java.nio.file.Files.write(java.nio.file.Paths.get(outputLogFile),
+                log.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return true;
+    }
+
+    /**
      * Converts using detailed conversion options.
      *
      * @param options the conversion options
@@ -4667,6 +4777,17 @@ public void decrypt() throws IOException {
             return remainingHeight;
         }
 
+        // Rows that must repeat at the top of each continuation page (a table
+        // header). The first `repeatingRowsCount` rows are re-emitted on every
+        // new page the table spills onto, so the column headings stay in view —
+        // the standard behaviour when a table is broken across pages. 0 (the
+        // default) means no repetition, so non-header tables are unaffected.
+        int repeatCount = Math.max(0, Math.min(table.getRepeatingRowsCount(), rows.size()));
+        double repeatHeight = 0;
+        for (int i = 0; i < repeatCount; i++) {
+            repeatHeight += estimateRowHeight(rows.get(i), table, availableWidth);
+        }
+
         Table currentTable = cloneTableStructure(table);
         chunks.get(chunks.size() - 1).add(currentTable);
 
@@ -4678,6 +4799,8 @@ public void decrypt() throws IOException {
                 currentTable = cloneTableStructure(table);
                 chunks.get(chunks.size() - 1).add(currentTable);
                 remainingHeight = availableHeight;
+                remainingHeight -= repeatHeaderRows(currentTable, rows, repeatCount,
+                        rowIndex, repeatHeight);
             }
             currentTable.getRows().add(cloneRow(row));
             remainingHeight -= rowHeight;
@@ -4697,11 +4820,33 @@ public void decrypt() throws IOException {
                     currentTable = cloneTableStructure(table);
                     chunks.get(chunks.size() - 1).add(currentTable);
                     remainingHeight = availableHeight;
+                    remainingHeight -= repeatHeaderRows(currentTable, rows, repeatCount,
+                            rowIndex + 1, repeatHeight);
                 }
             }
         }
 
         return remainingHeight;
+    }
+
+    /**
+     * Prepends the repeating header rows (rows {@code 0..repeatCount-1}) to a
+     * freshly created continuation table, but only once layout has progressed
+     * past the header region itself ({@code nextRowIndex >= repeatCount}) so the
+     * header is never duplicated while it is still being emitted on the first
+     * page.
+     *
+     * @return the total height consumed by the repeated rows (0 if none added)
+     */
+    private double repeatHeaderRows(Table currentTable, List<Row> rows,
+                                    int repeatCount, int nextRowIndex, double repeatHeight) {
+        if (repeatCount <= 0 || nextRowIndex < repeatCount) {
+            return 0;
+        }
+        for (int i = 0; i < repeatCount; i++) {
+            currentTable.getRows().add(cloneRow(rows.get(i)));
+        }
+        return repeatHeight;
     }
 
     private double estimateParagraphHeight(BaseParagraph paragraph, double availableWidth) {
@@ -4719,7 +4864,15 @@ public void decrypt() throws IOException {
             double usableWidth = Math.max(1, availableWidth
                     - (margin != null ? margin.getLeft() + margin.getRight() : 0));
             int lineCount = TextLayoutHelper.wrapText(fragment.getText(), fontName, fontSize, usableWidth).size();
-            return top + bottom + Math.max(1, lineCount) * TextLayoutHelper.getLineHeight(fontName, fontSize);
+            // Match the renderer (and splitTextFragmentAcrossPages): when an explicit
+            // line spacing is set, the baseline-to-baseline distance is
+            // max(fontSize, lineSpacing), not the default 1.2x line height. Using the
+            // default here underestimated row height for line-spaced cells, so the
+            // paginator overpacked a page and the renderer clipped the overflow rows.
+            double lineHeight = textState != null && textState.getLineSpacing() > 0
+                    ? Math.max(fontSize, textState.getLineSpacing())
+                    : TextLayoutHelper.getLineHeight(fontName, fontSize);
+            return top + bottom + Math.max(1, lineCount) * lineHeight;
         }
 
         if (paragraph instanceof Table) {
@@ -4903,6 +5056,17 @@ public void decrypt() throws IOException {
         if (source.getPageInfo() != null) {
             target.setPageInfo(source.getPageInfo().deepClone());
         }
+        // An overflow/break page inherited from `source` must share its page size.
+        // paginate runs after flushDirtyPages(), so the cloned PageInfo above is
+        // never flushed to the inserted page's /MediaBox — copy the box directly so
+        // a non-default page size (e.g. a layout document built at A3) carries over
+        // instead of reverting to the default A4 insert box.
+        Rectangle sourceBox = source.getMediaBox();
+        if (sourceBox != null) {
+            target.setMediaBox(new Rectangle(
+                    sourceBox.getLLX(), sourceBox.getLLY(),
+                    sourceBox.getURX(), sourceBox.getURY()));
+        }
         if (source.getHeader() != null) {
             target.setHeader(source.getHeader());
         }
@@ -5042,14 +5206,51 @@ public void decrypt() throws IOException {
         if (pdfFormat != null) {
             return pdfFormat;
         }
+        // PDF/A inference on a loaded document: a file converted to PDF/A (by us
+        // or any other tool) carries its conformance in the XMP /Metadata
+        // (pdfaid:part + pdfaid:conformance). Detect it so a converted-then-
+        // reopened document reports its format (PDFNEWNET-37398). This getter
+        // deliberately does NOT mutate the pdfFormat FIELD: other PDF/A inference
+        // keys off pdfFormat == null, so we only derive the value on demand.
+        PdfFormat fromXmp = inferPdfFormatFromXmp();
+        if (fromXmp != null) {
+            return fromXmp;
+        }
         // A PDF 2.0 document (header 2.0 or catalog /Version /2.0) reports its
         // format even when never explicitly converted. Earlier versions keep the
-        // historical null-until-converted behaviour (PDF/A inference keys off the
-        // pdfFormat FIELD, which this getter does not mutate).
+        // historical null-until-converted behaviour.
         if ("2.0".equals(getVersion())) {
             return PdfFormat.v_2_0;
         }
         return pdfFormat;
+    }
+
+    /**
+     * Derives the PDF/A format of a loaded document from its XMP {@code pdfaid}
+     * identification metadata ({@code pdfaid:part} + {@code pdfaid:conformance}),
+     * or {@code null} when the document is not PDF/A or carries no such metadata.
+     * Does not mutate any state.
+     *
+     * @return the inferred PDF/A format, or null
+     */
+    private PdfFormat inferPdfFormatFromXmp() {
+        if (parser == null) {
+            return null;
+        }
+        try {
+            PdfDictionary catalog = getCatalog();
+            if (catalog == null) {
+                return null;
+            }
+            org.aspose.pdf.engine.pdfa.XmpMetadataHandler handler =
+                    org.aspose.pdf.engine.pdfa.XmpMetadataHandler.readFromCatalog(catalog);
+            if (handler.hasPdfAId()) {
+                return inferPdfAFormat(handler.getPdfAPart(), handler.getPdfAConformance());
+            }
+        } catch (IOException ignored) {
+            // Metadata unreadable — report no format rather than failing.
+        }
+        return null;
     }
 
     /**
@@ -5077,7 +5278,42 @@ public void decrypt() throws IOException {
      * the cached operator view (e.g. via {@link org.aspose.pdf.text.TextFragment#setText(String)})
      * are serialised before the document graph is written.
      */
+    /**
+     * Fragments with a font assignment ({@link org.aspose.pdf.text.TextState#setFont})
+     * whose source write-back was deferred to save time. Flushed at the start of
+     * {@link #flushDirtyPages()} so the embed/subset decision reflects the caller's
+     * final flag state (they may be flipped after {@code setFont}).
+     */
+    private final java.util.List<org.aspose.pdf.text.TextFragment> pendingFontWriteBacks =
+            new java.util.ArrayList<>();
+
+    /**
+     * Registers a fragment whose deferred font write-back must run at save time.
+     * Engine-internal; called from {@link org.aspose.pdf.text.TextState#setFont}.
+     *
+     * @param fragment the fragment carrying a pending font assignment
+     */
+    public void addPendingFontWriteBack(org.aspose.pdf.text.TextFragment fragment) {
+        if (fragment != null) {
+            pendingFontWriteBacks.add(fragment);
+        }
+    }
+
+    /** Runs and clears any deferred font write-backs (see {@link #pendingFontWriteBacks}). */
+    private void flushPendingFontWriteBacks() {
+        if (pendingFontWriteBacks.isEmpty()) return;
+        // Snapshot: a flush edits page content and may mark pages dirty, but must
+        // not re-enter this list.
+        java.util.List<org.aspose.pdf.text.TextFragment> pending =
+                new java.util.ArrayList<>(pendingFontWriteBacks);
+        pendingFontWriteBacks.clear();
+        for (org.aspose.pdf.text.TextFragment f : pending) {
+            f.flushPendingFontWriteBack();
+        }
+    }
+
     private void flushDirtyPages() throws IOException {
+        flushPendingFontWriteBacks();
         editedPageContentsThisSave = false;
         if (pages == null) return;
         for (Page p : pages) {
@@ -5184,18 +5420,38 @@ public void decrypt() throws IOException {
         }
     }
 
+    /**
+     * Creates a new optional-content group (layer) and registers it in the
+     * document (ISO 32000-1:2008, §8.11): builds the {@code /Type /OCG /Name}
+     * dictionary, stores it as an indirect object, and lists that reference in
+     * the catalog's {@code /OCProperties /OCGs} and the default configuration's
+     * {@code /D /Order}.
+     * <p>
+     * Returns the OCG's indirect reference. To make the layer actually toggle
+     * content in a viewer, mark that content with the SAME reference — reference
+     * it from a page's {@code /Resources /Properties} (see
+     * {@link Page#registerPropertiesResourceRef(PdfObjectReference)}) and wrap
+     * the content in {@code /OC /Name BDC … EMC}. Sharing the one indirect object
+     * between {@code /OCProperties} and the content is what binds the viewer's
+     * visibility switch to the marked content.
+     *
+     * @param name the human-readable layer name (/Name)
+     * @return the indirect reference to the new OCG dictionary
+     * @throws IOException if the catalog cannot be read
+     */
+    public PdfObjectReference addOptionalContentGroup(String name) throws IOException {
+        PdfDictionary ocg = new PdfDictionary();
+        ocg.set(PdfName.of("Type"), PdfName.of("OCG"));
+        ocg.set(PdfName.of("Name"), new PdfString(name == null ? "" : name));
+        PdfObjectReference ocgRef = registerImportedObject(ocg);
+        registerLayerInOcProperties(ocgRef);
+        return ocgRef;
+    }
+
     /** Adds an OCG reference to the catalog's /OCProperties (§8.11.4.2). */
     private void registerLayerInOcProperties(PdfObjectReference ocgRef) throws IOException {
-        PdfDictionary catalog = getCatalog();
-        if (catalog == null) return;
-        PdfBase ocpVal = deref(catalog.get("OCProperties"));
-        PdfDictionary ocp;
-        if (ocpVal instanceof PdfDictionary) {
-            ocp = (PdfDictionary) ocpVal;
-        } else {
-            ocp = new PdfDictionary();
-            catalog.set(PdfName.of("OCProperties"), ocp);
-        }
+        PdfDictionary ocp = getOrCreateOcProperties();
+        if (ocp == null) return;
         PdfBase ocgsVal = deref(ocp.get("OCGs"));
         PdfArray ocgs;
         if (ocgsVal instanceof PdfArray) {
@@ -5205,6 +5461,24 @@ public void decrypt() throws IOException {
             ocp.set(PdfName.of("OCGs"), ocgs);
         }
         ocgs.add(ocgRef);
+        ocDefaultOrder(ocp).add(ocgRef);
+    }
+
+    /** The catalog's {@code /OCProperties} dictionary, created if absent (null if no catalog). */
+    private PdfDictionary getOrCreateOcProperties() throws IOException {
+        PdfDictionary catalog = getCatalog();
+        if (catalog == null) return null;
+        PdfBase ocpVal = deref(catalog.get("OCProperties"));
+        if (ocpVal instanceof PdfDictionary) {
+            return (PdfDictionary) ocpVal;
+        }
+        PdfDictionary ocp = new PdfDictionary();
+        catalog.set(PdfName.of("OCProperties"), ocp);
+        return ocp;
+    }
+
+    /** The default configuration's {@code /D /Order} array, created if absent (§8.11.4.3). */
+    private PdfArray ocDefaultOrder(PdfDictionary ocp) {
         PdfBase dVal = deref(ocp.get("D"));
         PdfDictionary d;
         if (dVal instanceof PdfDictionary) {
@@ -5214,14 +5488,65 @@ public void decrypt() throws IOException {
             ocp.set(PdfName.of("D"), d);
         }
         PdfBase orderVal = deref(d.get("Order"));
-        PdfArray order;
         if (orderVal instanceof PdfArray) {
-            order = (PdfArray) orderVal;
-        } else {
-            order = new PdfArray();
-            d.set(PdfName.of("Order"), order);
+            return (PdfArray) orderVal;
         }
-        order.add(ocgRef);
+        PdfArray order = new PdfArray();
+        d.set(PdfName.of("Order"), order);
+        return order;
+    }
+
+    /**
+     * Adds a non-toggleable grouping label to the default optional-content
+     * configuration's {@code /D /Order} (ISO 32000-1:2008, §8.11.4.3): a text
+     * string in the Order array acts as a title/heading for the entries that
+     * follow it in a viewer's layer panel. Unlike
+     * {@link #addOptionalContentGroup(String)} a title is NOT a content group, so
+     * it is not added to {@code /OCGs} and marks no content.
+     *
+     * @param title the grouping label shown in the layers panel
+     * @throws IOException if the catalog cannot be read
+     */
+    public void addOptionalContentTitle(String title) throws IOException {
+        PdfDictionary ocp = getOrCreateOcProperties();
+        if (ocp == null) return;
+        ocDefaultOrder(ocp).add(new PdfString(title == null ? "" : title));
+    }
+
+    /**
+     * Adds a radio-button group to the default optional-content configuration's
+     * {@code /D /RBGroups} (ISO 32000-1:2008, §8.11.4.3): the listed OCGs become
+     * mutually exclusive, so a viewer keeps at most one of them visible at a time.
+     *
+     * @param ocgRefs the indirect references of the OCGs in the radio group
+     *                 (e.g. from {@link #addOptionalContentGroup(String)})
+     * @throws IOException if the catalog cannot be read
+     */
+    public void addOptionalContentRadioGroup(java.util.List<PdfObjectReference> ocgRefs) throws IOException {
+        if (ocgRefs == null || ocgRefs.isEmpty()) return;
+        PdfDictionary ocp = getOrCreateOcProperties();
+        if (ocp == null) return;
+        PdfBase dVal = deref(ocp.get("D"));
+        PdfDictionary d;
+        if (dVal instanceof PdfDictionary) {
+            d = (PdfDictionary) dVal;
+        } else {
+            d = new PdfDictionary();
+            ocp.set(PdfName.of("D"), d);
+        }
+        PdfBase rbVal = deref(d.get("RBGroups"));
+        PdfArray rbGroups;
+        if (rbVal instanceof PdfArray) {
+            rbGroups = (PdfArray) rbVal;
+        } else {
+            rbGroups = new PdfArray();
+            d.set(PdfName.of("RBGroups"), rbGroups);
+        }
+        PdfArray group = new PdfArray();
+        for (PdfObjectReference ref : ocgRefs) {
+            if (ref != null) group.add(ref);
+        }
+        rbGroups.add(group);
     }
 
     /** Dereferences an indirect reference, returning null on failure. */

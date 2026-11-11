@@ -249,6 +249,55 @@ public class FormEditor {
     }
 
     /**
+     * Sets the annotation flags ({@code /F}) on a field's widget (Aspose
+     * {@code FormEditor.SetFieldAppearance(String, int)}). The flag bits are a
+     * bitwise OR of {@link org.aspose.pdf.annotations.AnnotationFlags#getBit()}
+     * values (e.g. {@code NoView.getBit() | NoZoom.getBit()}).
+     *
+     * @param fieldName the full name of the field
+     * @param flags     the {@code /F} annotation flag bits
+     * @return {@code true} if the field was found and updated
+     */
+    public boolean setFieldAppearance(String fieldName, int flags) {
+        try {
+            Form form = requireBoundForm();
+            if (form == null) {
+                return false;
+            }
+            Field field = form.get(fieldName);
+            if (field == null) {
+                return false;
+            }
+            field.setFlags(flags);
+            return true;
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Failed to set field appearance: " + fieldName, e);
+            return false;
+        }
+    }
+
+    /**
+     * Returns the annotation flags ({@code /F}) of a field's widget, or 0 when
+     * the field is absent (Aspose {@code FormEditor.GetFieldAppearance(String)}).
+     *
+     * @param fieldName the full name of the field
+     * @return the {@code /F} annotation flag bits, or 0
+     */
+    public int getFieldAppearance(String fieldName) {
+        try {
+            Form form = requireBoundForm();
+            if (form == null) {
+                return 0;
+            }
+            Field field = form.get(fieldName);
+            return field != null ? field.getFlags() : 0;
+        } catch (Exception e) {
+            LOG.log(Level.WARNING, "Failed to get field appearance: " + fieldName, e);
+            return 0;
+        }
+    }
+
+    /**
      * Flattens all form fields, making them non-interactive.
      *
      * @return {@code true} on success

@@ -182,6 +182,94 @@ public final class Type0FontBuilder {
     }
 
     /**
+     * True when the sfnt bytes are a CFF-based OpenType font (signature
+     * {@code 'OTTO'}), which must be embedded as {@code /FontFile3} in a
+     * {@code CIDFontType0} rather than {@code /FontFile2}/{@code CIDFontType2}.
+     * TrueType-outline fonts ({@code 0x00010000} or {@code 'true'}) return false.
+     *
+     * @param bytes the font program bytes
+     * @return true for a CFF OpenType ({@code 'OTTO'}) program
+     */
+    public static boolean isOpenTypeCff(byte[] bytes) {
+        return bytes != null && bytes.length >= 4
+                && (bytes[0] & 0xFF) == 0x4F   // 'O'
+                && (bytes[1] & 0xFF) == 0x54   // 'T'
+                && (bytes[2] & 0xFF) == 0x54   // 'T'
+                && (bytes[3] & 0xFF) == 0x4F;  // 'O'
+    }
+
+    /**
+     * Builds the Type0 object graph for a <b>CFF-based OpenType</b> font
+     * (ISO 32000-1:2008 §9.7.4.2): a {@code /CIDFontType0} descendant whose
+     * {@code /FontDescriptor} carries the whole OpenType program in a
+     * {@code /FontFile3} stream tagged {@code /Subtype /OpenType}. Encoding is
+     * {@code /Identity-H} and, for a non-CID-keyed CFF (the common case for a
+     * desktop {@code .otf}), CIDs are taken as glyph indices — matching the
+     * {@code cmap}-driven glyph IDs the {@link TrueTypeReader} returns. A real
+     * {@code /W} width array (from {@code hmtx}) and a {@code /ToUnicode} CMap are
+     * emitted exactly as for the TrueType path.
+     *
+     * @param baseFontName the {@code /BaseFont} value (PDF-friendly form)
+     * @param otfBytes     standalone OpenType (CFF) bytes
+     * @return the assembled Type0 dict + parsed reader for encoding-side use
+     * @throws java.io.IOException if the OpenType bytes are malformed
+     */
+    public static Result buildOpenType(String baseFontName, byte[] otfBytes) throws java.io.IOException {
+        TrueTypeReader reader = new TrueTypeReader(otfBytes);
+        String pdfName = pdfSafeName(baseFontName);
+
+        // /FontFile3 — embedded OpenType program, Subtype /OpenType.
+        PdfStream fontFile = new PdfStream();
+        fontFile.set(PdfName.of("Subtype"), PdfName.of("OpenType"));
+        fontFile.setDecodedData(otfBytes);
+
+        PdfDictionary descriptor = new PdfDictionary();
+        descriptor.set(PdfName.of("Type"), PdfName.of("FontDescriptor"));
+        descriptor.set(PdfName.of("FontName"), PdfName.of(pdfName));
+        descriptor.set(PdfName.of("Flags"), PdfInteger.valueOf(32)); // Nonsymbolic
+        PdfArray bbox = new PdfArray();
+        bbox.add(PdfInteger.valueOf(-200));
+        bbox.add(PdfInteger.valueOf(-200));
+        bbox.add(PdfInteger.valueOf(1100));
+        bbox.add(PdfInteger.valueOf(1100));
+        descriptor.set(PdfName.of("FontBBox"), bbox);
+        descriptor.set(PdfName.of("ItalicAngle"), PdfInteger.valueOf(0));
+        descriptor.set(PdfName.of("Ascent"), PdfInteger.valueOf(880));
+        descriptor.set(PdfName.of("Descent"), PdfInteger.valueOf(-120));
+        descriptor.set(PdfName.of("CapHeight"), PdfInteger.valueOf(700));
+        descriptor.set(PdfName.of("StemV"), PdfInteger.valueOf(80));
+        descriptor.set(PdfName.of("FontFile3"), fontFile);
+
+        PdfDictionary cidSysInfo = new PdfDictionary();
+        cidSysInfo.set(PdfName.of("Registry"), new PdfString("Adobe"));
+        cidSysInfo.set(PdfName.of("Ordering"), new PdfString("Identity"));
+        cidSysInfo.set(PdfName.of("Supplement"), PdfInteger.valueOf(0));
+
+        // CIDFontType0 descendant (CFF outlines). No /CIDToGIDMap — that key is
+        // only meaningful for CIDFontType2.
+        PdfDictionary cidFont = new PdfDictionary();
+        cidFont.set(PdfName.of("Type"), PdfName.of("Font"));
+        cidFont.set(PdfName.of("Subtype"), PdfName.of("CIDFontType0"));
+        cidFont.set(PdfName.of("BaseFont"), PdfName.of(pdfName));
+        cidFont.set(PdfName.of("CIDSystemInfo"), cidSysInfo);
+        cidFont.set(PdfName.of("FontDescriptor"), descriptor);
+        cidFont.set(PdfName.of("DW"), PdfInteger.valueOf(1000));
+        cidFont.set(PdfName.of("W"), widthArray(reader));
+
+        PdfDictionary type0 = new PdfDictionary();
+        type0.set(PdfName.of("Type"), PdfName.of("Font"));
+        type0.set(PdfName.of("Subtype"), PdfName.of("Type0"));
+        type0.set(PdfName.of("BaseFont"), PdfName.of(pdfName));
+        type0.set(PdfName.of("Encoding"), PdfName.of("Identity-H"));
+        PdfArray descendantArr = new PdfArray();
+        descendantArr.add(cidFont);
+        type0.set(PdfName.of("DescendantFonts"), descendantArr);
+        type0.set(PdfName.of("ToUnicode"), buildToUnicodeCMap(reader, pdfName));
+
+        return new Result(type0, reader);
+    }
+
+    /**
      * Generates a {@code /ToUnicode} CMap stream that maps every glyph ID in
      * the font's cmap back to a single Unicode codepoint. Lets PDF readers
      * extract text and copy-paste it correctly even though the content

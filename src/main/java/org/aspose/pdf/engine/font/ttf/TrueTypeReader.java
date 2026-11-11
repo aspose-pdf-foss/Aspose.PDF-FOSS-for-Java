@@ -30,6 +30,17 @@ public class TrueTypeReader {
     private int unitsPerEm = 1000;
     private int numGlyphs;
     private int numHMetrics;
+    /** {@code hhea.ascender} in font units (design units, i.e. {@link #unitsPerEm}). */
+    private int hheaAscender = 0;
+    /** {@code hhea.descender} in font units, normally negative. */
+    private int hheaDescender = 0;
+    /**
+     * Glyph IDs requested through {@link #getGlyphId(int)} and recorded via
+     * {@link #markGlyphUsed(int)} during content-stream encoding. Drives
+     * font subsetting ({@link org.aspose.pdf.engine.optimization.TtfGlyphStripper}).
+     * Lazily created — {@code null} until the first glyph is marked.
+     */
+    private java.util.Set<Integer> usedGids;
     private int[] advanceWidths;     // indexed by glyph ID
     private Map<Integer, Integer> cmapTable;
     private Map<Integer, Integer> reverseCmapTable;
@@ -159,6 +170,33 @@ public class TrueTypeReader {
     }
 
     /**
+     * Records a glyph ID as used, for subsetting. Call this at each point where
+     * a glyph is actually emitted to a content stream so the subsetter knows
+     * which outlines to keep. No-op for negative ids.
+     *
+     * @param glyphId the glyph ID that was emitted
+     */
+    public void markGlyphUsed(int glyphId) {
+        if (glyphId < 0) {
+            return;
+        }
+        if (usedGids == null) {
+            usedGids = new java.util.TreeSet<>();
+        }
+        usedGids.add(glyphId);
+    }
+
+    /**
+     * Returns the set of glyph IDs recorded via {@link #markGlyphUsed(int)}, or
+     * {@code null} if none were marked (the font was never used for encoding).
+     *
+     * @return the used glyph IDs, or {@code null}
+     */
+    public java.util.Set<Integer> getUsedGids() {
+        return usedGids;
+    }
+
+    /**
      * Returns the advance width for the given glyph ID, in font units.
      *
      * @param glyphId the glyph ID
@@ -271,8 +309,33 @@ public class TrueTypeReader {
 
     private void parseHhea(int offset) {
         if (offset + 36 <= data.length) {
+            // hhea layout: version(4), ascender(2) @+4, descender(2) @+6,
+            // lineGap(2) @+8, …, numberOfHMetrics(2) @+34 (signed FWORDs).
+            hheaAscender = readInt16(offset + 4);
+            hheaDescender = readInt16(offset + 6);
             numHMetrics = readUInt16(offset + 34);
         }
+    }
+
+    /**
+     * Returns the horizontal-header ascender in font design units
+     * ({@link #getUnitsPerEm()}). Divide by {@code unitsPerEm} and multiply by
+     * 1000 to convert to the 1/1000-em glyph space used by PDF font metrics.
+     *
+     * @return the {@code hhea.ascender}, or 0 if the font has no hhea table
+     */
+    public int getAscender() {
+        return hheaAscender;
+    }
+
+    /**
+     * Returns the horizontal-header descender in font design units
+     * ({@link #getUnitsPerEm()}); normally negative.
+     *
+     * @return the {@code hhea.descender}, or 0 if the font has no hhea table
+     */
+    public int getDescender() {
+        return hheaDescender;
     }
 
     private void parseHmtx(int offset, int length) {

@@ -45,6 +45,15 @@ public class LayoutContext {
     private final double pageHeight;
 
     /**
+     * Transient per-block horizontal insets (a paragraph's own left/right
+     * margin), folded into the effective content edges only while that block is
+     * laid out. Both default to 0, so a block without explicit left/right
+     * margins — every FOSS-native paragraph — sees the unchanged content area.
+     */
+    private double blockIndentLeft;
+    private double blockIndentRight;
+
+    /**
      * Creates a LayoutContext for a page with the given dimensions and margins.
      * <p>
      * The content area is computed as:
@@ -91,7 +100,26 @@ public class LayoutContext {
      * @return contentRight - contentLeft
      */
     public double getAvailableWidth() {
-        return contentRight - contentLeft;
+        return getContentRight() - getContentLeft();
+    }
+
+    /**
+     * Applies a block's own left/right margin as a transient inset on the
+     * content area for the duration of that block's layout. Negative values are
+     * clamped to 0. Call {@link #clearBlockIndent()} when the block is done.
+     *
+     * @param left  left inset in points
+     * @param right right inset in points
+     */
+    public void setBlockIndent(double left, double right) {
+        this.blockIndentLeft = Math.max(0, left);
+        this.blockIndentRight = Math.max(0, right);
+    }
+
+    /** Clears any transient block indent set by {@link #setBlockIndent}. */
+    public void clearBlockIndent() {
+        this.blockIndentLeft = 0;
+        this.blockIndentRight = 0;
     }
 
     /**
@@ -120,7 +148,7 @@ public class LayoutContext {
      * Resets the horizontal cursor to the left edge of the content area.
      */
     public void resetCursorX() {
-        this.cursorX = contentLeft;
+        this.cursorX = getContentLeft();
     }
 
     /**
@@ -176,7 +204,7 @@ public class LayoutContext {
      * @return the content left X coordinate
      */
     public double getContentLeft() {
-        return contentLeft;
+        return contentLeft + blockIndentLeft;
     }
 
     /**
@@ -185,7 +213,7 @@ public class LayoutContext {
      * @return the content right X coordinate
      */
     public double getContentRight() {
-        return contentRight;
+        return contentRight - blockIndentRight;
     }
 
     /**

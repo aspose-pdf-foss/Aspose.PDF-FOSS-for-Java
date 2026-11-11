@@ -151,11 +151,43 @@ public class EmbeddedFileCollection implements Iterable<FileSpecification> {
         try {
             PdfDictionary efRoot = embeddedFilesRoot(true);
             if (efRoot == null) return;
-            String name = fs.getName() != null ? fs.getName() : "attachment" + files.size();
-            new NameTree(efRoot).put(name, fs.getPdfDictionary());
+            NameTree tree = new NameTree(efRoot);
+            // The name-tree KEY is the file's base name, not its (possibly
+            // fully-qualified) /F path — this is what Aspose stores and keeps
+            // the tree's sort order aligned with the displayed attachment name
+            // (PDFNET-57244: the corpus file is keyed "zugferd-invoice.xml"
+            // while its /F is an absolute local path).
+            String rawName = fs.getName() != null ? fs.getName() : "attachment" + files.size();
+            String base = baseName(rawName);
+            // A name tree requires unique keys (ISO 32000-1 §7.9.6). Two
+            // attachments can legitimately share the same base name, so when the
+            // chosen key already exists, disambiguate it rather than silently
+            // overwriting the existing entry.
+            String name = base;
+            for (int n = 1; tree.containsKey(name); n++) {
+                name = base + "-" + n;
+            }
+            tree.put(name, fs.getPdfDictionary());
         } catch (IOException e) {
             LOG.warning(() -> "Failed to add to name tree: " + e.getMessage());
         }
+    }
+
+    /**
+     * Strips any directory prefix from a file specification name, accepting
+     * both {@code /} and {@code \} separators (attachment names often carry a
+     * local absolute path). Returns the input unchanged when it has no
+     * separator or would reduce to an empty string.
+     */
+    private static String baseName(String name) {
+        if (name == null || name.isEmpty()) {
+            return name;
+        }
+        int cut = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
+        if (cut < 0 || cut == name.length() - 1) {
+            return name;
+        }
+        return name.substring(cut + 1);
     }
 
     private void removeFromNameTreeByName(String name) {

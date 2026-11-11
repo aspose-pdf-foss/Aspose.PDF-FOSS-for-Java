@@ -30,7 +30,7 @@ flowchart TD
   subgraph StartingPoints["Starting Points"]
     direction TB
     i1["An existing PDF file"]
-    i2["An existing HTML file"]
+    i2["HTML, DOCX, XLSX, or Markdown"]
     i3["TIFF images (multi-frame)"]
   end
   PRODUCT["Aspose.PDF FOSS for Java"]
@@ -56,7 +56,7 @@ flowchart TD
   subgraph Outputs["Outputs"]
     direction TB
     o1["A PDF file"]
-    o2["An HTML file"]
+    o2["HTML, XML, DOCX, XLSX, or Markdown"]
     o3["BMP images"]
     o4["GIF images"]
     o5["JPEG images"]
@@ -98,8 +98,13 @@ flowchart TD
   `OptimizationOptions` and `ResourceOptimizer`.
 - Validate and convert documents to PDF/A-1 through PDF/A-4 with `PdfAValidator`,
   `PdfAConverter`, and `PdfAValidationResult`.
-- Import HTML into a PDF with `HtmlLoadOptions` and `HtmlToPdfConverter`, and export a PDF back
-  to HTML or XML with `HtmlSaveOptions`, `PdfToHtmlConverter`, and `SaveFormat`.
+- Import HTML, DOCX, XLSX, or Markdown into a PDF with `HtmlLoadOptions`, `DocLoadOptions`,
+  `ExcelLoadOptions`, and `MarkdownLoadOptions`, and export a PDF back to HTML, XML, DOCX, XLSX,
+  or Markdown with `HtmlSaveOptions`, `DocSaveOptions`, `ExcelSaveOptions`, `MarkdownSaveOptions`,
+  and `SaveFormat` — all on a shared structural-document engine with no new dependencies.
+- Turn a spreadsheet into an interactive PDF form with `ExcelLoadOptions.setInteractiveForms(true)`,
+  which maps cells to AcroForm fields and translates Excel formulas into PDF JavaScript calculation
+  actions.
 - Read and write document metadata with `XmpMetadata`, `XmpWriter`, and `XmpParser`.
 - Split, merge, insert, extract, and reorder pages with `PdfFileEditor`, and edit individual page
   size and rotation with `PdfPageEditor`.
@@ -118,14 +123,14 @@ The package is published on Maven Central as `org.aspose:aspose-pdf-foss`:
 <dependency>
     <groupId>org.aspose</groupId>
     <artifactId>aspose-pdf-foss</artifactId>
-    <version>26.6.0</version>
+    <version>26.9.0</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'org.aspose:aspose-pdf-foss:26.6.0'
+implementation 'org.aspose:aspose-pdf-foss:26.9.0'
 ```
 
 To build from source instead:
@@ -348,11 +353,15 @@ public API surface spans 1026 public types across the module-grouped tables belo
 | `Color` | Represents a color value in one of several color spaces (RGB, Grayscale, CMYK). |
 | `ColorConverter` | Converts color operators in page content streams from one color space to another. |
 | `DefaultMetadataProperties` | String constants for commonly used XMP metadata property keys (ISO 16684-1). |
+| `DocLoadOptions` | Options for loading (converting) an Office Open XML word-processing document (.docx) into a PDF document. |
+| `DocSaveOptions` | Options for saving a document as Office Open XML word-processing (.docx), projected through the Semantic Document Model. |
 | `Document` | The central class for working with PDF documents (ISO 32000-1:2008). |
 | `DocumentActions` | Document-level action triggers (ISO 32000-1:2008, §12.6.4.1, p.417). |
 | `DocumentInfo` | Wraps the PDF document information dictionary (ISO 32000-1:2008, §14.3.3). |
 | `DocumentPageImporter` | Imports pages from one Document into another by performing a full deep copy of the source page's PDF object subgraph into fresh indirect objects belonging to the target document. |
 | `EmbeddedFileCollection` | Collection of embedded files (attachments) in a PDF document. |
+| `ExcelLoadOptions` | Options for loading (converting) an Office Open XML spreadsheet (.xlsx) into a PDF document, including the opt-in interactive-forms mode. |
+| `ExcelSaveOptions` | Options for saving a document as an Office Open XML spreadsheet (.xlsx) of typed, styled cells. |
 | `ExplicitDestination` | Abstract base for explicit destinations (ISO 32000-1:2008, §12.3.2.2, Table 151). |
 | `ExportFilter` | Filter for controlling which annotations are exported. |
 | `ExtGState` | Extended graphics state parameter dictionary (ISO 32000-1:2008, §8.4.5, Table 58). |
@@ -394,8 +403,11 @@ public API surface spans 1026 public types across the module-grouped tables belo
 | `LaunchAction` | Launch action — launches an application or opens a document (ISO 32000-1:2008, §12.6.4.1). |
 | `Layer` | Represents an Optional Content Group (layer) in a PDF document (ISO 32000-1:2008, §8.11). |
 | `LevelFormat` | Represents formatting settings for a single TOC level. |
+| `LoadOptions` | Base class for all document load options; the source format is determined by the runtime type of the options object. |
 | `LocalHyperlink` | Hyperlink to another location inside the same document — either a target BaseParagraph (set via setTarget(BaseParagraph)) or a specific 1-based page number (setTargetPageNumber(int)). |
 | `MarginInfo` | Represents margin information for a content element. |
+| `MarkdownLoadOptions` | Options for loading (converting) a Markdown document (.md) into a PDF document. |
+| `MarkdownSaveOptions` | Options for saving a document as Markdown (.md), serialized as CommonMark / GitHub-Flavored Markdown. |
 | `Matrix` | Represents a 3x3 affine transformation matrix used in PDF graphics state. |
 | `NamedAction` | Named action — predefined action (ISO 32000-1:2008, §12.6.4.11). |
 | `NamedDestination` | Represents a reference to a named destination in a PDF document (ISO 32000-1:2008, §12.3.2.3). |
@@ -426,6 +438,7 @@ public API surface spans 1026 public types across the module-grouped tables belo
 | `RgbToDeviceGrayConversionStrategy` | Converts RGB color values in a page's content stream to DeviceGray equivalents. |
 | `Row` | Represents a single row within a Table. |
 | `Rows` | Represents an ordered collection of Row instances within a Table. |
+| `SaveOptions` | Base class for all document save options; the target format is determined by the runtime type of the options object. |
 | `SetOCGStateAction` | SetOCGState action — changes the state of Optional Content Groups (ISO 32000-1:2008, §12.6.4.12). |
 | `Stamp` | Abstract base class for all stamp types that can be overlaid on PDF pages. |
 | `SubmitFormAction` | SubmitForm action — submits form data to a URL (ISO 32000-1:2008, §12.6.4.14). |
@@ -470,6 +483,7 @@ public API surface spans 1026 public types across the module-grouped tables belo
 | `CryptoAlgorithm` | Enumerates the cryptographic algorithms available for PDF encryption (ISO 32000-1:2008, Section 7.6). |
 | `HorizontalAlignment` | Enumerates horizontal alignment options for content elements within a PDF page or container. |
 | `HtmlDocumentType` | Represents the type of HTML document to generate. |
+| `LoadFormat` | Specifies the source format a document is loaded (and converted) from. |
 | `NumberingStyle` | Numbering style for headings and TOC entries. |
 | `PageCoordinateType` | Specifies which page box should be used as the coordinate space for rendering-related operations. |
 | `PageMode` | Document page mode — how the document should be displayed when opened. |
@@ -1605,9 +1619,10 @@ public API surface spans 1026 public types across the module-grouped tables belo
 Out of scope (not planned for this edition):
 
 - **OCR** — recognition of text in scanned images; use a dedicated OCR library instead.
-- **Conversion to non-PDF formats** other than HTML/XML — DOCX, XLSX, PPTX, EPUB, MOBI, Markdown,
-  LaTeX, and similar are not supported; this edition is PDF in, PDF (or HTML/XML/raster) out.
-- **Conversion from non-PDF formats** other than HTML — DOC, DOCX, XLSX, PPTX, XPS, PCL,
+- **Conversion to non-PDF formats** other than HTML, XML, DOCX, XLSX, and Markdown — PPTX, EPUB,
+  MOBI, LaTeX, and similar are not supported; this edition is PDF in, PDF (or HTML/XML/DOCX/XLSX/
+  Markdown/raster) out.
+- **Conversion from non-PDF formats** other than HTML, DOCX, XLSX, and Markdown — PPTX, XPS, PCL,
   PostScript, EPS, and SVG as input are not supported.
 - **Full XFA form rendering** — XFA data is exposed and can be flattened to AcroForm, but the
   dynamic XFA layout/rendering layer itself is not reproduced.

@@ -493,9 +493,20 @@ public class PdfFileStamp implements AutoCloseable {
                 double h = imgStamp.getHeight() > 0 ? imgStamp.getHeight() : 100;
                 double x = imgStamp.getXIndent();
                 double y = imgStamp.getYIndent();
+                // Snapshot the page's /XObject names so we can identify the one
+                // PdfFileMend.addImage registers and tie a stamp-tracking record
+                // to it — otherwise getStamps()/deleteStampById() never see image
+                // stamps added this way (PDFNEWNET-33319).
+                java.util.Set<String> before = xObjectNames(page);
                 PdfFileMend tmp = new PdfFileMend(document);
                 tmp.addImage(new java.io.ByteArrayInputStream(bytes),
                         pageNumber, x, y, x + w, y + h);
+                String resName = null;
+                for (String name : xObjectNames(page)) {
+                    if (!before.contains(name)) { resName = name; break; }
+                }
+                page.addStampInfoRecord("ImageStamp", imgStamp.getStampId(), null,
+                        x, y, w, h, resName);
                 return;
             }
         }
@@ -523,6 +534,23 @@ public class PdfFileStamp implements AutoCloseable {
         }
         // Fallback: text/page stamps go through the existing pathway.
         page.addStamp(stamp);
+    }
+
+    /** Returns the set of /XObject resource names on a page (empty if none). */
+    private static java.util.Set<String> xObjectNames(Page page) {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        try {
+            org.aspose.pdf.Resources resources = page.getResources();
+            if (resources == null) return names;
+            org.aspose.pdf.engine.pdfobjects.PdfDictionary xobjects = resources.getXObjects();
+            if (xobjects == null) return names;
+            for (org.aspose.pdf.engine.pdfobjects.PdfName key : xobjects.keySet()) {
+                names.add(key.getName());
+            }
+        } catch (Exception e) {
+            LOG.log(Level.FINE, "Could not read XObject names for stamp tracking", e);
+        }
+        return names;
     }
 
     private void ensureDocumentBound() {
@@ -560,6 +588,14 @@ public class PdfFileStamp implements AutoCloseable {
                     : new ImageStamp("stream-image");
             if (stamp.getImageStream() != null) {
                 imageStamp.setImageStream(stamp.getImageStream());
+            }
+            // Honour an explicit Stamp.SetImageSize(w, h); otherwise the core
+            // ImageStamp falls back to its natural/default size.
+            if (stamp.getImageWidth() > 0) {
+                imageStamp.setWidth(stamp.getImageWidth());
+            }
+            if (stamp.getImageHeight() > 0) {
+                imageStamp.setHeight(stamp.getImageHeight());
             }
             copyCommonProperties(stamp, imageStamp);
             return imageStamp;

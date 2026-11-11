@@ -49,6 +49,12 @@ public class Page {
     private Document owningDocument;
     private int number;
     private Paragraphs paragraphs;
+    // Positioned text overlays laid out together with the flowing paragraphs during
+    // new-document generation (see LayoutEngine.layout). Unlike addStamp(), which
+    // writes the page content immediately and would be overwritten when the layout
+    // engine rebuilds /Contents from the paragraphs, these are emitted inside that
+    // same content build so positioned text (e.g. showTextAligned) survives.
+    private java.util.List<TextStamp> layoutStamps;
     private PageInfo pageInfo;
     private HeaderFooter header;
     private HeaderFooter footer;
@@ -1580,6 +1586,36 @@ public class Page {
     }
 
     /**
+     * Queues a positioned text overlay to be rendered with this page's flowing
+     * content during new-document layout (ISO 32000-1 §9.4 text showing). The
+     * stamp's {@code XIndent}/{@code YIndent} give the absolute position; the
+     * layout engine emits it after the flowing paragraphs so it is not lost when
+     * {@code /Contents} is rebuilt. Use this (not {@link #addStamp(TextStamp)})
+     * for generated documents whose pages also carry paragraphs.
+     *
+     * @param stamp the positioned text overlay; ignored when {@code null}
+     */
+    public void addLayoutStamp(TextStamp stamp) {
+        if (stamp == null) {
+            return;
+        }
+        if (layoutStamps == null) {
+            layoutStamps = new java.util.ArrayList<>();
+        }
+        layoutStamps.add(stamp);
+    }
+
+    /**
+     * The positioned text overlays queued via {@link #addLayoutStamp(TextStamp)},
+     * or an empty list. Consumed by the layout engine during generation.
+     *
+     * @return the queued layout stamps (never {@code null})
+     */
+    public java.util.List<TextStamp> getLayoutStamps() {
+        return layoutStamps != null ? layoutStamps : java.util.Collections.emptyList();
+    }
+
+    /**
      * Returns the page info (dimensions and margins) for this page.
      *
      * @return the page info
@@ -2106,6 +2142,75 @@ public class Page {
         recordStampInfo("ImageStamp", stamp.getStampId(), null, x, y, w, h, imageRes);
     }
 
+    /**
+     * Adds an image to this page, scaled to fill the supplied rectangle.
+     *
+     * <p>The image is embedded as an Image XObject in the page resources and
+     * painted with a {@code q cm Do Q} sequence appended to the page content
+     * stream (ISO 32000-1:2008, §8.8). The rectangle is expressed in default
+     * user-space units.</p>
+     *
+     * @param imageFile path to the image file (JPEG, PNG, BMP, ...)
+     * @param rectangle the target rectangle on the page
+     * @throws IOException if the image cannot be read or embedded
+     */
+    public void addImage(String imageFile, Rectangle rectangle) throws IOException {
+        if (imageFile == null || imageFile.isEmpty()) {
+            throw new IllegalArgumentException("imageFile must not be null or empty");
+        }
+        byte[] imageBytes;
+        try (InputStream fis = java.nio.file.Files.newInputStream(java.nio.file.Paths.get(imageFile))) {
+            imageBytes = readAllBytes(fis);
+        }
+        addImageInternal(imageBytes, rectangle);
+    }
+
+    /**
+     * Adds an image supplied as a stream, scaled to fill the supplied rectangle.
+     *
+     * @param imageStream the image data stream
+     * @param rectangle   the target rectangle on the page
+     * @throws IOException if the image cannot be read or embedded
+     */
+    public void addImage(InputStream imageStream, Rectangle rectangle) throws IOException {
+        if (imageStream == null) {
+            throw new IllegalArgumentException("imageStream must not be null");
+        }
+        addImageInternal(readAllBytes(imageStream), rectangle);
+    }
+
+    private void addImageInternal(byte[] imageBytes, Rectangle rectangle) throws IOException {
+        if (imageBytes == null || imageBytes.length == 0) {
+            throw new IllegalArgumentException("image data is empty");
+        }
+        if (rectangle == null) {
+            throw new IllegalArgumentException("rectangle must not be null");
+        }
+
+        PdfStream imageXObject = XImage.createImageStream(imageBytes);
+        Resources resources = ensureResources();
+        PdfDictionary xObjects = resources.getXObjects();
+        if (xObjects == null) {
+            xObjects = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("XObject"), xObjects);
+        }
+        String imageRes = createUniqueXObjectName(xObjects, "Im", 0);
+        xObjects.set(PdfName.of(imageRes), imageXObject);
+
+        double x = rectangle.getLLX();
+        double y = rectangle.getLLY();
+        double w = rectangle.getWidth();
+        double h = rectangle.getHeight();
+
+        // Map the unit image square onto the rectangle: q [w 0 0 h x y] cm /Im Do Q.
+        ContentStreamBuilder builder = new ContentStreamBuilder();
+        builder.saveState();
+        builder.concatMatrix(w, 0, 0, h, x, y);
+        builder.drawXObject(imageRes);
+        builder.restoreState();
+        appendToContentStream(builder.toByteArray());
+    }
+
     private static byte[] readImageBytes(ImageStamp stamp) throws IOException {
         // Reuse bytes read on a previous application so ONE stamp can be applied to
         // several pages — an InputStream is single-pass and would be exhausted by
@@ -2239,6 +2344,29 @@ public class Page {
         recordStampInfo(type, stampId, text, x, y, width, height, null);
     }
 
+    /**
+     * Records a stamp-tracking entry for a stamp applied through a path other
+     * than {@link #addStamp} (e.g. an image stamp routed via {@code PdfFileMend}
+     * so the underlying {@code /XObject} is registered). Lets the facades layer
+     * keep {@code getStamps}/{@code deleteStampById} aware of such stamps
+     * (PDFNEWNET-33319). {@code resourceName} is the page {@code /XObject} name
+     * to drop when the stamp is deleted, or {@code null} if none.
+     *
+     * @param type         stamp type label (e.g. {@code "ImageStamp"})
+     * @param stampId      the stamp identifier
+     * @param text         the stamp text, or {@code null}
+     * @param x            lower-left X in page space
+     * @param y            lower-left Y in page space
+     * @param width        stamp width
+     * @param height       stamp height
+     * @param resourceName associated {@code /XObject} resource name, or {@code null}
+     */
+    public void addStampInfoRecord(String type, int stampId, String text,
+                                   double x, double y, double width, double height,
+                                   String resourceName) {
+        recordStampInfo(type, stampId, text, x, y, width, height, resourceName);
+    }
+
     private void recordStampInfo(String type, int stampId, String text,
                                  double x, double y, double width, double height,
                                  String resourceName) {
@@ -2295,6 +2423,21 @@ public class Page {
         double fontSize = stamp.getTextState().getFontSize();
         if (fontSize <= 0) {
             fontSize = 12;
+        }
+        // AutoAdjustFontSizeToFitStampRectangle: shrink (or grow) the font so the
+        // text fits the stamp's Width×Height. Uses the same width/height estimates
+        // as the stamp-box sizing (inverting them) so the glyph run and the BBox
+        // stay consistent.
+        if (stamp.isAutoAdjustFontSizeToFitStampRectangle()
+                && stamp.getWidth() > 0 && stamp.getHeight() > 0) {
+            String v = stamp.getValue() != null ? stamp.getValue() : "";
+            int len = Math.max(1, v.length());
+            double widthFit = stamp.getWidth() / (len * 0.5);   // inverse of estimateTextStampWidth
+            double heightFit = stamp.getHeight() / 1.2;          // inverse of estimateTextStampHeight
+            double fit = Math.min(widthFit, heightFit);
+            if (fit > 0) {
+                fontSize = fit;
+            }
         }
         String fontRes = builder.registerFont(fontName);
         builder.setFont(fontRes, fontSize);
@@ -2672,6 +2815,259 @@ public class Page {
             res = new Resources(resDict);
         }
         return res;
+    }
+
+    /**
+     * Registers a Standard-14 (Type1) font on this page's {@code /Resources/Font}
+     * dictionary and returns its resource name (e.g. {@code "FHelvetica"}),
+     * reusing an existing entry whose {@code /BaseFont} already matches.
+     * <p>
+     * Intended for callers that emit text-showing operators referencing a font by
+     * its resource name — for example a {@code Tf} ({@link org.aspose.pdf.operators.SelectFont})
+     * operator added directly to the page's {@link OperatorCollection}. The font
+     * is a non-embedded Standard-14 base font with WinAnsiEncoding (except Symbol
+     * and ZapfDingbats, which use their built-in encodings). See ISO 32000-1:2008
+     * §9.6.2.1.
+     * </p>
+     *
+     * @param baseFont the Standard-14 base font name (e.g. {@code "Helvetica"},
+     *                 {@code "Times-Bold"}, {@code "Courier-Oblique"})
+     * @return the resource name under which the font is registered in {@code /Resources/Font}
+     * @throws IllegalArgumentException if {@code baseFont} is null or empty
+     */
+    public String registerStandardFontResource(String baseFont) {
+        if (baseFont == null || baseFont.isEmpty()) {
+            throw new IllegalArgumentException("baseFont must not be null or empty");
+        }
+        return ArtifactSupport.ensureStandardFont(this, baseFont);
+    }
+
+    /**
+     * Registers an external object (image or form) on this page's
+     * {@code /Resources/XObject} sub-dictionary and returns the generated
+     * resource name (ISO 32000-1:2008, §7.8.3). The caller is then expected to
+     * invoke it with a {@code Do} content operator (optionally preceded by a
+     * {@code cm} placement matrix).
+     * <p>
+     * This is the low-level primitive behind higher-level helpers such as
+     * {@link #addImage(String, Rectangle)} and is exposed so adapter layers that
+     * emit their own content operators (e.g. a compatibility {@code PdfCanvas})
+     * can place an XObject without re-implementing resource bookkeeping. If the
+     * identical stream instance is already registered its existing name is
+     * reused rather than creating a duplicate entry.
+     *
+     * @param xobject the image or form XObject stream to register
+     * @return the resource name under which the XObject was registered (without
+     *         the leading slash)
+     * @throws IllegalArgumentException if {@code xobject} is null
+     */
+    public String registerXObjectResource(PdfStream xobject) {
+        if (xobject == null) {
+            throw new IllegalArgumentException("xobject must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary xObjects = resources.getXObjects();
+        if (xObjects == null) {
+            xObjects = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("XObject"), xObjects);
+        }
+        // Reuse an existing registration of the same instance to avoid bloating
+        // /Resources when one XObject is placed several times.
+        for (PdfName key : xObjects.keySet()) {
+            if (xObjects.get(key) == xobject) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(xObjects, "Xo", 0);
+        xObjects.set(PdfName.of(name), xobject);
+        return name;
+    }
+
+    /**
+     * Registers a graphics-state parameter dictionary on this page's
+     * {@code /Resources/ExtGState} sub-dictionary and returns the generated
+     * resource name (ISO 32000-1:2008, §8.4.5). The caller is expected to invoke
+     * it with a {@code gs} content operator.
+     * <p>
+     * Exposed for the same reason as {@link #registerXObjectResource(PdfStream)}:
+     * adapter layers emitting raw content operators need to attach an ExtGState
+     * without duplicating resource bookkeeping. A re-registered identical
+     * instance reuses its existing name.
+     *
+     * @param extGState the graphics-state parameter dictionary to register
+     * @return the resource name under which the dictionary was registered
+     *         (without the leading slash)
+     * @throws IllegalArgumentException if {@code extGState} is null
+     */
+    public String registerExtGStateResource(PdfDictionary extGState) {
+        if (extGState == null) {
+            throw new IllegalArgumentException("extGState must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary gsDict = resources.getExtGState();
+        if (gsDict == null) {
+            gsDict = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("ExtGState"), gsDict);
+        }
+        for (PdfName key : gsDict.keySet()) {
+            if (gsDict.get(key) == extGState) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(gsDict, "Gs", 0);
+        gsDict.set(PdfName.of(name), extGState);
+        return name;
+    }
+
+    /**
+     * Registers a shading dictionary (or mesh-shading stream — {@code PdfStream}
+     * is a {@code PdfDictionary}) on this page's {@code /Resources/Shading}
+     * sub-dictionary and returns the generated resource name (ISO 32000-1:2008,
+     * §8.7.4.3). The caller is expected to invoke it with an {@code sh} content
+     * operator.
+     * <p>
+     * Exposed for the same reason as {@link #registerXObjectResource(PdfStream)}:
+     * adapter layers emitting raw content operators need to attach a shading
+     * without duplicating resource bookkeeping. A re-registered identical
+     * instance reuses its existing name.
+     *
+     * @param shading the shading dictionary or mesh stream to register
+     * @return the resource name under which the shading was registered (without
+     *         the leading slash)
+     * @throws IllegalArgumentException if {@code shading} is null
+     */
+    public String registerShadingResource(PdfDictionary shading) {
+        if (shading == null) {
+            throw new IllegalArgumentException("shading must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary shDict = resources.getShadings();
+        if (shDict == null) {
+            shDict = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("Shading"), shDict);
+        }
+        for (PdfName key : shDict.keySet()) {
+            if (shDict.get(key) == shading) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(shDict, "Sh", 0);
+        shDict.set(PdfName.of(name), shading);
+        return name;
+    }
+
+    /**
+     * Registers a pattern dictionary (shading pattern /PatternType 2) or tiling
+     * pattern stream ({@code PdfStream} is a {@code PdfDictionary}) on this page's
+     * {@code /Resources/Pattern} sub-dictionary and returns the generated
+     * resource name (ISO 32000-1:2008, §8.7.3). The caller is expected to select
+     * the {@code /Pattern} colour space ({@code cs}/{@code CS}) and then name the
+     * pattern as the current colour ({@code scn}/{@code SCN}).
+     * <p>
+     * Exposed for the same reason as {@link #registerXObjectResource(PdfStream)}:
+     * adapter layers emitting raw content operators need to attach a pattern
+     * without duplicating resource bookkeeping. A re-registered identical
+     * instance reuses its existing name.
+     *
+     * @param pattern the shading-pattern dictionary or tiling-pattern stream
+     * @return the resource name under which the pattern was registered (without
+     *         the leading slash)
+     * @throws IllegalArgumentException if {@code pattern} is null
+     */
+    public String registerPatternResource(PdfDictionary pattern) {
+        if (pattern == null) {
+            throw new IllegalArgumentException("pattern must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary patDict = resources.getPatterns();
+        if (patDict == null) {
+            patDict = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("Pattern"), patDict);
+        }
+        for (PdfName key : patDict.keySet()) {
+            if (patDict.get(key) == pattern) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(patDict, "P", 0);
+        patDict.set(PdfName.of(name), pattern);
+        return name;
+    }
+
+    /**
+     * Registers a marked-content property list on this page's
+     * {@code /Resources/Properties} sub-dictionary and returns the generated
+     * resource name (ISO 32000-1:2008, §14.6.2 / §7.8.3). The caller is expected
+     * to reference it from a {@code BDC} operator ({@code /Tag /Name BDC}).
+     * <p>
+     * Exposed for the same reason as {@link #registerXObjectResource(PdfStream)}:
+     * adapter layers emitting raw content operators need to attach a
+     * marked-content property list (e.g. {@code /MCID}, optional-content
+     * membership) by name without duplicating resource bookkeeping. A
+     * re-registered identical instance reuses its existing name.
+     *
+     * @param properties the marked-content property dictionary to register
+     * @return the resource name under which the dictionary was registered
+     *         (without the leading slash)
+     * @throws IllegalArgumentException if {@code properties} is null
+     */
+    public String registerPropertiesResource(PdfDictionary properties) {
+        if (properties == null) {
+            throw new IllegalArgumentException("properties must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary propsDict = resources.getProperties();
+        if (propsDict == null) {
+            propsDict = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("Properties"), propsDict);
+        }
+        for (PdfName key : propsDict.keySet()) {
+            if (propsDict.get(key) == properties) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(propsDict, "MC", 0);
+        propsDict.set(PdfName.of(name), properties);
+        return name;
+    }
+
+    /**
+     * Registers an already-indirect marked-content property object (typically an
+     * optional-content group reference from
+     * {@link Document#addOptionalContentGroup(String)}) on this page's
+     * {@code /Resources/Properties} and returns the generated resource name.
+     * <p>
+     * Unlike {@link #registerPropertiesResource(PdfDictionary)}, this stores the
+     * given indirect {@code reference} verbatim rather than a dictionary, so the
+     * content's {@code /OC /Name BDC} points at the very same object listed in the
+     * catalog's {@code /OCProperties} — the identity a viewer keys layer
+     * visibility on (ISO 32000-1:2008, §8.11.3.2). A reference already present is
+     * reused.
+     *
+     * @param reference the indirect reference to register (e.g. an OCG)
+     * @return the resource name under which it was registered (without the
+     *         leading slash)
+     * @throws IllegalArgumentException if {@code reference} is null
+     */
+    public String registerPropertiesResourceRef(
+            org.aspose.pdf.engine.pdfobjects.PdfObjectReference reference) {
+        if (reference == null) {
+            throw new IllegalArgumentException("reference must not be null");
+        }
+        Resources resources = ensureResources();
+        PdfDictionary propsDict = resources.getProperties();
+        if (propsDict == null) {
+            propsDict = new PdfDictionary();
+            resources.getPdfDictionary().set(PdfName.of("Properties"), propsDict);
+        }
+        for (PdfName key : propsDict.keySet()) {
+            if (propsDict.get(key) == reference) {
+                return key.getName();
+            }
+        }
+        String name = createUniqueXObjectName(propsDict, "MC", 0);
+        propsDict.set(PdfName.of(name), reference);
+        return name;
     }
 
     /**

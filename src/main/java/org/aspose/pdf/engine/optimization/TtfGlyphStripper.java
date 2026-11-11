@@ -30,6 +30,19 @@ public final class TtfGlyphStripper {
 
     private static final Logger LOG = Logger.getLogger(TtfGlyphStripper.class.getName());
 
+    /**
+     * sfnt tables retained in the rebuilt font. A PDF consumer draws glyphs
+     * from {@code glyf}/{@code loca} and positions them itself, so the OpenType
+     * layout tables (GSUB/GPOS/GDEF/BASE/JSTF), kerning, device-metric, hinting-
+     * metric and digital-signature tables are dead weight. On modern system
+     * fonts these can rival or exceed the outlines, so dropping them is a large
+     * part of the size win; {@code DSIG} must go in any case once the program is
+     * edited. Everything a renderer needs is kept.
+     */
+    private static final Set<String> KEEP_TABLES = new java.util.HashSet<>(java.util.Arrays.asList(
+            "head", "hhea", "maxp", "hmtx", "cmap", "glyf", "loca",
+            "cvt ", "fpgm", "prep", "post", "OS/2", "name", "gasp"));
+
     private final byte[] data;
     private final Map<String, int[]> tables = new LinkedHashMap<>();   // tag → {offset, length}
     private int numGlyphs;
@@ -143,17 +156,22 @@ public final class TtfGlyphStripper {
 
     /** Rewrites the font with replacement glyf/loca/head tables. */
     private byte[] assemble(byte[] glyfBytes, byte[] locaBytes, byte[] headBytes) {
-        int numTables = tables.size();
-        int headerSize = 12 + 16 * numTables;
         Map<String, byte[]> content = new LinkedHashMap<>();
         for (Map.Entry<String, int[]> entry : tables.entrySet()) {
-            switch (entry.getKey()) {
+            String tag = entry.getKey();
+            if (!KEEP_TABLES.contains(tag)) {
+                continue;   // drop OpenType layout / kerning / signature / device tables
+            }
+            switch (tag) {
                 case "glyf": content.put("glyf", glyfBytes); break;
                 case "loca": content.put("loca", locaBytes); break;
                 case "head": content.put("head", headBytes); break;
-                default: content.put(entry.getKey(), slice(entry.getValue()));
+                case "post": content.put("post", postFormat3(entry.getValue())); break;
+                default: content.put(tag, slice(entry.getValue()));
             }
         }
+        int numTables = content.size();
+        int headerSize = 12 + 16 * numTables;
 
         int total = headerSize;
         for (byte[] table : content.values()) {
@@ -256,6 +274,20 @@ public final class TtfGlyphStripper {
                 throw new IllegalStateException("non-monotonic loca");
             }
         }
+    }
+
+    /**
+     * Re-emits {@code post} as a 32-byte format-3.0 header (no glyph-name list).
+     * The name list in format-2 {@code post} covers every glyph in the original
+     * font and is never consulted by a PDF renderer, so dropping it is safe and
+     * often saves tens of KB. The 32-byte header (version…maxMemType1) is copied
+     * verbatim from the original with only the version field changed.
+     */
+    private byte[] postFormat3(int[] table) {
+        byte[] b = new byte[32];
+        System.arraycopy(data, table[0], b, 0, Math.min(32, table[1]));
+        writeU32(b, 0, 0x00030000);
+        return b;
     }
 
     private byte[] slice(int[] table) {

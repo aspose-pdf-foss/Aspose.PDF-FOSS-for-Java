@@ -80,6 +80,11 @@ public class CheckboxField extends Field {
      * <p>Idempotent: safe to call after any property change. No-op when the
      * widget has no {@code /Rect} set yet.</p>
      */
+    @Override
+    protected void regenerateAppearanceIfSupported() {
+        regenerateAppearance();
+    }
+
     public void regenerateAppearance() {
         Rectangle r = getRect();
         if (r == null) return;

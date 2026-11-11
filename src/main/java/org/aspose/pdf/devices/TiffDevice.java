@@ -357,19 +357,28 @@ public class TiffDevice {
 
     private BufferedImage toBinary(BufferedImage src) {
         BufferedImage rgb = toRGB(src);
-        BufferedImage bin = new BufferedImage(rgb.getWidth(), rgb.getHeight(), BufferedImage.TYPE_BYTE_BINARY);
+        int w = rgb.getWidth();
+        int h = rgb.getHeight();
+        BufferedImage bin = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_BINARY);
         WritableRaster raster = bin.getRaster();
         float brightness = settings != null ? settings.getBrightness() : 0.5f;
         int threshold = Math.max(0, Math.min(255, Math.round(brightness * 255f)));
-        for (int y = 0; y < rgb.getHeight(); y++) {
-            for (int x = 0; x < rgb.getWidth(); x++) {
-                int argb = rgb.getRGB(x, y);
+        // Row-wise bulk pixel access: a single getRGB/setSamples call per scanline is
+        // dramatically faster than per-pixel getRGB(x,y)/setSample(x,y), which dominated
+        // large multi-page TIFF exports (e.g. a 1100-page document at 300 DPI, PDFNEWNET-33324).
+        int[] row = new int[w];
+        int[] bits = new int[w];
+        for (int y = 0; y < h; y++) {
+            rgb.getRGB(0, y, w, 1, row, 0, w);
+            for (int x = 0; x < w; x++) {
+                int argb = row[x];
                 int r = (argb >> 16) & 0xFF;
                 int g = (argb >> 8) & 0xFF;
                 int b = argb & 0xFF;
                 int luminance = (299 * r + 587 * g + 114 * b) / 1000;
-                raster.setSample(x, y, 0, luminance >= threshold ? 1 : 0);
+                bits[x] = luminance >= threshold ? 1 : 0;
             }
+            raster.setSamples(0, y, w, 1, 0, bits);
         }
         return bin;
     }

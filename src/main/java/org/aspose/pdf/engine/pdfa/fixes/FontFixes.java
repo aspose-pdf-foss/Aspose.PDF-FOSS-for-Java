@@ -12,6 +12,8 @@ import org.aspose.pdf.engine.pdfobjects.PdfObjectReference;
 import org.aspose.pdf.engine.pdfobjects.PdfStream;
 import org.aspose.pdf.engine.pdfobjects.PdfString;
 import org.aspose.pdf.engine.font.ttf.FontDiskLookup;
+import org.aspose.pdf.engine.optimization.TtfGlyphStripper;
+import org.aspose.pdf.engine.font.AdobeGlyphList;
 import org.aspose.pdf.engine.pdfa.PdfAValidationResult;
 import org.aspose.pdf.engine.parser.PDFParser;
 
@@ -380,6 +382,19 @@ public final class FontFixes {
                 continue;
             }
 
+            // Subset the located program to the glyphs the simple font can
+            // address (≤ 256 codes). glyph-blanking keeps all glyph ids so the
+            // /Encoding and /Widths we emit below stay valid; the full system
+            // font (often > 1 MB) shrinks to the handful of reachable outlines.
+            // CFF/OpenType programs have no glyf table and are returned as-is.
+            if (!isCffOtf) {
+                java.util.Set<Integer> keep = collectSimpleFontGids(dict, parser, reader);
+                byte[] stripped = TtfGlyphStripper.strip(program, keep);
+                if (stripped != null && stripped.length < program.length) {
+                    program = stripped;
+                }
+            }
+
             PdfStream fontStream = new PdfStream();
             fontStream.setDecodedData(program);
             fontStream.setFilter(PdfName.FLATE_DECODE);
@@ -588,6 +603,69 @@ public final class FontFixes {
         fontDict.set("FirstChar", PdfInteger.valueOf(32));
         fontDict.set("LastChar", PdfInteger.valueOf(255));
         fontDict.set("Widths", widths);
+    }
+
+    /**
+     * Collects the glyph ids a simple (non-CID) font can select, for subsetting.
+     * A simple font addresses at most 256 single-byte codes, so the union of the
+     * glyphs reachable through every plausible code→glyph channel is a complete,
+     * lossless keep-set:
+     * <ul>
+     *   <li>WinAnsi code→Unicode (the encoding we force for non-symbolic fonts)</li>
+     *   <li>the raw code as a Unicode value (Latin-1 identity)</li>
+     *   <li>the symbol range {@code 0xF000 + code} (symbolic TrueType cmaps)</li>
+     *   <li>names in an explicit {@code /Encoding /Differences} → Unicode (AGL)</li>
+     * </ul>
+     * Glyph 0 (.notdef) and composite components are added by the subsetter.
+     *
+     * @param fontDict the simple font dictionary
+     * @param parser   the parsed document (to resolve the /Encoding reference)
+     * @param reader   a reader over the located font program (cmap lookups)
+     * @return the glyph ids whose outlines must be retained
+     */
+    private static java.util.Set<Integer> collectSimpleFontGids(
+            PdfDictionary fontDict, PDFParser parser,
+            org.aspose.pdf.engine.font.ttf.TrueTypeReader reader) {
+        java.util.Set<Integer> gids = new java.util.HashSet<>();
+        for (int code = 0; code <= 255; code++) {
+            addGid(gids, reader.getGlyphId(code));
+            addGid(gids, reader.getGlyphId(0xF000 + code));
+            Integer uni = WIN_ANSI_MAP.get(code);
+            if (uni != null) {
+                addGid(gids, reader.getGlyphId(uni));
+            }
+        }
+        // Honour an explicit /Encoding /Differences name list.
+        PdfBase encRef = fontDict.get("Encoding");
+        if (encRef != null) {
+            try {
+                PdfBase encObj = parser.resolveReference(encRef);
+                if (encObj instanceof PdfDictionary) {
+                    PdfBase diffs = ((PdfDictionary) encObj).get("Differences");
+                    if (diffs instanceof PdfArray) {
+                        PdfArray arr = (PdfArray) diffs;
+                        for (int i = 0; i < arr.size(); i++) {
+                            PdfBase el = arr.get(i);
+                            if (el instanceof PdfName) {
+                                int u = AdobeGlyphList.getUnicode(((PdfName) el).getName());
+                                if (u > 0) {
+                                    addGid(gids, reader.getGlyphId(u));
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (IOException | RuntimeException ignored) {
+                // fall back to the code-based keep-set above
+            }
+        }
+        return gids;
+    }
+
+    private static void addGid(java.util.Set<Integer> gids, int gid) {
+        if (gid > 0) {
+            gids.add(gid);
+        }
     }
 
     /**

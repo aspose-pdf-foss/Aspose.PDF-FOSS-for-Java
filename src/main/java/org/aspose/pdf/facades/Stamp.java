@@ -31,6 +31,8 @@ public class Stamp {
     private int pdfPageNumber = 1;
     private float opacity = 1.0f;
     private int[] pages;
+    private double imageWidth;
+    private double imageHeight;
 
     /**
      * Creates a new empty {@code Stamp} instance.
@@ -76,6 +78,39 @@ public class Stamp {
      */
     public void setPages(int[] pages) {
         this.pages = pages;
+    }
+
+    /**
+     * Sets the rendered size of an image stamp, in points (Aspose
+     * {@code Stamp.SetImageSize(float, float)}). Only meaningful for image
+     * stamps bound via {@link #bindImage(String)} / {@link #bindImage(InputStream)};
+     * ignored for text and PDF-page stamps. Non-positive values mean "use the
+     * natural size".
+     *
+     * @param width  the target width in points
+     * @param height the target height in points
+     */
+    public void setImageSize(double width, double height) {
+        this.imageWidth = width;
+        this.imageHeight = height;
+    }
+
+    /**
+     * Returns the explicit image-stamp width in points, or 0 when unset.
+     *
+     * @return the image width in points
+     */
+    public double getImageWidth() {
+        return imageWidth;
+    }
+
+    /**
+     * Returns the explicit image-stamp height in points, or 0 when unset.
+     *
+     * @return the image height in points
+     */
+    public double getImageHeight() {
+        return imageHeight;
     }
 
     /**

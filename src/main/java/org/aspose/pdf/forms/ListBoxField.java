@@ -29,6 +29,20 @@ public class ListBoxField extends Field {
      * @param page the page
      * @param rect the field rectangle
      */
+    /**
+     * Constructs a new <em>detached</em> list box field (no owning page). Page
+     * wiring is deferred to {@link Form#add(Field, Page, Rectangle)}.
+     */
+    public ListBoxField() {
+        super(new PdfDictionary(), "");
+        dict.set(PdfName.of("Type"), PdfName.of("Annot"));
+        dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
+        dict.set(PdfName.of("FT"), PdfName.of("Ch"));
+        if (getDefaultAppearance() == null) {
+            setDefaultAppearance("/Helv 12 Tf 0 g");
+        }
+    }
+
     public ListBoxField(Page page, Rectangle rect) {
         super(new PdfDictionary(), page, "");
         dict.set(PdfName.of("Type"), PdfName.of("Annot"));

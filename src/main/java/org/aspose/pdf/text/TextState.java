@@ -122,6 +122,15 @@ public class TextState {
         Font f = new Font(fontName);
         f.setEmbedded(fontEmbedded);
         f.setSubset(fontSubset);
+        // For a state bound to an absorbed, editable fragment, memoize the built
+        // font and bind it to that fragment so a caller's mutation sticks and can
+        // write back on save (Aspose idiom: getFont().setEmbedded(true) embeds the
+        // existing font in place — FontTests.Embed_ExistingFont1). Non-editable
+        // states keep returning a throwaway, preserving prior behaviour.
+        if (sourceWriteBackFragment != null) {
+            f.bindWriteBack(sourceWriteBackFragment);
+            this.font = f;
+        }
         return f;
     }
 
@@ -154,17 +163,16 @@ public class TextState {
     public void setFont(Font font) {
         this.font = font;
         this.fontName = font != null ? font.getName() : null;
-        // Aspose semantics: assigning a new (embeddable) font to an absorbed
-        // fragment re-draws that fragment's glyphs with the new font on save.
-        // Mirror the setFontSize write-back: only fires for a state bound to an
-        // extracted fragment and only for a font carrying real program bytes
-        // (Standard-14 replacements have no bytes and take the by-name path).
+        // Aspose semantics: assigning a new font to an absorbed fragment re-draws
+        // that fragment's glyphs with the new font on save. The actual write-back
+        // is DEFERRED to save time rather than run here, because callers routinely
+        // flip the embed/subset flags AFTER setFont (e.g. setSubset(false)), and
+        // the embed-vs-non-embed decision must honour their final state. Scheduling
+        // records the fragment and seeds the font's default flags (embeddable ->
+        // embedded+subset) so a pre-save getFont().isEmbedded()/isSubset() is
+        // already correct; the embedded/simple encoding path is picked at flush.
         if (font != null && sourceWriteBackFragment != null) {
-            // Both embedded (font-program bytes present) and Standard-14
-            // replacements (no bytes) write back to the source now; the fragment
-            // picks the right encoding path. Standard-14 replacement is required
-            // for FontReplace.RemoveUnusedFonts (Courier/Times-Roman etc.).
-            sourceWriteBackFragment.applyFontToSource(font);
+            sourceWriteBackFragment.scheduleFontWriteBack(font);
         }
     }
 
@@ -183,10 +191,32 @@ public class TextState {
      * @param fontSize the font size in points
      */
     public void setFontSize(double fontSize) {
+        double oldSize = this.fontSize;
         this.fontSize = fontSize;
         if (sourceWriteBackFragment != null) {
-            sourceWriteBackFragment.applyFontSizeToSource(fontSize);
+            sourceWriteBackFragment.applyFontSizeToSource(fontSize, oldSize);
         }
+    }
+
+    /**
+     * Measures the advance width of the given text using this state's font and
+     * font size, in user-space points.
+     * <p>
+     * Delegates to {@link Font#measureString(String, double)} for the resolved
+     * {@link #getFont() font}; when no font object is attached it measures by the
+     * state's font name through the Standard-14 width tables. Matches Aspose.PDF
+     * semantics (e.g. Helvetica {@code "z"} at 14&nbsp;pt ≈ 7.000).
+     * </p>
+     *
+     * @param text the text to measure
+     * @return the advance width in user-space points
+     */
+    public double measureString(String text) {
+        Font f = getFont();
+        if (f != null) {
+            return f.measureString(text, fontSize);
+        }
+        return org.aspose.pdf.engine.layout.TextLayoutHelper.measureTextWidth(text, fontName, fontSize);
     }
 
     /** Fragment whose source content stream mirrors font-size changes, or null. */

@@ -34,6 +34,28 @@ public class TextBoxField extends Field {
      * @param page the page
      * @param rect the field rectangle
      */
+    /**
+     * Constructs a new <em>detached</em> text box field (no owning page). The
+     * field-dictionary state is set up here; the rectangle, widget {@code /P}
+     * and page {@code /Annots} wiring are applied later by
+     * {@link Form#add(Field, Page, Rectangle)}.
+     */
+    public TextBoxField() {
+        super(new PdfDictionary(), "");
+        dict.set(PdfName.of("Type"), PdfName.of("Annot"));
+        dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
+        dict.set(PdfName.of("FT"), PdfName.of("Tx"));
+        markPrintable(dict);
+        if (getDefaultAppearance() == null) {
+            setDefaultAppearance("/Helv 0 Tf 0 g");
+        }
+    }
+
+    @Override
+    protected void regenerateAppearanceIfSupported() {
+        regenerateAppearance();
+    }
+
     public TextBoxField(Page page, Rectangle rect) {
         super(new PdfDictionary(), page, "");
         dict.set(PdfName.of("Type"), PdfName.of("Annot"));

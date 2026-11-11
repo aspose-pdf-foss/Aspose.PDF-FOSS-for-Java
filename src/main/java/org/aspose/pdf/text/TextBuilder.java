@@ -195,16 +195,35 @@ public class TextBuilder {
                 // round-trip through save → reopen → TFA. Falls back to the
                 // existing Type1/WinAnsi path when the system TTF cannot be
                 // located (e.g. font name unknown to the OS).
-                boolean useType0 = requiresType0(segText);
+                // A caller that assigned an embeddable Font object (setFont with a
+                // font carrying program bytes, marked setEmbedded(true)) wants that
+                // face embedded — register it from the attached bytes as an
+                // Identity-H composite, taking precedence over the name-only path
+                // below (FontTests.AddFont_TextBuilder1/2). TrueType embeds as a
+                // subset; OpenType/CFF ("OTTO") embeds whole (no CFF subsetter).
+                org.aspose.pdf.text.Font attachedFont = segState.getFont() != null
+                        ? segState.getFont() : fragState.getFont();
+                boolean embedAttached = attachedFont != null && attachedFont.isEmbedded()
+                        && attachedFont.getFontData() != null && attachedFont.getFontData().length > 0;
+
+                boolean useType0;
                 String resourceName = null;
-                if (useType0) {
-                    resourceName = registerType0Font(fontName, segText);
-                    if (resourceName == null) {
-                        useType0 = false;
-                    }
+                if (embedAttached) {
+                    resourceName = registerEmbeddedAttachedFont(fontName, attachedFont);
                 }
-                if (!useType0) {
-                    resourceName = registerFont(fontName);
+                if (resourceName != null) {
+                    useType0 = true; // emit Identity-H CID hex via the attached reader
+                } else {
+                    useType0 = requiresType0(segText);
+                    if (useType0) {
+                        resourceName = registerType0Font(fontName, segText);
+                        if (resourceName == null) {
+                            useType0 = false;
+                        }
+                    }
+                    if (!useType0) {
+                        resourceName = registerFont(fontName);
+                    }
                 }
                 String fontKey = (useType0 ? "T0:" : "T1:") + fontName;
                 if (!fontKey.equals(currentFont) || fontSize != currentSize) {
@@ -382,6 +401,67 @@ public class TextBuilder {
     }
 
     /**
+     * Registers an Identity-H composite font built from a caller-supplied
+     * embeddable {@link org.aspose.pdf.text.Font}'s program bytes (as opposed to
+     * {@link #registerType0Font}, which loads a face from disk by name). Chooses
+     * the embedding path from the font's magic: TrueType ({@code buildLatin},
+     * subsettable) vs OpenType/CFF ({@code buildOpenType}, embedded whole — there
+     * is no CFF subsetter, so such a font reopens as {@code isSubset() == false}).
+     * A TrueType subset gets the conventional {@code AAAAAA+} {@code /BaseFont}
+     * tag so a reload reports {@code isSubset() == true}.
+     *
+     * @param fontName the requested base name (spaces are stripped for /BaseFont)
+     * @param attached the embeddable font carrying the program bytes
+     * @return the resource alias (e.g. {@code "F1"}), or {@code null} on failure
+     */
+    private String registerEmbeddedAttachedFont(String fontName, org.aspose.pdf.text.Font attached) {
+        try {
+            byte[] bytes = attached.getFontData();
+            if (bytes == null || bytes.length == 0) {
+                return null;
+            }
+            boolean otto = Type0FontBuilder.isOpenTypeCff(bytes);
+            boolean subset = !otto && attached.isSubset();
+            String base = (fontName != null && !fontName.isEmpty() ? fontName : "EmbeddedFont")
+                    .replaceAll("\\s+", "");
+            if (subset) {
+                base = "AAAAAA+" + base;
+            }
+            // Reflect the real subset outcome back on the font so a pre-save
+            // getFont().isSubset() agrees with what reopening will report.
+            attached.setSubset(subset);
+
+            String cached = type0FontResources.get(base);
+            if (cached != null) {
+                return cached;
+            }
+            Type0FontBuilder.Result built = otto
+                    ? Type0FontBuilder.buildOpenType(base, bytes)
+                    : Type0FontBuilder.buildLatin(base, bytes);
+
+            Resources resources = page.ensureResources();
+            PdfDictionary fontsDict = resources.getFonts();
+            if (fontsDict == null) {
+                fontsDict = new PdfDictionary();
+                resources.getPdfDictionary().set(PdfName.FONT, fontsDict);
+            }
+            int index = 1;
+            String candidateName;
+            do {
+                candidateName = "F" + index;
+                index++;
+            } while (fontsDict.containsKey(candidateName));
+            fontsDict.set(PdfName.of(candidateName), built.type0Font);
+            type0FontResources.put(base, candidateName);
+            type0Readers.put(candidateName, built.reader);
+            return candidateName;
+        } catch (IOException e) {
+            LOG.warning("Failed to register embedded attached font " + fontName + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * Loads {@code fontName}'s TTF from disk and assembles its Type0 graph.
      * Returns {@code null} when the file is missing or the parser rejects it.
      */
@@ -427,6 +507,7 @@ public class TextBuilder {
         for (int i = 0; i < text.length(); ) {
             int cp = text.codePointAt(i);
             int gid = reader.getGlyphId(cp);
+            reader.markGlyphUsed(gid); // record for font subsetting
             sb.append(String.format("%04X", gid & 0xFFFF));
             i += Character.charCount(cp);
         }

@@ -25,7 +25,17 @@ public abstract class MarkupAnnotation extends Annotation {
      * @param page the page this annotation belongs to
      * @param rect the annotation rectangle
      */
-    protected MarkupAnnotation(Page page, Rectangle rect) { super(page, rect); }
+    protected MarkupAnnotation(Page page, Rectangle rect) {
+        super(page, rect);
+        // Aspose stamps a creation timestamp on freshly-created markup annotations
+        // (ISO 32000-1 §12.5.6.2, /CreationDate): getCreationDate() must be non-null,
+        // and later-created instances must sort >= earlier ones. The PDF date format
+        // "D:YYYYMMDDHHmmSS" sorts correctly under lexicographic String.compareTo.
+        java.time.LocalDateTime now = java.time.LocalDateTime.now();
+        setCreationDate(String.format("D:%04d%02d%02d%02d%02d%02d",
+                now.getYear(), now.getMonthValue(), now.getDayOfMonth(),
+                now.getHour(), now.getMinute(), now.getSecond()));
+    }
 
     /**
      * Returns the author or title of the annotation (/T entry).

@@ -318,6 +318,85 @@ public final class MetadataFixes {
         LOG.fine("Synchronized DocInfo with XMP metadata");
     }
 
+    /**
+     * Removes XMP properties that are not permitted in the target PDF/A profile
+     * without a PDF/A extension schema.
+     * <p>
+     * {@code xmpMM:OriginalDocumentID} is not among the XMP Media Management
+     * properties predefined for PDF/A-2/3 (unlike {@code DocumentID},
+     * {@code InstanceID}, {@code DerivedFrom}, {@code History} and
+     * {@code RenditionClass}), so a conforming file must either declare it via an
+     * extension schema or drop it. Aspose drops it (PDFNET-56488). Only this one
+     * element is removed; the {@code stRef:originalDocumentID} entry inside a
+     * ResourceRef (e.g. {@code xmpMM:DerivedFrom}) is a different, permitted
+     * property and is left untouched.
+     *
+     * @param parser      the parsed PDF
+     * @param format      the target format
+     * @param errorAction the error action strategy
+     * @param result      the validation result
+     * @throws IOException if an I/O error occurs
+     */
+    public void removeDisallowedXmpProperties(PDFParser parser, PdfFormat format,
+                                              ConvertErrorAction errorAction, PdfAValidationResult result) throws IOException {
+        if (!format.isPdfA()) {
+            return;
+        }
+        // A document can carry several XMP packets — the catalog /Metadata plus
+        // per-object /Metadata on pages or XObjects (56488.pdf has more than one).
+        // Scan every /Type /Metadata stream, not just the catalog's.
+        boolean anyCleaned = false;
+        for (PdfObjectKey key : new java.util.ArrayList<>(parser.getAllObjectKeys())) {
+            PdfBase obj;
+            try {
+                obj = parser.getObject(key);
+            } catch (IOException e) {
+                continue;
+            }
+            if (!(obj instanceof PdfStream)) {
+                continue;
+            }
+            PdfStream stream = (PdfStream) obj;
+            if (!"Metadata".equals(stream.getNameAsString("Type"))) {
+                continue;
+            }
+            if (stripOriginalDocumentId(stream)) {
+                anyCleaned = true;
+            }
+        }
+        if (anyCleaned) {
+            result.addWarning("meta.4",
+                    "Removed PDF/A-disallowed xmpMM:OriginalDocumentID from XMP metadata",
+                    "catalog/Metadata", null);
+        }
+    }
+
+    /**
+     * Strips any {@code xmpMM:OriginalDocumentID} element from a single metadata
+     * stream's XMP packet, rewriting it uncompressed. Returns whether the stream
+     * was changed.
+     */
+    private static boolean stripOriginalDocumentId(PdfStream metaStream) throws IOException {
+        String xmp = new String(metaStream.getDecodedData(), StandardCharsets.UTF_8);
+        if (!xmp.contains("xmpMM:OriginalDocumentID")) {
+            return false;
+        }
+        // Drop the whole element (open tag … close tag), DOTALL so a value that
+        // wraps lines is covered, plus any leading indentation and trailing
+        // newline so no blank line is left behind.
+        String cleaned = xmp.replaceAll(
+                "(?s)[ \\t]*<xmpMM:OriginalDocumentID>.*?</xmpMM:OriginalDocumentID>[ \\t]*\\r?\\n?",
+                "");
+        // Also handle a self-closing or attribute-style occurrence defensively.
+        cleaned = cleaned.replaceAll("(?s)[ \\t]*<xmpMM:OriginalDocumentID[^>]*/>[ \\t]*\\r?\\n?", "");
+        if (cleaned.equals(xmp)) {
+            return false;
+        }
+        metaStream.setDecodedData(cleaned.getBytes(StandardCharsets.UTF_8));
+        metaStream.set(PdfName.FILTER, null);
+        return true;
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------

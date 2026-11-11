@@ -171,3 +171,29 @@ new external dependencies.
     <version>26.9.0</version>
 </dependency>
 ```
+
+
+## [26.11]
+
+Maintenance release: a text-extraction correctness fix on the core
+`TextFragmentAbsorber` / `TextAbsorber` path. No new external dependencies.
+
+### Fixed
+- `TextFragmentAbsorber.getText()` in empty-phrase ("extract everything") mode
+  now returns the same positional, formatting-mode-aware text as `TextAbsorber`
+  unless a spatial filter is configured (a `TextSearchOptions` search rectangle,
+  `limitToPageBounds`, or exclude rectangles). Previously it always returned a
+  compact fragment-join that ignored the `TextExtractionOptions` formatting mode,
+  so `TextAbsorber` and `TextFragmentAbsorber` could report different text for the
+  same page. Phrase-search callers are unaffected — they continue to receive the
+  inherited positional output.
+
+### Maven Coordinates
+
+```xml
+<dependency>
+    <groupId>org.aspose</groupId>
+    <artifactId>aspose-pdf-foss</artifactId>
+    <version>26.11.0</version>
+</dependency>
+```

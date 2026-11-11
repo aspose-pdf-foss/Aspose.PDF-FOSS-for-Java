@@ -57,30 +57,74 @@ public class FontUtilities {
                 Page page = pages.get(i);
                 Resources resources = page.getResources();
                 if (resources == null) continue;
-                PdfDictionary fontsDict = resources.getFonts();
-                if (fontsDict == null) continue;
-                for (PdfName key : fontsDict.keySet()) {
-                    PdfBase fontObj = fontsDict.get(key);
-                    fontObj = resolveRef(fontObj);
-                    if (fontObj instanceof PdfDictionary) {
-                        PdfDictionary fontDict = (PdfDictionary) fontObj;
-                        String baseFontName = fontDict.getNameAsString("BaseFont");
-                        if (baseFontName == null) {
-                            baseFontName = key.getName();
-                        }
-                        if (!fontMap.containsKey(baseFontName)) {
-                            Font font = new Font(baseFontName);
-                            font.setEmbedded(isFontEmbedded(fontDict));
-                            font.setSubset(isFontSubset(baseFontName));
-                            fontMap.put(baseFontName, font);
-                        }
-                    }
-                }
+                collectFonts(resources.getFonts(), fontMap);
             }
+            // AcroForm default resources (/AcroForm /DR /Font) hold the fonts used
+            // by form field appearances, which never appear in a page's own
+            // /Resources (ISO 32000-1 §12.7.2). Aspose includes them in the
+            // document's font list — scan them after the pages so page fonts keep
+            // their leading positions (PDFNET-44576).
+            collectFonts(acroFormFonts(), fontMap);
         } catch (IOException e) {
             LOG.warning(() -> "Error collecting fonts: " + e.getMessage());
         }
         return fontMap.values().toArray(new Font[0]);
+    }
+
+    /**
+     * Adds each entry of a {@code /Font} resource dictionary to {@code fontMap},
+     * de-duplicating by the raw {@code /BaseFont} name (so two differently-subset
+     * copies of the same face stay distinct) while exposing the subset-prefix-
+     * stripped name through {@link Font#getName()}.
+     */
+    private void collectFonts(PdfDictionary fontsDict, Map<String, Font> fontMap) {
+        if (fontsDict == null) return;
+        for (PdfName key : fontsDict.keySet()) {
+            PdfBase fontObj = resolveRef(fontsDict.get(key));
+            if (!(fontObj instanceof PdfDictionary)) continue;
+            PdfDictionary fontDict = (PdfDictionary) fontObj;
+            String baseFontName = fontDict.getNameAsString("BaseFont");
+            if (baseFontName == null) {
+                baseFontName = key.getName();
+            }
+            if (!fontMap.containsKey(baseFontName)) {
+                Font font = new Font(stripSubsetPrefix(baseFontName));
+                font.setEmbedded(isFontEmbedded(fontDict));
+                font.setSubset(isFontSubset(baseFontName));
+                fontMap.put(baseFontName, font);
+            }
+        }
+    }
+
+    /**
+     * Returns the {@code /AcroForm /DR /Font} dictionary, or {@code null} when the
+     * document has no form or no default-resource fonts.
+     */
+    private PdfDictionary acroFormFonts() throws IOException {
+        PdfDictionary catalog = document.getCatalog();
+        if (catalog == null) return null;
+        PdfBase acroForm = resolveRef(catalog.get("AcroForm"));
+        if (!(acroForm instanceof PdfDictionary)) return null;
+        PdfBase dr = resolveRef(((PdfDictionary) acroForm).get("DR"));
+        if (!(dr instanceof PdfDictionary)) return null;
+        PdfBase fonts = resolveRef(((PdfDictionary) dr).get("Font"));
+        return fonts instanceof PdfDictionary ? (PdfDictionary) fonts : null;
+    }
+
+    /**
+     * Strips a 6-uppercase-letter subset prefix ({@code ABCDEF+}) from a base
+     * font name (ISO 32000-1 §9.6.4). Returns the input unchanged when it does
+     * not match the subset convention.
+     */
+    private static String stripSubsetPrefix(String baseFont) {
+        if (baseFont == null || baseFont.length() < 8 || baseFont.charAt(6) != '+') {
+            return baseFont;
+        }
+        for (int i = 0; i < 6; i++) {
+            char c = baseFont.charAt(i);
+            if (c < 'A' || c > 'Z') return baseFont;
+        }
+        return baseFont.substring(7);
     }
 
     /**

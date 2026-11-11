@@ -73,6 +73,11 @@ public class ComboBoxField extends Field {
      * yet — a degenerate or missing rectangle is stored rather than rejected,
      * matching {@link Field}'s lenient construction semantics.</p>
      */
+    @Override
+    protected void regenerateAppearanceIfSupported() {
+        regenerateAppearance();
+    }
+
     public void regenerateAppearance() {
         Rectangle rect = getRect();
         if (rect == null) return;

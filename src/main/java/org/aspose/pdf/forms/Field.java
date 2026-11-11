@@ -47,6 +47,48 @@ Field extends WidgetAnnotation implements Iterable<Field> {
     }
 
     /**
+     * Constructs a <em>detached</em> field from a dictionary with no owning page.
+     * <p>
+     * A detached field holds only its field-dictionary state ({@code /FT},
+     * {@code /T}, {@code /Ff}, {@code /V}, {@code /Opt}, …); the page-dependent
+     * wiring (widget {@code /P} and insertion into the page {@code /Annots}) is
+     * deferred until the field is attached via
+     * {@link Form#add(Field, Page, Rectangle)}. 
+     * </p>
+     *
+     * @param dict     the PDF dictionary backing this field
+     * @param fullName the fully-qualified dotted name of the field
+     */
+    protected Field(PdfDictionary dict, String fullName) {
+        this(dict, null, fullName);
+    }
+
+    /**
+     * Regenerates this field's appearance stream if the concrete field type
+     * supports it. Default is a no-op; appearance-bearing subclasses
+     * (text/checkbox/combo) override it to call their appearance builder. Used
+     * by {@link Form#add(Field, Page, Rectangle)} after the rectangle is set so
+     * a detached field gets a correct {@code /AP} on attach.
+     */
+    protected void regenerateAppearanceIfSupported() {
+        // no-op by default
+    }
+
+    /**
+     * Package-internal attach helper: stores the widget {@code /Rect} without
+     * positive-area validation (matching the lenient semantics the field
+     * constructors use via {@code setRectLenient}). Called by
+     * {@link Form#add(Field, Page, Rectangle)} when attaching a detached field.
+     *
+     * @param rect the rectangle to store; ignored if null
+     */
+    void attachRect(Rectangle rect) {
+        if (rect != null) {
+            setRectLenient(rect);
+        }
+    }
+
+    /**
      * Returns the border of this form field.
      *
      * @return the border, or null if not set

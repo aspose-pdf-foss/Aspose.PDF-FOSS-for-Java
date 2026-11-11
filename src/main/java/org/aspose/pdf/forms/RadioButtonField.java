@@ -45,6 +45,19 @@ public class RadioButtonField extends Field {
     }
 
     /**
+     * Constructs a new <em>detached</em> radio button field (no owning page).
+     * Page wiring is deferred to {@link Form#add(Field, Page, Rectangle)}.
+     */
+    public RadioButtonField() {
+        super(new PdfDictionary(), "");
+        dict.set(PdfName.of("Type"), PdfName.of("Annot"));
+        dict.set(PdfName.of("Subtype"), PdfName.of("Widget"));
+        dict.set(PdfName.of("FT"), PdfName.of("Btn"));
+        // Set radio flag (bit 16)
+        dict.set(PdfName.of("Ff"), PdfInteger.valueOf(RADIO_FLAG));
+    }
+
+    /**
      * Convenience overload — creates a radio-button group on {@code page} and
      * uses {@code rect} as the field-level {@code /Rect} (most viewers ignore
      * it for radio groups but Aspose-compat ports often set it).

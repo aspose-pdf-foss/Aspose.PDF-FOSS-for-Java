@@ -505,7 +505,22 @@ public class Form implements AutoCloseable {
             RandomAccessReader reader = RandomAccessReader.fromStream(fdfInputStream);
             PDFParser fdfParser = new PDFParser(reader);
             fdfParser.parse();
-            PdfDictionary catalog = fdfParser.getCatalog();
+            // An FDF file's root is an FDF catalog (/FDF <<...>>), NOT a PDF
+            // /Type /Catalog, and FDF files carry no xref/startxref — so
+            // PDFParser.getCatalog() (which enforces catalog semantics and runs
+            // catalog-recovery that only matches /Type /Catalog) rejects it.
+            // Resolve the trailer's /Root directly instead (ISO 32000-1 §12.7.7).
+            PdfDictionary trailer = fdfParser.getTrailer();
+            PdfBase rootBase = trailer != null ? trailer.get("Root") : null;
+            if (rootBase instanceof PdfObjectReference) {
+                rootBase = fdfParser.resolveReference(rootBase);
+            }
+            if (!(rootBase instanceof PdfDictionary)) {
+                LOG.warning("FDF has no resolvable /Root dictionary");
+                fdfParser.close();
+                return;
+            }
+            PdfDictionary catalog = (PdfDictionary) rootBase;
             PdfBase fdfBase = catalog.get("FDF");
             if (fdfBase instanceof PdfObjectReference) {
                 fdfBase = fdfParser.resolveReference(fdfBase);

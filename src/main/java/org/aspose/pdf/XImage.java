@@ -30,6 +30,13 @@ public class XImage {
 
     private static final Logger LOG = Logger.getLogger(XImage.class.getName());
 
+    static {
+        // Decode all images from in-memory byte arrays, so ImageIO must not spill
+        // each stream to a temp file (its default disk cache). That per-image
+        // temp-file I/O dominated image embedding; a memory cache removes it.
+        javax.imageio.ImageIO.setUseCache(false);
+    }
+
     private final PdfStream stream;
     private String name;
     private final PDFParser parser;
@@ -1093,9 +1100,48 @@ public class XImage {
         int height = image.getHeight();
         byte[] pixels = new byte[width * height * (gray ? 1 : 3)];
         int p = 0;
+        // Fast path: for an sRGB image the raster's integer samples already ARE the
+        // 0-255 R,G,B component values, so read them a row at a time and skip the
+        // per-pixel colour-model conversion that getRGB(x, y) performs. That
+        // conversion is the hot path for JPEG/PNG, which ImageIO decodes to
+        // TYPE_3BYTE_BGR (ComponentColorModel). The output is byte-identical to the
+        // getRGB result for sRGB images (verified); non-sRGB images take the
+        // colour-model fallback below so their values are still converted to sRGB.
+        if (image.getColorModel().getColorSpace().isCS_sRGB()) {
+            java.awt.image.Raster raster = image.getRaster();
+            int bands = raster.getNumBands();
+            int[] rowSamples = new int[width * bands];
+            for (int y = 0; y < height; y++) {
+                raster.getPixels(0, y, width, 1, rowSamples);
+                for (int x = 0; x < width; x++) {
+                    int base = x * bands;
+                    int r;
+                    int g;
+                    int b;
+                    if (bands >= 3) {
+                        r = rowSamples[base];
+                        g = rowSamples[base + 1];
+                        b = rowSamples[base + 2];
+                    } else {
+                        r = g = b = rowSamples[base];
+                    }
+                    if (gray) {
+                        pixels[p++] = (byte) ((r + g + b) / 3);
+                    } else {
+                        pixels[p++] = (byte) r;
+                        pixels[p++] = (byte) g;
+                        pixels[p++] = (byte) b;
+                    }
+                }
+            }
+            return pixels;
+        }
+        // Fallback (non-sRGB): per-row bulk getRGB, which colour-converts to sRGB.
+        int[] row = new int[width];
         for (int y = 0; y < height; y++) {
+            image.getRGB(0, y, width, 1, row, 0, width);
             for (int x = 0; x < width; x++) {
-                int rgb = image.getRGB(x, y);
+                int rgb = row[x];
                 int r = (rgb >> 16) & 0xFF;
                 int g = (rgb >> 8) & 0xFF;
                 int b = rgb & 0xFF;
