@@ -23,6 +23,23 @@ Only `pom.xml`'s `<version>` element changed as part of this bump -- groupId,
 artifactId, and all other pom.xml elements are unchanged from the 2026-08-21
 hardening pass above.
 
+### Version bump: 26.9.0 -> 26.11.0 (2026-11-12, republication)
+
+`--mode=republish`. The upstream commit `3c6bd62b038c` ("Release 26.11") bumped the pom
+`<version>` to `26.11.0` itself (together with the `[26.11]` CHANGELOG entry and README
+edits); S-110 then pushed tag `v26.11.0` at exactly that commit. No pom.xml element other
+than `<version>` changed in this release (groupId, artifactId, plugins, `waitUntil`, and
+description are as audited before). Note for the product team: the release workflow runs
+only on a tag push or a published GitHub Release -- merging a version bump to `main`
+does not by itself publish.
+
+Observation recorded for the product team: the `[26.11]` CHANGELOG entry lists one fix
+(`TextFragmentAbsorber.getText()`), while the code diff since `v26.9.0` also adds 41
+public member declarations (38 new member names on existing classes, 2 overloads, 1 on a
+class new to the API surface), e.g. `Document.addOptionalContentGroup`, `Page.addImage`,
+`Font.measureString`, `FormEditor.setFieldAppearance`, `Stamp.setImageSize`. A grounded
+changelog entry is proposed separately; this file does not edit `CHANGELOG.md`.
+
 ### pom.xml changes (2026-08-21 hardening pass, MT036 Track B)
 
 | Element | Before | After | Required by |
@@ -70,10 +87,15 @@ Resolved since the last regeneration (2026-07-31), corrected here since PUBLISHI
 
 | Test | Result |
 |------|--------|
-| Local build (gpg.skip=true) | PASS -- `mvn clean package -Dgpg.skip=true -DskipTests`, BUILD SUCCESS, all 3 jars produced (2026-08-21) |
-| Ubuntu dry-run (workflow_dispatch) | PASS through checkout / coordinate guard / Java 11 setup on real GitHub-hosted infrastructure (run 32485097828, `mt036-hardening` branch); the job then correctly exits via its own "already on Maven Central" safety guard, since this pass deliberately does not bump the version -- a full "DEPLOY SKIPPED" pass requires a not-yet-published version and will run naturally as part of the real 26.8.0 release flow. The new `guard` job (concurrency, idempotency marker) is only reachable via a real tag-push/release event, not `workflow_dispatch` -- untested until that real event, by design (see aspose.org's MT036 plan Risk R1). |
+| Local build (gpg.skip=true) | PASS -- `mvn -B clean verify -Dgpg.skip=true -DskipTests` via the Ubuntu dry-run job, BUILD SUCCESS, all 3 jars produced (2026-11-12) |
+| Ubuntu dry-run (workflow_dispatch) | PASS -- run [43219883176](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/43219883176) on `main` @ `3c6bd62b038c`: coordinates OK (`org.aspose:aspose-pdf-foss:26.11.0`), version not yet on Central, BUILD SUCCESS, 3 jars present, clean working tree, "DEPLOY SKIPPED" (2026-11-12) |
 | Windows dry-run (workflow_dispatch) | NOT RUN -- no self-hosted runner (`[self-hosted, Windows, maven-pilot]`) is currently registered for this repository (confirmed via the GitHub API: zero runners registered). This is a pre-existing infrastructure gap, not introduced by this hardening pass; the Windows job's PowerShell logic is unchanged from the previously-proven template except for the same guard/permissions/pinning changes already validated structurally. |
-| Artifact on Maven Central (HTTP 200) | PASS - confirmed live: https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
+| Artifact on Maven Central (HTTP 200) | PASS - confirmed live: https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.11.0/ (jar, pom, sources, javadoc, `.asc`, `.sha1` all 200; `maven-metadata.xml` latest/release = 26.11.0) |
+| Release workflow (tag push) | PASS -- run [43220263446](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/43220263446), the only publish run for `v26.11.0`; "Deployment d8f99989-a228-415f-be18-76245ae00b23 has been validated"; post-deploy poll confirmed jar+pom+sources on Central; Release `v26.11.0` created with asset `maven-central-published.marker` |
+| Checksums and signatures | PASS -- jar and pom SHA-1 match the published `.sha1`; jar, pom, sources and javadoc `.asc` verify "Good signature" against key `E176D5CBCA1DCC62` (fetched from keyserver.ubuntu.com into an isolated keyring) |
+| Fresh-environment resolution | PASS -- `mvn dependency:get -Dartifact=org.aspose:aspose-pdf-foss:26.11.0` into an empty local repository |
+| JAR smoke compile | PASS -- 1,429 classes, all under `org.aspose.pdf`; a consumer created a `Document`, added `TextFragment`s, saved, reloaded, and `TextAbsorber` and `TextFragmentAbsorber` (empty phrase) returned identical text (the 26.11 fix); five new 26.11 members confirmed present by reflection |
+| C7 findings (missing classes) | none -- every class imported by the English pdf/java docs, KB, blog and products content exists in the published jar (two wildcard imports, `annotations.*` and `facades.*`, resolve to existing packages) |
 
 ## How to Cut Future Releases
 
@@ -122,3 +144,5 @@ For secret rotation or recovery: contact the infrastructure team.
 |---------|------|-------------|---------------|
 | 26.6.0 | 2026-07-16 (first publish); regenerated 2026-07-31 to match the S-110 Step A9 template of that date; regenerated again 2026-08-21 (MT036 hardening pass -- dual-trigger workflow, waitUntil fix, grounded description, no version change) | S-110 foss-java-publish | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.6.0/ |
 | 26.8.0 | 2026-08-21 (MT036 Track C, `--mode=republish` -- first real exercise of that mode) | S-110 foss-java-publish | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.8.0/ -- **live and fully verified**: release-event workflow run [32496828313](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/32496828313) SUCCESS (Sonatype Central Portal validation confirmed via "has been validated", deploymentId `4bc0786c-f131-400f-a855-29632904f935`); repo1.maven.org sync confirmed (jar/pom/sources/javadoc all HTTP 200, `.asc`/`.sha1`/`.md5` present, `maven-metadata.xml` lists 26.8.0 as latest/release); fresh-environment `mvn dependency:get` against a clean local repo resolved and downloaded successfully; a minimal real consumer (create Document -> add TextFragment -> save -> reload from bytes -> TextFragmentAbsorber regex extract) compiled and ran correctly end-to-end. The concurrent push-event trigger for the same tag ([32496827297](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/32496827297), the dual-trigger race this design is built to handle) failed, but only because a real bug in the idempotency-marker step (fixed in commit [9076c9a](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/commit/9076c9a50864b20ca9f3207b5cf5505ed3f5c5f5)) let it reach a real `mvn deploy` retry, which Sonatype's own server-side duplicate-coordinate rejection caught safely -- no data-integrity impact; the release's marker asset has been manually backfilled under the correct name to match what the fixed workflow now produces on its own. |
+| 26.9.0 | 2026-10-07 (row added retroactively on 2026-11-12 -- it was not recorded when this version was published) | S-110 foss-java-publish (tag `v26.9.0` pushed after upstream PR #11) | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.9.0/ -- live; GitHub Actions run [37609985634](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/37609985634) (tag-push trigger) SUCCESS; GitHub Release `v26.9.0` exists. |
+| 26.11.0 | 2026-11-12 (`--mode=republish`) | S-110 foss-java-publish (tag `v26.11.0` pushed at upstream commit `3c6bd62b038c`) | https://repo1.maven.org/maven2/org/aspose/aspose-pdf-foss/26.11.0/ -- **live and independently verified**: run [43220263446](https://github.com/aspose-pdf-foss/Aspose.PDF-FOSS-for-Java/actions/runs/43220263446) SUCCESS (single publish run; Sonatype deploymentId `d8f99989-a228-415f-be18-76245ae00b23` validated); jar, pom, sources, javadoc, `.asc` and `.sha1` all HTTP 200; jar and pom SHA-1 match; 4 signatures verified Good against key `E176D5CBCA1DCC62` in an isolated keyring; `maven-metadata.xml` latest/release = 26.11.0; fresh-environment `mvn dependency:get` OK; consumer smoke test PASS (see Smoke Test Results). |
